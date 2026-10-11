@@ -610,20 +610,25 @@ def freeze_rehearsal() -> str:
 
 # the gate for a candidate build of `src/magpie`: only the dit and vae are loaded. results go to
 # /out/gate/<tag>/<variant>; compare against baseline/<variant>.json with GATE_MARGIN_DB.
+# tag "baseline" instead re-freezes the port half of the baseline against the existing references.
 @app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
 def gate(variant: str, tag: str) -> str:
     import torch
     from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
+    from huggingface_hub import hf_hub_download
 
     import magpie.pipeline as lean
 
     torch.set_grad_enabled(False)
-    transformer = QwenImage21Transformer2DModel.from_pretrained(REPOS[variant], subfolder="transformer", torch_dtype=torch.bfloat16).to("cuda")
-    autoencoder = AutoencoderKLQwenImage21.from_pretrained(REPOS[variant], subfolder="vae", torch_dtype=torch.bfloat16).to("cuda")
+    # the cached snapshot folder; a repo id would query the hub, which is offline here
+    snapshot = pl.Path(hf_hub_download(REPOS[variant], "model_index.json", local_files_only=True)).parent
+    transformer = QwenImage21Transformer2DModel.from_pretrained(f"{snapshot}/transformer", torch_dtype=torch.bfloat16).to("cuda")
+    autoencoder = AutoencoderKLQwenImage21.from_pretrained(f"{snapshot}/vae", torch_dtype=torch.bfloat16).to("cuda")
     dit, vae = lean.adopt(transformer.state_dict(), autoencoder.state_dict(), autoencoder.config.latents_mean, autoencoder.config.latents_std)
     folder = pl.Path(OUT_ROOT) / "baseline" / variant
+    out = folder / "magpie" if tag == "baseline" else pl.Path(OUT_ROOT) / "gate" / tag / variant
     result = {"variant": variant, "tag": tag, "device": device_info(), "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
-              "magpie": gate_pass(dit, vae, variant, GATE_CASES, folder, pl.Path(OUT_ROOT) / "gate" / tag / variant, {})}
+              "magpie": gate_pass(dit, vae, variant, GATE_CASES, folder, out, {})}
     out_volume.commit()
     return json.dumps(result)
 
@@ -660,7 +665,12 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         (ROOT / "out" / "gate").mkdir(parents=True, exist_ok=True)
         for payload in gate.starmap([(variant, tag) for variant in variants.split(",")]):
             result = json.loads(payload)
-            result["verdict"] = verdict(result, json.loads((frozen / f"{result['variant']}.json").read_text()))
+            baseline = json.loads((frozen / f"{result['variant']}.json").read_text())
+            if tag == "baseline":
+                merged = {**baseline, "resident_dit_vae_gib": result["resident_dit_vae_gib"], "magpie": result["magpie"]}
+                (frozen / f"{result['variant']}.json").write_text(json.dumps(merged, indent=1))
+                continue
+            result["verdict"] = verdict(result, baseline)
             (ROOT / "out" / "gate" / f"{tag}-{result['variant']}.json").write_text(json.dumps(result, indent=1))
             print(result["variant"], json.dumps(result["verdict"], indent=1))
         return

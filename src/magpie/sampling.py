@@ -40,6 +40,8 @@ def schedule(tokens: int, cfg: SamplerConfig) -> Tensor:
     return torch.cat([stretched, stretched.new_zeros(1)])
 
 
-# one euler step along the predicted velocity, accumulated in fp32.
+# one euler step along the predicted velocity. as in the reference scheduler, the step `dt * velocity` is
+# formed in the model's dtype (a 0-dim fp32 `dt` does not promote a bf16 tensor) and only the sum is fp32.
+# multiplying in fp32 is more exact but drifts from the reference: 53.6 -> 39.8 dB on the l4 parity image.
 def euler(latents: Tensor, velocity: Tensor, sigma: Tensor, sigma_next: Tensor) -> Tensor:
-    return (latents.float() + (sigma_next - sigma) * velocity.float()).to(velocity.dtype)
+    return (latents.float() + (sigma_next - sigma) * velocity).to(velocity.dtype)
