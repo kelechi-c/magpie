@@ -1,0 +1,118 @@
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+from torch import Tensor
+
+from magpie.dit import Dit, DitConfig, layout
+from magpie.sampling import SamplerConfig, euler, schedule
+from magpie.text import encode
+from magpie.vae import Vae, VaeConfig, image_weights
+
+Shape = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class Models:
+    encoder: Any  # transformers Qwen3VLForConditionalGeneration
+    processor: Any
+    dit: Dit
+    vae: Vae
+
+
+# builds the port's dit and vae around already-loaded weights (e.g. a diffusers pipeline's state
+# dicts) without copying them: the dit is created on the meta device so 7b parameters are never
+# initialised, then `assign=True` swaps the real tensors in.
+def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list[float], std: list[float]) -> tuple[Dit, Vae]:
+    with torch.device("meta"):
+        dit = Dit()
+    dit.load_state_dict(dit_state, assign=True)
+    reference = next(iter(vae_state.values()))
+    vae = Vae(VaeConfig(), mean, std).to(reference.device, reference.dtype)
+    vae.load_state_dict(image_weights(vae_state), assign=True)
+    return dit.eval(), vae.eval()
+
+
+# (width, height) with the requested pixel area and aspect ratio, both multiples of 32.
+def fit(area: int, ratio: float) -> Shape:
+    width = math.sqrt(area * ratio)
+    return round(width / 32) * 32, round(width / ratio / 32) * 32
+
+
+# pil -> (1, 4, H, W) in [-1, 1].
+def to_pixels(image: Image.Image) -> Tensor:
+    array = np.asarray(image.convert("RGBA")).astype(np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1)[None] * 2.0 - 1.0
+
+
+# (1, 4, H, W) in [-1, 1] -> rgba pil.
+def to_image(pixels: Tensor) -> Image.Image:
+    array = (pixels[0].float() / 2 + 0.5).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray((array * 255).round().astype("uint8"))
+
+
+# (B, 64, h, w) <-> (B, h*w, 64): the dit reads one token per latent pixel, no patching.
+def pack(latents: Tensor) -> Tensor:
+    return latents.flatten(2).transpose(1, 2)
+
+
+def unpack(tokens: Tensor, shape: Shape) -> Tensor:
+    return tokens.transpose(1, 2).unflatten(2, shape)
+
+
+# the denoising loop on precomputed conditioning. `text`/`slots` come from `text.encode`,
+# `references` are packed condition-image latents (B, R, 64) or None, `noise` is (B, N, 64).
+# step 0 runs the full joint sequence and fills the kv cache; later steps recompute target tokens only.
+@torch.no_grad()
+def denoise(
+    dit: Dit, text: Tensor, slots: Tensor, references: Tensor | None, noise: Tensor, shapes: list[Shape],
+    sampler: SamplerConfig,
+) -> Tensor:
+    lay = layout(slots, shapes, dit.cfg)
+    sigmas = schedule(noise.shape[1], sampler).to(noise.device)
+    levels = (sigmas * 1000).to(noise.dtype) / 1000  # the dit sees sigma rounded like the reference does
+    joint = noise if references is None else torch.cat([references, noise], dim=1)
+    velocity, cache = dit.prefill(joint, text, levels[:1], lay)
+    latents = euler(noise, velocity, sigmas[0], sigmas[1])
+    for i in range(1, len(sigmas) - 1):
+        velocity = dit.decode(latents, levels[i : i + 1], lay, cache)
+        latents = euler(latents, velocity, sigmas[i], sigmas[i + 1])
+    return latents
+
+
+# condition images at the working size: `resolution`^2 pixels, their own aspect ratio, sides multiples of 32.
+def resized(images: tuple[Image.Image, ...], resolution: int) -> list[Image.Image]:
+    return [image.convert("RGBA").resize(fit(resolution**2, image.width / image.height), Image.LANCZOS) for image in images]
+
+
+# conditioning (+ already resized condition images) -> rgba image, with no text encoder in sight:
+# vae-encode the images, denoise, decode. with images and no size, the output takes the last image's size.
+@torch.no_grad()
+def render(
+    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Image.Image] | None = None,
+    size: Shape | None = None, resolution: int = 1024, seed: int = 0,
+) -> Image.Image:
+    device, dtype = dit.img_in.weight.device, dit.img_in.weight.dtype
+    images = images or []
+    width, height = size or (images[-1].size if images else (resolution,) * 2)
+    encoded = [vae.encode(to_pixels(image).to(device, dtype)) for image in images]
+    shapes = [tuple(latent.shape[-2:]) for latent in encoded] + [(height // 16, width // 16)]
+    references = torch.cat([pack(latent) for latent in encoded], dim=1) if encoded else None
+    generator = torch.Generator("cpu").manual_seed(seed)
+    noise = torch.randn((1, 1, 64, *shapes[-1]), generator=generator, dtype=dtype).to(device)
+    latents = denoise(dit, text.to(device, dtype), slots.to(device), references, pack(noise[:, 0]), shapes, sampler)
+    return to_image(vae.decode(unpack(latents, shapes[-1])))
+
+
+# prompt (+ optional condition images) -> rgba image: the text encoder, then `render`.
+@torch.no_grad()
+def generate(
+    models: Models, prompt: str, sampler: SamplerConfig, images: tuple[Image.Image, ...] = (),
+    size: Shape | None = None, resolution: int = 1024, seed: int = 0,
+) -> Image.Image:
+    sized = resized(images, resolution)
+    text, slots = encode(models.encoder, models.processor, prompt, sized)
+    return render(models.dit, models.vae, text, slots, sampler, sized, size, resolution, seed)

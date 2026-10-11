@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.modal/
+.env
+refs/
+out/
+research/
+logs.txt
+AGENTS.md
+CLAUDE.md
