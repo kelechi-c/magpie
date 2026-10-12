@@ -2,7 +2,7 @@
   "generated": "2026-10-12",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "1a90e2dbc7ea92feb9bb4da2dfd1e13dd90e5868"
+    "head": "9ef5a67e1f08fb9bdf66cc5ec5e544b063806442"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -15,6 +15,10 @@
   "baseline": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/turbo.json",
     "sha256": "f665718837dd304e2ecb8584de1446e6ca2439b777811bfec04c56f95363ccf6"
+  },
+  "roofline": {
+    "path": "/home/tensor/Shared/code/ml/magpie/out/roofline.json",
+    "sha256": "d6afb71698118b1cba2002634e55530585674a5bb4b810250b4a3412569facba"
   },
   "charts": {
     "stage-split": [
@@ -108,6 +112,31 @@
       "rows[variant=turbo,engine=magpie,case=edit_2048].peak_gib",
       "baseline.magpie[edit_1024].stage_peak_gib(max)",
       "baseline.magpie[edit_2048].stage_peak_gib(max)"
+    ],
+    "floor": [
+      "roofline.cases[edit_1024].spans[mlp (swiglu)].measured_ms",
+      "roofline.cases[edit_1024].spans[qkv + qk-norm + rope].measured_ms",
+      "roofline.cases[edit_1024].spans[attention (sdpa)].measured_ms",
+      "roofline.cases[edit_1024].spans[attention out].measured_ms",
+      "roofline.cases[edit_1024].spans[block glue].measured_ms",
+      "roofline.cases[edit_1024].spans[vae decode].measured_ms",
+      "roofline.cases[edit_1024].spans[vae encode].measured_ms",
+      "roofline.cases[edit_1024].spans[mlp (swiglu)].reached_ms",
+      "roofline.cases[edit_1024].spans[qkv + qk-norm + rope].reached_ms",
+      "roofline.cases[edit_1024].spans[attention (sdpa)].reached_ms",
+      "roofline.cases[edit_1024].spans[attention out].reached_ms",
+      "roofline.cases[edit_1024].spans[block glue].reached_ms",
+      "roofline.cases[edit_1024].spans[vae decode].reached_ms",
+      "roofline.cases[edit_1024].spans[vae encode].reached_ms",
+      "roofline.cases[edit_1024].spans[mlp (swiglu)].floor_ms",
+      "roofline.cases[edit_1024].spans[qkv + qk-norm + rope].floor_ms",
+      "roofline.cases[edit_1024].spans[attention (sdpa)].floor_ms",
+      "roofline.cases[edit_1024].spans[attention out].floor_ms",
+      "roofline.cases[edit_1024].spans[block glue].floor_ms",
+      "roofline.cases[edit_1024].spans[vae decode].floor_ms",
+      "roofline.cases[edit_1024].spans[vae encode].floor_ms",
+      "roofline.cases[edit_1024].request_ms",
+      "roofline.cases[edit_1024].floor_request_ms"
     ]
   }
 }

@@ -1,6 +1,5 @@
 import json
 import pathlib as pl
-import statistics
 import sys
 import time
 from typing import Any, Callable
@@ -8,37 +7,10 @@ from typing import Any, Callable
 import modal
 
 sys.path.insert(0, str(pl.Path(__file__).resolve().parent))
-from modal_common import INPUTS, OUT_ROOT, REPOS, ROOT, VOLUMES, image, out_volume
+from gate import (CASES, GATE_CASES, INPUTS, OUT_ROOT, REPOS, SUITE, TIMED_CASES, Timings, collect, device_info, gate_input, gate_items, gate_pass, load_port, psnr, reduce, staged, summary, unfused, verdict)
+from modal_common import ROOT, VOLUMES, image, out_volume
 
 app = modal.App("magpie-bench", image=image)
-Timings = dict[str, list[float]]
-
-# (prompt, flicker image used as the edit input, edit instruction): ink / pencil subjects throughout.
-SUITE = [
-    ("Ink drawing of a huge radio telescope array on a salt flat, hundreds of dishes shrinking to hatched ellipses toward the horizon, sepia pen lines on warm ivory paper with small turquoise and rust accents, wide empty sky, sparse and precise, no text",
-     "03.png", "Change the season to deep winter: lay snow on the dishes and the salt flat with sparse pencil hatching, keep the sepia pen linework and the ivory paper"),
-    ("A mountain range built entirely from stacked wavering contour lines like a topographic map, drawn in dark teal ink on cream paper, a loose orange and pink watercolour wash for the sunrise behind the highest peak, minimal, hand-drawn, no text",
-     "07.png", "Replace the sunrise wash with a night sky, a deep indigo ink wash scattered with tiny white stars, keep the contour-line mountains unchanged"),
-    ("A bloom of jellyfish rising through open water, their tentacles drawn as long beaded chains of tiny scalloped loops that cross and tangle, violet and aquamarine ballpoint ink on warm ivory paper, fine hatching in the bells, airy composition, no text",
-     "08.png", "Redraw this as a soft graphite pencil sketch on grey paper, remove all colour, keep the composition"),
-    ("Hand-drawn ink diagram of a half-open folding fan, hair-thin dark ribs radiating from a single pivot point with a zigzag outer edge, soft indigo and coral watercolour blooms bleeding across a few of its panels, faint smudged pencil construction lines behind it, on flat pale peach paper, minimal and quiet, no text",
-     "01.png", "Add a small sleeping cat beneath the fan, drawn in the same hair-thin ink line style, keep the fan and the paper unchanged"),
-    ("A magpie perched on a bare winter branch, drawn in graphite pencil with dense cross-hatching for the black feathers and bare paper for the white, one small accent of cobalt blue ink on the wing, warm cream paper, generous empty space, hand-drawn, no text",
-     "06.png", "Add a second, smaller moon behind the planet, drawn in the same red and blue coloured pencil hatching, keep everything else unchanged"),
-]
-CASES: dict[str, dict[str, Any]] = {
-    "t2i_512": dict(edit=False, size=512),
-    "edit_512": dict(edit=True, size=512),
-    "t2i_1024": dict(edit=False, size=1024),
-    "edit_1024": dict(edit=True, size=1024),
-    "edit_1024_nocache": dict(edit=True, size=1024, use_kv_cache=False),
-    "t2i_2048": dict(edit=False, size=2048),
-    "edit_2048": dict(edit=True, size=2048),
-}
-
-
-def summary(values: list[float]) -> dict[str, float]:
-    return {"p50": statistics.median(values), "min": min(values), "max": max(values), "n": len(values)}
 
 
 # wraps a callable so each call appends its gpu-synchronised wall time to timings[name].
@@ -54,33 +26,6 @@ def timed(function: Callable, name: str, timings: Timings) -> Callable:
         return result
 
     return wrapper
-
-
-# one request's stage totals plus the per-step dit times, then clears the collector.
-def collect(timings: Timings, total: float) -> dict[str, Any]:
-    stages = {name: sum(values) for name, values in timings.items()}
-    row = {"total": total, **stages, "other": total - sum(stages.values()), "dit_steps": list(timings.get("dit", []))}
-    timings.clear()
-    return row
-
-
-# median of every scalar stage across requests, and the per-step medians of the dit.
-def reduce(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    scalars = {key: summary([row.get(key, 0.0) for row in rows]) for key in rows[0] if key != "dit_steps"}
-    steps = [statistics.median(step) for step in zip(*[row["dit_steps"] for row in rows])]
-    return {**scalars, "dit_steps_p50": steps}
-
-
-def device_info() -> dict[str, Any]:
-    import diffusers
-    import torch
-    import transformers
-
-    return {"gpu": torch.cuda.get_device_name(0), "capability": list(torch.cuda.get_device_capability(0)),
-            "vram_gib": round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1),
-            "torch": torch.__version__, "cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version(),
-            "diffusers": diffusers.__version__, "transformers": transformers.__version__,
-            "tf32_matmul": torch.backends.cuda.matmul.allow_tf32, "cudnn_benchmark": torch.backends.cudnn.benchmark}
 
 
 def save(image_out: Any, folder: pl.Path, name: str) -> None:
@@ -393,47 +338,6 @@ def parity() -> str:
     return json.dumps(report)
 
 
-GATE_CASES = ["t2i_1024", "edit_1024", "t2i_2048", "edit_2048"]
-GATE_MARGIN_DB = 3.0  # a change passes if no gate item drops more than this below the frozen baseline
-
-
-def psnr(a: Any, b: Any) -> float:
-    import numpy as np
-
-    error = np.mean((np.asarray(a.convert("RGB"), dtype=np.float64) - np.asarray(b.convert("RGB"), dtype=np.float64)) ** 2)
-    return float(10 * np.log10(255.0**2 / max(error, 1e-12)))
-
-
-# gate items per case: every suite prompt, except base at 2048 where three keep the session short.
-def gate_items(variant: str, case: str) -> int:
-    return 3 if variant == "base" and "2048" in case else len(SUITE)
-
-
-# like `timed`, and also keeps the stage's peak allocation in gib (resident weights included).
-def staged(function: Callable, name: str, timings: Timings, peaks: dict[str, float]) -> Callable:
-    import torch
-
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        start = time.perf_counter()
-        result = function(*args, **kwargs)
-        torch.cuda.synchronize()
-        timings.setdefault(name, []).append(time.perf_counter() - start)
-        peaks[name] = max(peaks.get(name, 0.0), torch.cuda.max_memory_allocated() / 2**30)
-        return result
-
-    return wrapper
-
-
-# the prompt and condition images of one gate item.
-def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
-    from PIL import Image
-
-    prompt, source, instruction = SUITE[index % len(SUITE)]
-    return (instruction, (Image.open(f"{INPUTS}/{source}"),)) if CASES[case]["edit"] else (prompt, ())
-
-
 # phase a of the freeze: the official pipeline on every gate item. writes the reference image (png)
 # and the port's text conditioning to the volume, so later gate runs need neither diffusers' pipeline
 # nor the text encoder. returns per-stage peaks, the text stage's time, and (if `capture`) every
@@ -495,84 +399,6 @@ def reference_pass(pipe: Any, variant: str, cases: list[str], folder: pl.Path, c
     return report, captured
 
 
-# where one port request leaves the reference, with accumulation removed: every dit step is rerun on
-# the reference's own inputs, and the vae decodes the reference's own latents.
-def diagnose(dit: Any, vae: Any, record: dict, text: Any, slots: Any, shapes: list, sampler: Any, seed: int) -> dict[str, Any]:
-    import torch
-
-    from magpie.dit import layout
-    from magpie.pipeline import pack
-    from magpie.sampling import schedule
-
-    def gap(ours: Any, theirs: Any) -> float:
-        return float((ours.double().cpu() - theirs.double().cpu()).abs().max() / theirs.double().abs().max())
-
-    target = shapes[-1][0] * shapes[-1][1]
-    joint = record["joint"].to("cuda")
-    noise = torch.randn((1, 1, 64, *shapes[-1]), generator=torch.Generator("cpu").manual_seed(seed), dtype=joint.dtype)
-    lay = layout(slots.to("cuda"), shapes, dit.cfg)
-    levels = (schedule(target, sampler).to("cuda") * 1000).to(joint.dtype) / 1000
-    first, cache = dit.prefill(joint, text.to("cuda", joint.dtype), levels[:1], lay)
-    steps = [gap(first, record["velocity"][0])] + [
-        gap(dit.decode(record["latents"][i].to("cuda"), levels[i : i + 1], lay, cache), record["velocity"][i])
-        for i in range(1, len(record["velocity"]))]
-    z, pixels = record["decode"]
-    raw = vae.decoder(vae.post_quant_conv(z[:, :, 0].to("cuda"))).clamp(-1.0, 1.0)
-    return {"text": gap(text, record["text"]), "noise": gap(pack(noise[:, 0]), joint[:, -target:]), "dit_steps_same_input": steps,
-            "vae_decode_same_input_mean_abs": float((raw.float().cpu() - pixels[:, :, 0].float()).abs().mean())}
-
-
-# phase b, and the gate itself: the lean port's dit + vae on saved conditioning, no text encoder.
-# per case: stage times, per-stage peaks, and each item's psnr against the frozen reference image
-# (and against the frozen baseline's own output, when one exists and this run is not the baseline).
-def gate_pass(dit: Any, vae: Any, variant: str, cases: list[str], folder: pl.Path, out: pl.Path, captured: dict) -> dict[str, Any]:
-    import torch
-    from PIL import Image
-
-    import magpie.pipeline as lean
-    from magpie.sampling import BASE, TURBO
-
-    sampler = TURBO if variant == "turbo" else BASE
-    timings: Timings = {}
-    peaks: dict[str, float] = {}
-    dit.prefill, dit.decode = staged(dit.prefill, "dit", timings, peaks), staged(dit.decode, "dit", timings, peaks)
-    vae.encode, vae.decode = staged(vae.encode, "vae_encode", timings, peaks), staged(vae.decode, "vae_decode", timings, peaks)
-    results: dict[str, Any] = {}
-    for case in cases:
-        spec = CASES[case]
-
-        def request(index: int) -> tuple[Any, Any, Any, list]:
-            saved = torch.load(folder / "conditioning" / case / f"{index:02d}.pt")
-            images = lean.resized(gate_input(case, index)[1], spec["size"])
-            output = lean.render(dit, vae, saved["text"], saved["slots"], sampler, images, None if images else (spec["size"],) * 2, spec["size"], index)
-            return output, saved["text"], saved["slots"], images
-
-        request(0)
-        timings.clear()
-        peaks.clear()
-        rows, scores, drift, checks = [], [], [], []
-        for index in range(gate_items(variant, case)):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            output, text, slots, images = request(index)
-            torch.cuda.synchronize()
-            rows.append(collect(timings, time.perf_counter() - start))
-            scores.append(psnr(output, Image.open(folder / "reference" / case / f"{index:02d}.png")))
-            frozen = folder / "magpie" / case / f"{index:02d}.png"
-            if out != folder / "magpie" and frozen.exists():
-                drift.append(psnr(output, Image.open(frozen)))
-            (out / case).mkdir(parents=True, exist_ok=True)
-            output.convert("RGB").save(out / case / f"{index:02d}.png")
-            if (case, index) in captured:
-                shapes = [(image.height // 16, image.width // 16) for image in images] + [(output.height // 16, output.width // 16)]
-                checks.append(diagnose(dit, vae, captured[(case, index)], text, slots, shapes, sampler, index))
-                timings.clear()
-        results[case] = {**reduce(rows), "stage_peak_gib": {k: round(v, 2) for k, v in peaks.items()}, "psnr_db": scores,
-                         "psnr_vs_baseline_db": drift, "diagnosis": checks}
-        print(f"gate {case}: dit+vae p50 {results[case]['total']['p50']:.3f} s, psnr min {min(scores):.1f} dB", flush=True)
-    return results
-
-
 # freezes the baseline for one checkpoint: official references, then the port's dit + vae alone on the card.
 def run_freeze(variant: str, cases: list[str], offload: bool) -> str:
     import torch
@@ -608,34 +434,64 @@ def freeze_rehearsal() -> str:
     return run_freeze("turbo", ["t2i_512", "edit_512"], offload=True)
 
 
-# the port's dit and vae on the card, and nothing else: no pipeline, no text encoder.
-def load_port(variant: str) -> tuple[Any, Any]:
+# records what the baseline port feeds each dit step and what comes out, for every gate item, into
+# /out/baseline/<variant>/steps. kernels are switched off so this is the frozen baseline's arithmetic;
+# `repeat_psnr_db` against the frozen baseline images shows that it is (168 = bit-identical).
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
+def steps(variant: str) -> str:
     import torch
-    from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
-    from huggingface_hub import hf_hub_download
+    from PIL import Image
 
+    import magpie.dit as dit_module
     import magpie.pipeline as lean
+    from magpie.sampling import BASE, TURBO
 
-    torch.set_grad_enabled(False)
-    # the cached snapshot folder; a repo id would query the hub, which is offline here
-    snapshot = pl.Path(hf_hub_download(REPOS[variant], "model_index.json", local_files_only=True)).parent
-    transformer = QwenImage21Transformer2DModel.from_pretrained(f"{snapshot}/transformer", torch_dtype=torch.bfloat16).to("cuda")
-    autoencoder = AutoencoderKLQwenImage21.from_pretrained(f"{snapshot}/vae", torch_dtype=torch.bfloat16).to("cuda")
-    return lean.adopt(transformer.state_dict(), autoencoder.state_dict(), autoencoder.config.latents_mean, autoencoder.config.latents_std)
+    dit, vae = load_port(variant, slim=False)
+    unfused(dit_module)
+    sampler = TURBO if variant == "turbo" else BASE
+    folder = pl.Path(OUT_ROOT) / "baseline" / variant
+    prefill, decode = dit.prefill, dit.decode
+    record: dict[str, Any] = {}
+
+    def spy_prefill(latents: Any, *args: Any) -> Any:
+        velocity, cache = prefill(latents, *args)
+        record.update(joint=latents.cpu(), latents=[], velocity=[velocity.cpu()])
+        return velocity, cache
+
+    def spy_decode(latents: Any, *args: Any) -> Any:
+        velocity = decode(latents, *args)
+        record["latents"].append(latents.cpu())
+        record["velocity"].append(velocity.cpu())
+        return velocity
+
+    dit.prefill, dit.decode = spy_prefill, spy_decode
+    repeat: dict[str, list[float]] = {}
+    for case in GATE_CASES:
+        spec = CASES[case]
+        (folder / "steps" / case).mkdir(parents=True, exist_ok=True)
+        for index in range(gate_items(variant, case)):
+            saved = torch.load(folder / "conditioning" / case / f"{index:02d}.pt")
+            images = lean.resized(gate_input(case, index)[1], spec["size"])
+            output = lean.render(dit, vae, saved["text"], saved["slots"], sampler, images, None if images else (spec["size"],) * 2, spec["size"], index)
+            torch.save(dict(record), folder / "steps" / case / f"{index:02d}.pt")
+            repeat.setdefault(case, []).append(psnr(output, Image.open(folder / "magpie" / case / f"{index:02d}.png")))
+        print(f"steps {case}: repeat psnr min {min(repeat[case]):.1f} dB", flush=True)
+    out_volume.commit()
+    return json.dumps({"variant": variant, "repeat_psnr_db": repeat})
 
 
 # the gate for a candidate build of `src/magpie`: only the dit and vae are loaded. results go to
-# /out/gate/<tag>/<variant>; compare against baseline/<variant>.json with GATE_MARGIN_DB.
+# /out/gate/<tag>/<variant>; `verdict` judges them against STEP_ERROR_MAX and DINO_MIN.
 # tag "baseline" instead re-freezes the port half of the baseline against the existing references.
 @app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
-def gate(variant: str, tag: str) -> str:
+def gate(variant: str, tag: str, cases: list[str], slim: bool = False) -> str:
     import torch
 
-    dit, vae = load_port(variant)
+    dit, vae = load_port(variant, slim)
     folder = pl.Path(OUT_ROOT) / "baseline" / variant
     out = folder / "magpie" if tag == "baseline" else pl.Path(OUT_ROOT) / "gate" / tag / variant
     result = {"variant": variant, "tag": tag, "device": device_info(), "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
-              "magpie": gate_pass(dit, vae, variant, GATE_CASES, folder, out, {})}
+              "magpie": gate_pass(dit, vae, variant, cases, folder, out, {})}
     out_volume.commit()
     return json.dumps(result)
 
@@ -661,7 +517,7 @@ def label_port(dit: Any, vae: Any) -> None:
     label(dit, "decode", "dit step (decode)")
     for attr, name in (("time_embed", "time embed"), ("text_embed", "text embed"), ("modulate", "modulation"), ("head", "head")):
         label(dit, attr, name)
-    label(dit_module, "sdpa", "attention (sdpa)")
+    label(dit_module, "attend", "attention (sdpa)")
     for index, block in enumerate(dit.transformer_blocks):
         label(block, "prefill", f"block {index:02d}")
         label(block, "decode", f"block {index:02d}")
@@ -728,21 +584,79 @@ def trace(variant: str, cases: list[str]) -> str:
     return json.dumps(report)
 
 
-# pass / fail of a gate run against the frozen baseline: per item, psnr against the official reference
-# may not fall more than GATE_MARGIN_DB below what the baseline scored.
-def verdict(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    cases = {}
-    for case, row in candidate["magpie"].items():
-        frozen = baseline["magpie"][case]
-        worst = min(ours - theirs for ours, theirs in zip(row["psnr_db"], frozen["psnr_db"]))
-        cases[case] = {"pass": worst >= -GATE_MARGIN_DB, "worst_psnr_change_db": round(worst, 2),
-                       "dit_vae_ms": round(row["total"]["p50"] * 1e3, 1), "baseline_ms": round(frozen["total"]["p50"] * 1e3, 1),
-                       "speedup": round(frozen["total"]["p50"] / row["total"]["p50"], 3)}
-    return {"pass": all(c["pass"] for c in cases.values()), "cases": cases}
+# the attention logits the model really reaches, per block, over the gate set: decides whether a flash
+# kernel without the running max is safe (no exp may overflow, and no row's sum of exps may overflow or
+# vanish). every sdpa call is shadowed: the scores are rebuilt in fp32, a chunk of queries at a time,
+# and the largest logit and the largest / smallest row log-sum-exp are kept. `bound` is the worst case
+# the qk-norm weights allow, sqrt(d) * max|s_q| * max|s_k|; a measured logit above it means the spy is wrong.
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
+def logits(variant: str, cases: list[str]) -> str:
+    import math
+
+    import torch
+
+    import magpie.dit as dit_module
+    import magpie.pipeline as lean
+    from magpie.sampling import BASE, TURBO
+
+    dit, vae = load_port(variant, slim=False)
+    sampler = TURBO if variant == "turbo" else BASE
+    folder = pl.Path(OUT_ROOT) / "baseline" / variant
+    blocks = dit.transformer_blocks
+    unfused(dit_module)
+    plain = dit_module.sdpa
+    state: dict[str, Any] = {"block": 0, "rows": [], "keys": 0}
+
+    def spy(q: Any, k: Any, v: Any, mask: Any = None) -> Any:
+        queries = q.transpose(1, 2).float() / math.sqrt(q.shape[-1])
+        keys = k.transpose(1, 2).float().transpose(-1, -2)
+        chunks = queries.split(max(1, 2**31 // (q.shape[2] * k.shape[1])), dim=2)
+        masks = mask.split(chunks[0].shape[2]) if mask is not None else [None] * len(chunks)
+        row = state["rows"][state["block"]]
+        state["keys"] = max(state["keys"], k.shape[1])
+        for chunk, visible in zip(chunks, masks):
+            scores = chunk @ keys
+            if visible is not None:
+                scores.masked_fill_(~visible, -math.inf)
+            top = scores.amax(-1, keepdim=True)
+            sums = scores.sub_(top).exp_().sum(-1).log_() + top[..., 0]  # log-sum-exp, in place
+            row[:] = max(row[0], float(top.max())), max(row[1], float(sums.max())), min(row[2], float(sums.min()))
+        return plain(q, k, v, mask)
+
+    def tag(block: Any, attr: str, index: int) -> None:
+        function = getattr(block, attr)
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            state["block"] = index
+            return function(*args, **kwargs)
+
+        setattr(block, attr, wrapper)
+
+    dit_module.sdpa = spy
+    for index, block in enumerate(blocks):
+        tag(block, "prefill", index)
+        tag(block, "decode", index)
+    width = blocks[0].attn.norm_q.weight.numel()
+    report: dict[str, Any] = {"device": device_info(), "variant": variant, "cases": {}, "bound": [
+        math.sqrt(width) * float(b.attn.norm_q.weight.float().abs().max()) * float(b.attn.norm_k.weight.float().abs().max())
+        for b in blocks]}
+    for case in cases:
+        spec = CASES[case]
+        state.update(rows=[[-math.inf, -math.inf, math.inf] for _ in blocks], keys=0)
+        for index in range(gate_items(variant, case)):
+            saved = torch.load(folder / "conditioning" / case / f"{index:02d}.pt")
+            images = lean.resized(gate_input(case, index)[1], spec["size"])
+            lean.render(dit, vae, saved["text"], saved["slots"], sampler, images, None if images else (spec["size"],) * 2, spec["size"], index)
+        names = ("max_logit", "max_row_logsumexp", "min_row_logsumexp")
+        report["cases"][case] = {"keys": state["keys"], "items": gate_items(variant, case),
+                                 **{name: [row[i] for row in state["rows"]] for i, name in enumerate(names)}}
+        print(f"logits {case}: max {max(report['cases'][case]['max_logit']):.2f}, "
+              f"row sum max {max(report['cases'][case]['max_row_logsumexp']):.2f}", flush=True)
+    return json.dumps(report)
 
 
 @app.local_entrypoint()
-def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants: str = "turbo,base") -> None:
+def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants: str = "turbo,base", cases: str = TIMED_CASES, slim: bool = True) -> None:
     out = ROOT / "out" / "bench"
     out.mkdir(parents=True, exist_ok=True)
     frozen = ROOT / "baseline"
@@ -760,9 +674,18 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         (ROOT / "out" / "trace").mkdir(parents=True, exist_ok=True)
         (ROOT / "out" / "trace" / "ops.json").write_text(json.dumps(json.loads(trace.remote("turbo", ["edit_1024", "edit_2048"])), indent=1))
         return
+    if mode == "steps":
+        print(steps.remote("turbo"))
+        return
+    if mode == "logits":
+        (ROOT / "out" / "logits").mkdir(parents=True, exist_ok=True)
+        for variant in variants.split(","):
+            (ROOT / "out" / "logits" / f"{variant}.json").write_text(json.dumps(json.loads(logits.remote(variant, GATE_CASES)), indent=1))
+        return
     if mode == "gate":
         (ROOT / "out" / "gate").mkdir(parents=True, exist_ok=True)
-        for payload in gate.starmap([(variant, tag) for variant in variants.split(",")]):
+        chosen = GATE_CASES if tag == "baseline" else cases.split(",")
+        for payload in gate.starmap([(variant, tag, chosen, slim) for variant in variants.split(",")]):
             result = json.loads(payload)
             baseline = json.loads((frozen / f"{result['variant']}.json").read_text())
             if tag == "baseline":

@@ -8,6 +8,7 @@ from PIL import Image
 from torch import Tensor
 
 from magpie.dit import Dit, DitConfig, layout
+from magpie.kernels import logit_bound, pack_mlp
 from magpie.sampling import SamplerConfig, euler, schedule
 from magpie.text import encode
 from magpie.vae import Vae, VaeConfig, image_weights
@@ -25,11 +26,20 @@ class Models:
 
 # builds the port's dit and vae around already-loaded weights (e.g. a diffusers pipeline's state
 # dicts) without copying them: the dit is created on the meta device so 7b parameters are never
-# initialised, then `assign=True` swaps the real tensors in.
-def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list[float], std: list[float]) -> tuple[Dit, Vae]:
+# initialised, then `assign=True` swaps the real tensors in. each block's logit bound is read off its weights,
+# and bf16 weights on the gpu also get fp8 copies of the mlp weights; `slim` then drops the bf16 originals
+# (the caller's state dicts must be released too), which leaves the mlp no bf16 path.
+def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list[float], std: list[float], slim: bool = False) -> tuple[Dit, Vae]:
     with torch.device("meta"):
         dit = Dit()
     dit.load_state_dict(dit_state, assign=True)
+    for block in dit.transformer_blocks:
+        block.attn.bound = logit_bound(block.attn.norm_q.weight, block.attn.norm_k.weight)
+        mlp = block.img_mlp
+        if mlp.out.weight.is_cuda and mlp.out.weight.dtype == torch.bfloat16:
+            mlp.packed = pack_mlp(mlp.gate_layer.weight, mlp.proj.weight, mlp.out.weight)
+            if slim:
+                mlp.gate_layer.weight = mlp.proj.weight = mlp.out.weight = None
     reference = next(iter(vae_state.values()))
     vae = Vae(VaeConfig(), mean, std).to(reference.device, reference.dtype)
     vae.load_state_dict(image_weights(vae_state), assign=True)

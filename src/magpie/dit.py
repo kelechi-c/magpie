@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from magpie.kernels import Fp8Mlp, flash, max_free, mlp_fp8, qk_prep
+
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's prefix keys and values, each (B, P, heads, head_dim)
 SLOT = 4  # one vision-language image slot stands for a 2x2 group of latent tokens
@@ -98,16 +100,30 @@ def rotate(x: Tensor, rope: Tensor) -> Tensor:
     return torch.view_as_real(pairs * rope[:, None]).flatten(3).type_as(x)
 
 
+# qk-norm then rope. `rotate(rms(...))` defines it; bf16 tensors on the gpu take the fused kernel instead.
+def prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float) -> Tensor:
+    fused = x.is_cuda and x.dtype == torch.bfloat16
+    return qk_prep(x, weight, rope, eps) if fused else rotate(rms(x, weight, eps), rope)
+
+
 # scaled dot-product attention over (B, S, heads, head_dim) tensors.
 def sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
     return out.transpose(1, 2)
 
 
+# attention as the model runs it. unmasked bf16 calls on the gpu take the max-free flash kernel where `bound`
+# (the block's largest possible logit) proves exp cannot overflow. everything else is `sdpa`: torch's flash
+# kernel beats our own running-max variant, so the blocks that need the max stay on it.
+def attend(q: Tensor, k: Tensor, v: Tensor, bound: float, mask: Tensor | None = None) -> Tensor:
+    fused = mask is None and q.is_cuda and q.dtype == torch.bfloat16 and max_free(bound, k.shape[1])
+    return flash(q, k, v, stable=False) if fused else sdpa(q, k, v, mask)
+
+
 # block-causal attention over the whole joint sequence: a token sees every earlier token, plus all
 # of its own image block. done as one flash call per prefix run (text runs get a causal triangle
 # over their own keys) and one for the target image, which sees everything.
-def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout) -> Tensor:
+def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float) -> Tensor:
     def run(start: int, end: int, is_text: bool) -> Tensor:
         size = end - start
         mask = (
@@ -115,15 +131,16 @@ def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout) -> Tensor:
             if is_text
             else None
         )
-        return sdpa(q[:, start:end], k[:, :end], v[:, :end], mask)
+        return attend(q[:, start:end], k[:, :end], v[:, :end], bound, mask)
 
-    return torch.cat([run(*s) for s in lay.segments] + [sdpa(q[:, lay.prefix :], k, v)], dim=1)
+    return torch.cat([run(*s) for s in lay.segments] + [attend(q[:, lay.prefix :], k, v, bound)], dim=1)
 
 
 class Attention(nn.Module):
     def __init__(self, cfg: DitConfig) -> None:
         super().__init__()
         self.heads, self.eps = cfg.heads, cfg.eps
+        self.bound = math.inf  # largest possible logit; `pipeline.adopt` sets it from the loaded qk-norm weights
         self.to_q, self.to_k, self.to_v = (nn.Linear(cfg.width, cfg.width, bias=False) for _ in range(3))
         self.to_out = nn.ModuleList([nn.Linear(cfg.width, cfg.width, bias=False)])
         self.norm_q = nn.Module()
@@ -134,9 +151,7 @@ class Attention(nn.Module):
     # projects to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
     def qkv(self, x: Tensor, rope: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         q, k, v = (proj(x).unflatten(-1, (self.heads, -1)) for proj in (self.to_q, self.to_k, self.to_v))
-        q = rotate(rms(q, self.norm_q.weight, self.eps), rope)
-        k = rotate(rms(k, self.norm_k.weight, self.eps), rope)
-        return q, k, v
+        return prep(q, self.norm_q.weight, rope, self.eps), prep(k, self.norm_k.weight, rope, self.eps), v
 
     def out(self, x: Tensor) -> Tensor:
         return self.to_out[0](x.flatten(2, 3))
@@ -149,9 +164,17 @@ class SwiGLU(nn.Module):
         self.proj = nn.Linear(cfg.width, hidden, bias=False)
         self.gate_layer = nn.Linear(cfg.width, hidden, bias=False)
         self.out = nn.Linear(hidden, cfg.width, bias=False)
+        self.packed: Fp8Mlp | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
+
+
+# the mlp branch of a block: `mlp(layer_norm(x) * mod)` defines it; bf16 tensors on the gpu take the fp8
+# kernels when the mlp carries packed fp8 weights (`pipeline.adopt` packs them).
+def feed(mlp: SwiGLU, x: Tensor, mod: Tensor, eps: float) -> Tensor:
+    fused = mlp.packed is not None and x.is_cuda and x.dtype == torch.bfloat16
+    return mlp_fp8(x, mod, mlp.packed, eps) if fused else mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
 
 
 # one single-stream block. it owns no modulation: `mod` = (scale1, gate1, scale2, gate2) is computed
@@ -169,16 +192,16 @@ class Block(nn.Module):
     # full-sequence pass; also returns this layer's prefix keys and values for the cache.
     def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV]:
         q, k, v = self.attn.qkv(self.norm(x) * mod[0], lay.rope)
-        x = x + mod[1] * self.attn.out(attend_prefill(q, k, v, lay))
-        x = x + mod[3] * self.img_mlp(self.norm(x) * mod[2])
+        x = x + mod[1] * self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound))
+        x = x + mod[3] * feed(self.img_mlp, x, mod[2], self.eps)
         return x, (k[:, : lay.prefix].clone(), v[:, : lay.prefix].clone())
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all.
     def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV) -> Tensor:
         q, k, v = self.attn.qkv(self.norm(x) * mod[0], rope)
-        attended = sdpa(q, torch.cat([cache[0], k], dim=1), torch.cat([cache[1], v], dim=1))
+        attended = attend(q, torch.cat([cache[0], k], dim=1), torch.cat([cache[1], v], dim=1), self.attn.bound)
         x = x + mod[1] * self.attn.out(attended)
-        return x + mod[3] * self.img_mlp(self.norm(x) * mod[2])
+        return x + mod[3] * feed(self.img_mlp, x, mod[2], self.eps)
 
 
 # qwen-image 2.1 single-stream dit. parameter names match the diffusers checkpoint, so

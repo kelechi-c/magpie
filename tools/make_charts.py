@@ -2,7 +2,7 @@
 
     cd /home/tensor/Shared/code/ml/magpie && uv run --no-project --with matplotlib python tools/make_charts.py [chart ...]
 
-Numbers come from out/bench/summary.json, out/trace/kernels.json and baseline/turbo.json. Writes
+Numbers come from out/bench/summary.json, out/trace/kernels.json, out/roofline.json and baseline/turbo.json. Writes
 qwen21_<chart>[_mobile][_dark].png and sources.json into assets/charts at 200 dpi.
 """
 
@@ -26,6 +26,7 @@ ROOT = pl.Path("/home/tensor/Shared/code/ml/magpie")
 SUMMARY = ROOT / "out/bench/summary.json"
 KERNELS = ROOT / "out/trace/kernels.json"
 BASELINE = ROOT / "baseline/turbo.json"
+FLOORS = ROOT / "out/roofline.json"
 OUT = ROOT / "assets/charts"
 PREFIX = "qwen21"
 TURBO, BASE, OFFICIAL, LEAN = "turbo", "base", "diffusers", "magpie"
@@ -51,6 +52,11 @@ SPAN_SEGMENTS: tuple[tuple[str, SpanNames], ...] = (  # kernel-time segments in 
 )
 KERNEL_SPANS: tuple[tuple[str, str], ...] = (
     ("qkv + qk-norm + rope", "qkv + qk-norm +\nrope"), ("mlp (swiglu)", "mlp (swiglu)"), ("vae decode", "vae decode"),
+)
+FLOOR_SPANS: tuple[tuple[str, str], ...] = (
+    ("mlp (swiglu)", "MLP"), ("qkv + qk-norm + rope", "QKV + QK-norm\n+ RoPE"), ("attention (sdpa)", "attention"),
+    ("attention out", "attention\noutput"), ("block glue", "norms, modulation,\nresiduals"), ("vae decode", "VAE decode"),
+    ("vae encode", "VAE encode"),
 )
 MATMUL_KINDS: SpanNames = ("gemm", "conv", "attention")
 SMALL_KINDS: SpanNames = ("elementwise", "copy", "layout")
@@ -388,10 +394,42 @@ def fit_32gb(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]
     return fig, srcs
 
 
+def floor(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Measured milliseconds per span of the 1024 edit against the same work at the card's measured rates and at its datasheet rates."""
+    roof = d["roofline"]
+    case = roof["cases"]["edit_1024"]
+    pt = lambda name, field: Pt(case["spans"][name][field], f"roofline.cases[edit_1024].spans[{name}].{field}")
+    took, reached, least = ([pt(name, f) for name, _ in FLOOR_SPANS] for f in ("measured_ms", "reached_ms", "floor_ms"))
+    total = [Pt(case[f], f"roofline.cases[edit_1024].{f}") for f in ("request_ms", "floor_request_ms")]
+    srcs = tuple(p.src for p in (*took, *reached, *least, *total))
+    fig, ax = canvas(th, sh, sh.pick(7.4, 9.8),
+                     f"On datasheet rates the same work takes {total[1].value / 1000:.2f} s; it takes {total[0].value / 1000:.2f} s",
+                     "Milliseconds of GPU kernel time per span of one Turbo edit at 1024: measured, and the same work at two rates.",
+                     f"Datasheet: {roof['datasheet']['bf16_tflops'] / 1000:.0f} PFLOPS of bf16 tensor-core peak and "
+                     f"{roof['datasheet']['bandwidth_gbs']:,.0f} GB/s. Fastest measured: {roof['reached']['gemm_8192_bf16_tflops']:.0f} TFLOP/s "
+                     f"and {roof['reached']['copy_gb_per_s']:,.0f} GB/s. Elementwise stages count as one read and one write. Lean port, "
+                     "one profiled request, RTX PRO 6000 Blackwell Server Edition.",
+                     left=sh.pick(2.3, 2.1), right=sh.pick(1.0, 0.9),
+                     key=[(th.other, "measured"), (th.peer, "at the fastest rates measured on the card"), (th.hero, "at datasheet rates")])
+    n = len(FLOOR_SPANS)
+    for i, ((_, label), t, r, f) in enumerate(zip(FLOOR_SPANS, took, reached, least)):
+        y = n - 1 - i
+        for dy, p, color, ink in ((0.27, t, th.other, th.muted), (0, r, th.peer, th.muted), (-0.27, f, th.hero, None)):
+            bar(ax, th, y + dy, 0, p.value, color, 0.25)
+            tag(ax, p.value, y + dy, f"{p.value:,.0f} ms", sh, th, color=ink, size=11)
+        row_label(ax, th, sh, y, label)
+    clean(ax)
+    ax.set_xlim(0, 1300)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.set_xticks([0, 400, 800, 1200], ["0", "400 ms", "800 ms", "1200 ms"])
+    return fig, srcs
+
+
 PLOTS: dict[str, Plot] = {
     "stage-split": stage_split, "request-latency": request_latency, "prefix-cache": prefix_cache,
     "utilisation": utilisation, "peak-memory": peak_memory, "op-groups": op_groups,
     "span-split": span_split, "kernel-classes": kernel_classes, "fit-32gb": fit_32gb,
+    "floor": floor,
 }
 
 
@@ -415,7 +453,7 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
                           capture_output=True, text=True).stdout.strip()
     doc = {"generated": dt.date.today().isoformat(), "repo": {"root": str(ROOT), "head": head or None},
            **{name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-              for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE))},
+              for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE), ("roofline", FLOORS))},
            "charts": {**prev, **{k: list(dict.fromkeys(v)) for k, v in charts.items()}}}
     path.write_text(json.dumps(doc, indent=2) + "\n")
     print("wrote sources.json")
@@ -424,7 +462,7 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
 def main(names: list[str]) -> None:
     """Render the requested charts (all by default) in every theme and shape, then write their provenance."""
     d = {**json.loads(SUMMARY.read_text()), "kernels": json.loads(KERNELS.read_text()),
-         "baseline": json.loads(BASELINE.read_text())}
+         "baseline": json.loads(BASELINE.read_text()), "roofline": json.loads(FLOORS.read_text())}
     charts: dict[str, tuple[str, ...]] = {}
     for name in names or list(PLOTS):
         for th in (LIGHT, DARK):

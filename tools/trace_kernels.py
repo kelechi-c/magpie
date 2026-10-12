@@ -15,7 +15,7 @@ ROOT = pl.Path(__file__).resolve().parents[1]
 TRACES = ROOT / "out/trace/turbo"
 OUT = ROOT / "out/trace/kernels.json"
 CLASSES: tuple[tuple[str, str], ...] = (  # first matching substring wins
-    ("flash_fwd", "attention"), ("nchwToNhwc", "layout"), ("nhwcToNchw", "layout"), ("xmma", "conv"),
+    ("flash_fwd", "attention"), ("attend_kernel", "attention"), ("nchwToNhwc", "layout"), ("nhwcToNchw", "layout"), ("xmma", "conv"),
     ("cudnn", "conv"), ("gemm", "gemm"), ("copy_kernel", "copy"),
 )
 
