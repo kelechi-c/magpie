@@ -1,0 +1,1189 @@
+{
+  "generated": "2026-10-12T08:57:12+00:00",
+  "rules": {
+    "clip": "kept categories clipped to window; events outside window and other categories (incl. instants) dropped",
+    "dropped_phases": [
+      "f",
+      "s"
+    ],
+    "kept_categories": [
+      "M",
+      "gpu_memcpy",
+      "gpu_memset",
+      "gpu_user_annotation",
+      "kernel"
+    ],
+    "dit_step_spans": "outer 'dit step' spans excluded from gpu_named_spans (gpu durations not meaningful)",
+    "step_windows": "block 00 start to block 31 end, gpu side",
+    "zoom_pad_us": 100.0
+  },
+  "shots": [
+    {
+      "file": "assets/traces/mg_01-request.png",
+      "crop": "out/trace/crops/mg_01-request.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "all gpu annotations, 8 dit steps + vae decode",
+      "window_start_us": 937365994958.678,
+      "window_end_us": 937367859537.914,
+      "shift_us": 937365994958.678,
+      "window_ms": 1864.579,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memcpy": 75,
+        "gpu_memset": 53,
+        "gpu_user_annotation": 1864,
+        "kernel": 11920
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 288,
+          "total_ms": 221.159
+        },
+        "attention out": {
+          "count": 256,
+          "total_ms": 90.393
+        },
+        "block 00": {
+          "count": 8,
+          "total_ms": 53.629
+        },
+        "block 01": {
+          "count": 8,
+          "total_ms": 53.621
+        },
+        "block 02": {
+          "count": 8,
+          "total_ms": 53.627
+        },
+        "block 03": {
+          "count": 8,
+          "total_ms": 53.272
+        },
+        "block 04": {
+          "count": 8,
+          "total_ms": 53.262
+        },
+        "block 05": {
+          "count": 8,
+          "total_ms": 53.242
+        },
+        "block 06": {
+          "count": 8,
+          "total_ms": 53.26
+        },
+        "block 07": {
+          "count": 8,
+          "total_ms": 53.249
+        },
+        "block 08": {
+          "count": 8,
+          "total_ms": 53.255
+        },
+        "block 09": {
+          "count": 8,
+          "total_ms": 53.268
+        },
+        "block 10": {
+          "count": 8,
+          "total_ms": 53.255
+        },
+        "block 11": {
+          "count": 8,
+          "total_ms": 53.271
+        },
+        "block 12": {
+          "count": 8,
+          "total_ms": 53.258
+        },
+        "block 13": {
+          "count": 8,
+          "total_ms": 53.255
+        },
+        "block 14": {
+          "count": 8,
+          "total_ms": 53.269
+        },
+        "block 15": {
+          "count": 8,
+          "total_ms": 53.29
+        },
+        "block 16": {
+          "count": 8,
+          "total_ms": 53.278
+        },
+        "block 17": {
+          "count": 8,
+          "total_ms": 53.304
+        },
+        "block 18": {
+          "count": 8,
+          "total_ms": 53.279
+        },
+        "block 19": {
+          "count": 8,
+          "total_ms": 53.283
+        },
+        "block 20": {
+          "count": 8,
+          "total_ms": 53.27
+        },
+        "block 21": {
+          "count": 8,
+          "total_ms": 53.277
+        },
+        "block 22": {
+          "count": 8,
+          "total_ms": 53.296
+        },
+        "block 23": {
+          "count": 8,
+          "total_ms": 53.279
+        },
+        "block 24": {
+          "count": 8,
+          "total_ms": 53.283
+        },
+        "block 25": {
+          "count": 8,
+          "total_ms": 53.303
+        },
+        "block 26": {
+          "count": 8,
+          "total_ms": 53.309
+        },
+        "block 27": {
+          "count": 8,
+          "total_ms": 53.317
+        },
+        "block 28": {
+          "count": 8,
+          "total_ms": 53.297
+        },
+        "block 29": {
+          "count": 8,
+          "total_ms": 53.325
+        },
+        "block 30": {
+          "count": 8,
+          "total_ms": 53.331
+        },
+        "block 31": {
+          "count": 8,
+          "total_ms": 53.309
+        },
+        "head": {
+          "count": 8,
+          "total_ms": 0.525
+        },
+        "layer norm": {
+          "count": 512,
+          "total_ms": 9.087
+        },
+        "mlp (swiglu)": {
+          "count": 256,
+          "total_ms": 874.47
+        },
+        "modulation": {
+          "count": 8,
+          "total_ms": 1.751
+        },
+        "qkv + qk-norm + rope": {
+          "count": 256,
+          "total_ms": 448.519
+        },
+        "text embed": {
+          "count": 1,
+          "total_ms": 0.395
+        },
+        "time embed": {
+          "count": 8,
+          "total_ms": 1.978
+        },
+        "vae decode": {
+          "count": 1,
+          "total_ms": 147.429
+        },
+        "vae decoder mid": {
+          "count": 1,
+          "total_ms": 3.172
+        },
+        "vae up 0": {
+          "count": 1,
+          "total_ms": 4.074
+        },
+        "vae up 1": {
+          "count": 1,
+          "total_ms": 14.5
+        },
+        "vae up 2": {
+          "count": 1,
+          "total_ms": 24.917
+        },
+        "vae up 3": {
+          "count": 1,
+          "total_ms": 41.89
+        },
+        "vae up 4": {
+          "count": 1,
+          "total_ms": 53.801
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 54.07,
+        "distinct_colors": 1206,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_02-step.png",
+      "crop": "out/trace/crops/mg_02-step.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "dit step index 4 (4th decode step)",
+      "window_start_us": 937366856417.023,
+      "window_end_us": 937367069769.13,
+      "shift_us": 937366856417.023,
+      "window_ms": 213.352,
+      "categories_kept": {
+        "M": 58,
+        "gpu_user_annotation": 223,
+        "kernel": 1343
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 32,
+          "total_ms": 27.431
+        },
+        "attention out": {
+          "count": 32,
+          "total_ms": 11.286
+        },
+        "block 00": {
+          "count": 1,
+          "total_ms": 6.645
+        },
+        "block 01": {
+          "count": 1,
+          "total_ms": 6.644
+        },
+        "block 02": {
+          "count": 1,
+          "total_ms": 6.65
+        },
+        "block 03": {
+          "count": 1,
+          "total_ms": 6.644
+        },
+        "block 04": {
+          "count": 1,
+          "total_ms": 6.645
+        },
+        "block 05": {
+          "count": 1,
+          "total_ms": 6.646
+        },
+        "block 06": {
+          "count": 1,
+          "total_ms": 6.648
+        },
+        "block 07": {
+          "count": 1,
+          "total_ms": 6.644
+        },
+        "block 08": {
+          "count": 1,
+          "total_ms": 6.647
+        },
+        "block 09": {
+          "count": 1,
+          "total_ms": 6.645
+        },
+        "block 10": {
+          "count": 1,
+          "total_ms": 6.649
+        },
+        "block 11": {
+          "count": 1,
+          "total_ms": 6.647
+        },
+        "block 12": {
+          "count": 1,
+          "total_ms": 6.643
+        },
+        "block 13": {
+          "count": 1,
+          "total_ms": 6.644
+        },
+        "block 14": {
+          "count": 1,
+          "total_ms": 6.645
+        },
+        "block 15": {
+          "count": 1,
+          "total_ms": 6.644
+        },
+        "block 16": {
+          "count": 1,
+          "total_ms": 6.647
+        },
+        "block 17": {
+          "count": 1,
+          "total_ms": 6.646
+        },
+        "block 18": {
+          "count": 1,
+          "total_ms": 6.651
+        },
+        "block 19": {
+          "count": 1,
+          "total_ms": 6.646
+        },
+        "block 20": {
+          "count": 1,
+          "total_ms": 6.647
+        },
+        "block 21": {
+          "count": 1,
+          "total_ms": 6.648
+        },
+        "block 22": {
+          "count": 1,
+          "total_ms": 6.647
+        },
+        "block 23": {
+          "count": 1,
+          "total_ms": 6.646
+        },
+        "block 24": {
+          "count": 1,
+          "total_ms": 6.649
+        },
+        "block 25": {
+          "count": 1,
+          "total_ms": 6.653
+        },
+        "block 26": {
+          "count": 1,
+          "total_ms": 6.649
+        },
+        "block 27": {
+          "count": 1,
+          "total_ms": 6.652
+        },
+        "block 28": {
+          "count": 1,
+          "total_ms": 6.649
+        },
+        "block 29": {
+          "count": 1,
+          "total_ms": 6.646
+        },
+        "block 30": {
+          "count": 1,
+          "total_ms": 6.659
+        },
+        "block 31": {
+          "count": 1,
+          "total_ms": 6.663
+        },
+        "layer norm": {
+          "count": 63,
+          "total_ms": 1.097
+        },
+        "mlp (swiglu)": {
+          "count": 32,
+          "total_ms": 109.122
+        },
+        "qkv + qk-norm + rope": {
+          "count": 32,
+          "total_ms": 55.979
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 48.95,
+        "distinct_colors": 1177,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_03-block.png",
+      "crop": "out/trace/crops/mg_03-block.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "block 10 of dit step 4",
+      "window_start_us": 937366923073.395,
+      "window_end_us": 937366929722.811,
+      "shift_us": 937366923073.395,
+      "window_ms": 6.649,
+      "categories_kept": {
+        "M": 58,
+        "gpu_user_annotation": 6,
+        "kernel": 41
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 1,
+          "total_ms": 0.858
+        },
+        "attention out": {
+          "count": 1,
+          "total_ms": 0.353
+        },
+        "block 10": {
+          "count": 1,
+          "total_ms": 6.649
+        },
+        "layer norm": {
+          "count": 1,
+          "total_ms": 0.017
+        },
+        "mlp (swiglu)": {
+          "count": 1,
+          "total_ms": 3.407
+        },
+        "qkv + qk-norm + rope": {
+          "count": 1,
+          "total_ms": 1.751
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 46.96,
+        "distinct_colors": 1944,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_04-qkv.png",
+      "crop": "out/trace/crops/mg_04-qkv.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "zoom: block 10 qkv span",
+      "window_start_us": 937366923002.068,
+      "window_end_us": 937366924953.335,
+      "shift_us": 937366923002.068,
+      "window_ms": 1.951,
+      "categories_kept": {
+        "M": 58,
+        "gpu_user_annotation": 5,
+        "kernel": 32
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "layer norm": {
+          "count": 1,
+          "total_ms": 0.017
+        },
+        "qkv + qk-norm + rope": {
+          "count": 1,
+          "total_ms": 1.751
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 47.73,
+        "distinct_colors": 2036,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_05-mlp.png",
+      "crop": "out/trace/crops/mg_05-mlp.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "zoom: block 10 mlp span",
+      "window_start_us": 937366926149.814,
+      "window_end_us": 937366929756.475,
+      "shift_us": 937366926149.814,
+      "window_ms": 3.607,
+      "categories_kept": {
+        "M": 58,
+        "gpu_user_annotation": 5,
+        "kernel": 13
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "layer norm": {
+          "count": 2,
+          "total_ms": 0.034
+        },
+        "mlp (swiglu)": {
+          "count": 1,
+          "total_ms": 3.407
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 45.54,
+        "distinct_colors": 1384,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_06-step-boundary.png",
+      "crop": "out/trace/crops/mg_06-step-boundary.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "block 31 of dit step 4 to block 00 of dit step 5, one block context each side",
+      "window_start_us": 937367063106.498,
+      "window_end_us": 937367077012.079,
+      "shift_us": 937367063106.498,
+      "window_ms": 13.906,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memcpy": 1,
+        "gpu_memset": 3,
+        "gpu_user_annotation": 17,
+        "kernel": 114
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 2,
+          "total_ms": 1.715
+        },
+        "attention out": {
+          "count": 2,
+          "total_ms": 0.706
+        },
+        "block 00": {
+          "count": 1,
+          "total_ms": 6.656
+        },
+        "block 31": {
+          "count": 1,
+          "total_ms": 6.663
+        },
+        "head": {
+          "count": 1,
+          "total_ms": 0.064
+        },
+        "layer norm": {
+          "count": 3,
+          "total_ms": 0.066
+        },
+        "mlp (swiglu)": {
+          "count": 2,
+          "total_ms": 6.832
+        },
+        "modulation": {
+          "count": 1,
+          "total_ms": 0.191
+        },
+        "qkv + qk-norm + rope": {
+          "count": 2,
+          "total_ms": 3.51
+        },
+        "time embed": {
+          "count": 1,
+          "total_ms": 0.23
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 47.27,
+        "distinct_colors": 1930,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_07-vae-decode.png",
+      "crop": "out/trace/crops/mg_07-vae-decode.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "whole vae decode",
+      "window_start_us": 937367712109.027,
+      "window_end_us": 937367859537.914,
+      "shift_us": 937367712109.027,
+      "window_ms": 147.429,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memset": 29,
+        "gpu_user_annotation": 7,
+        "kernel": 564
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "vae decode": {
+          "count": 1,
+          "total_ms": 147.429
+        },
+        "vae decoder mid": {
+          "count": 1,
+          "total_ms": 3.172
+        },
+        "vae up 0": {
+          "count": 1,
+          "total_ms": 4.074
+        },
+        "vae up 1": {
+          "count": 1,
+          "total_ms": 14.5
+        },
+        "vae up 2": {
+          "count": 1,
+          "total_ms": 24.917
+        },
+        "vae up 3": {
+          "count": 1,
+          "total_ms": 41.89
+        },
+        "vae up 4": {
+          "count": 1,
+          "total_ms": 53.801
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 50.73,
+        "distinct_colors": 1861,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_08-vae-up.png",
+      "crop": "out/trace/crops/mg_08-vae-up.json",
+      "source": "out/trace/turbo/t2i_1024.json.gz",
+      "note": "zoom: vae up 4 chosen as the more busy of vae up 3/4 (53.801 ms gpu total)",
+      "window_start_us": 937367800656.746,
+      "window_end_us": 937367854657.43,
+      "shift_us": 937367800656.746,
+      "window_ms": 54.001,
+      "categories_kept": {
+        "M": 58,
+        "gpu_user_annotation": 3,
+        "kernel": 87
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "vae up 4": {
+          "count": 1,
+          "total_ms": 53.801
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 50.61,
+        "distinct_colors": 2267,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_09-edit-request.png",
+      "crop": "out/trace/crops/mg_09-edit-request.json",
+      "source": "out/trace/turbo/edit_1024.json.gz",
+      "note": "all gpu annotations of the edit request",
+      "window_start_us": 937379991481.147,
+      "window_end_us": 937382399287.033,
+      "shift_us": 937379991481.147,
+      "window_ms": 2407.806,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memcpy": 92,
+        "gpu_memset": 94,
+        "gpu_user_annotation": 1935,
+        "kernel": 12736
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 352,
+          "total_ms": 464.603
+        },
+        "attention out": {
+          "count": 256,
+          "total_ms": 101.616
+        },
+        "block 00": {
+          "count": 8,
+          "total_ms": 68.721
+        },
+        "block 01": {
+          "count": 8,
+          "total_ms": 68.624
+        },
+        "block 02": {
+          "count": 8,
+          "total_ms": 68.526
+        },
+        "block 03": {
+          "count": 8,
+          "total_ms": 68.61
+        },
+        "block 04": {
+          "count": 8,
+          "total_ms": 68.553
+        },
+        "block 05": {
+          "count": 8,
+          "total_ms": 68.628
+        },
+        "block 06": {
+          "count": 8,
+          "total_ms": 68.534
+        },
+        "block 07": {
+          "count": 8,
+          "total_ms": 68.638
+        },
+        "block 08": {
+          "count": 8,
+          "total_ms": 68.557
+        },
+        "block 09": {
+          "count": 8,
+          "total_ms": 68.609
+        },
+        "block 10": {
+          "count": 8,
+          "total_ms": 68.531
+        },
+        "block 11": {
+          "count": 8,
+          "total_ms": 68.669
+        },
+        "block 12": {
+          "count": 8,
+          "total_ms": 68.557
+        },
+        "block 13": {
+          "count": 8,
+          "total_ms": 68.636
+        },
+        "block 14": {
+          "count": 8,
+          "total_ms": 68.548
+        },
+        "block 15": {
+          "count": 8,
+          "total_ms": 68.641
+        },
+        "block 16": {
+          "count": 8,
+          "total_ms": 68.555
+        },
+        "block 17": {
+          "count": 8,
+          "total_ms": 68.68
+        },
+        "block 18": {
+          "count": 8,
+          "total_ms": 68.58
+        },
+        "block 19": {
+          "count": 8,
+          "total_ms": 68.731
+        },
+        "block 20": {
+          "count": 8,
+          "total_ms": 68.574
+        },
+        "block 21": {
+          "count": 8,
+          "total_ms": 68.71
+        },
+        "block 22": {
+          "count": 8,
+          "total_ms": 68.58
+        },
+        "block 23": {
+          "count": 8,
+          "total_ms": 68.729
+        },
+        "block 24": {
+          "count": 8,
+          "total_ms": 68.617
+        },
+        "block 25": {
+          "count": 8,
+          "total_ms": 68.682
+        },
+        "block 26": {
+          "count": 8,
+          "total_ms": 68.609
+        },
+        "block 27": {
+          "count": 8,
+          "total_ms": 68.702
+        },
+        "block 28": {
+          "count": 8,
+          "total_ms": 68.622
+        },
+        "block 29": {
+          "count": 8,
+          "total_ms": 68.723
+        },
+        "block 30": {
+          "count": 8,
+          "total_ms": 68.595
+        },
+        "block 31": {
+          "count": 8,
+          "total_ms": 68.732
+        },
+        "head": {
+          "count": 8,
+          "total_ms": 0.551
+        },
+        "layer norm": {
+          "count": 512,
+          "total_ms": 11.596
+        },
+        "mlp (swiglu)": {
+          "count": 256,
+          "total_ms": 978.423
+        },
+        "modulation": {
+          "count": 8,
+          "total_ms": 2.122
+        },
+        "qkv + qk-norm + rope": {
+          "count": 256,
+          "total_ms": 537.551
+        },
+        "text embed": {
+          "count": 1,
+          "total_ms": 0.551
+        },
+        "time embed": {
+          "count": 8,
+          "total_ms": 3.028
+        },
+        "vae decode": {
+          "count": 1,
+          "total_ms": 147.548
+        },
+        "vae decoder mid": {
+          "count": 1,
+          "total_ms": 3.181
+        },
+        "vae down 0": {
+          "count": 1,
+          "total_ms": 18.681
+        },
+        "vae down 1": {
+          "count": 1,
+          "total_ms": 9.226
+        },
+        "vae down 2": {
+          "count": 1,
+          "total_ms": 3.878
+        },
+        "vae down 3": {
+          "count": 1,
+          "total_ms": 2.931
+        },
+        "vae down 4": {
+          "count": 1,
+          "total_ms": 1.022
+        },
+        "vae encode": {
+          "count": 1,
+          "total_ms": 38.661
+        },
+        "vae encoder mid": {
+          "count": 1,
+          "total_ms": 1.993
+        },
+        "vae up 0": {
+          "count": 1,
+          "total_ms": 4.084
+        },
+        "vae up 1": {
+          "count": 1,
+          "total_ms": 14.524
+        },
+        "vae up 2": {
+          "count": 1,
+          "total_ms": 24.958
+        },
+        "vae up 3": {
+          "count": 1,
+          "total_ms": 41.926
+        },
+        "vae up 4": {
+          "count": 1,
+          "total_ms": 53.793
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 49.19,
+        "distinct_colors": 1305,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_10-edit-prefill-block.png",
+      "crop": "out/trace/crops/mg_10-edit-prefill-block.json",
+      "source": "out/trace/turbo/edit_1024.json.gz",
+      "note": "block 10 of dit step 0 (prefill)",
+      "window_start_us": 937380198743.974,
+      "window_end_us": 937380214282.87,
+      "shift_us": 937380198743.974,
+      "window_ms": 15.539,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memcpy": 2,
+        "gpu_memset": 1,
+        "gpu_user_annotation": 9,
+        "kernel": 62
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 4,
+          "total_ms": 2.807
+        },
+        "attention out": {
+          "count": 1,
+          "total_ms": 0.707
+        },
+        "block 10": {
+          "count": 1,
+          "total_ms": 15.539
+        },
+        "layer norm": {
+          "count": 1,
+          "total_ms": 0.033
+        },
+        "mlp (swiglu)": {
+          "count": 1,
+          "total_ms": 6.636
+        },
+        "qkv + qk-norm + rope": {
+          "count": 1,
+          "total_ms": 4.499
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 47.8,
+        "distinct_colors": 2155,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_11-vae-encode.png",
+      "crop": "out/trace/crops/mg_11-vae-encode.json",
+      "source": "out/trace/turbo/edit_1024.json.gz",
+      "note": "whole vae encode",
+      "window_start_us": 937379991481.147,
+      "window_end_us": 937380030142.212,
+      "shift_us": 937379991481.147,
+      "window_ms": 38.661,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memset": 9,
+        "gpu_user_annotation": 7,
+        "kernel": 428
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "vae down 0": {
+          "count": 1,
+          "total_ms": 18.681
+        },
+        "vae down 1": {
+          "count": 1,
+          "total_ms": 9.226
+        },
+        "vae down 2": {
+          "count": 1,
+          "total_ms": 3.878
+        },
+        "vae down 3": {
+          "count": 1,
+          "total_ms": 2.931
+        },
+        "vae down 4": {
+          "count": 1,
+          "total_ms": 1.022
+        },
+        "vae encode": {
+          "count": 1,
+          "total_ms": 38.661
+        },
+        "vae encoder mid": {
+          "count": 1,
+          "total_ms": 1.993
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 51.11,
+        "distinct_colors": 2037,
+        "ok": true
+      }
+    },
+    {
+      "file": "assets/traces/mg_12-block-2048.png",
+      "crop": "out/trace/crops/mg_12-block-2048.json",
+      "source": "out/trace/turbo/t2i_2048.json.gz",
+      "note": "block 10 of dit step 4, 16384 tokens",
+      "window_start_us": 937415891227.377,
+      "window_end_us": 937415928996.711,
+      "shift_us": 937415891227.377,
+      "window_ms": 37.769,
+      "categories_kept": {
+        "M": 58,
+        "gpu_memset": 1,
+        "gpu_user_annotation": 6,
+        "kernel": 41
+      },
+      "categories_dropped": [
+        "Trace",
+        "ac2g",
+        "cpu_op",
+        "cuda_driver",
+        "cuda_runtime",
+        "i",
+        "overhead",
+        "user_annotation"
+      ],
+      "gpu_named_spans": {
+        "attention (sdpa)": {
+          "count": 1,
+          "total_ms": 12.063
+        },
+        "attention out": {
+          "count": 1,
+          "total_ms": 1.336
+        },
+        "block 10": {
+          "count": 1,
+          "total_ms": 37.769
+        },
+        "layer norm": {
+          "count": 1,
+          "total_ms": 0.165
+        },
+        "mlp (swiglu)": {
+          "count": 1,
+          "total_ms": 13.383
+        },
+        "qkv + qk-norm + rope": {
+          "count": 1,
+          "total_ms": 9.095
+        }
+      },
+      "pixels": {
+        "width": 1920,
+        "height": 1080,
+        "stddev": 47.96,
+        "distinct_colors": 1974,
+        "ok": true
+      }
+    }
+  ]
+}

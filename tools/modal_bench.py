@@ -608,11 +608,8 @@ def freeze_rehearsal() -> str:
     return run_freeze("turbo", ["t2i_512", "edit_512"], offload=True)
 
 
-# the gate for a candidate build of `src/magpie`: only the dit and vae are loaded. results go to
-# /out/gate/<tag>/<variant>; compare against baseline/<variant>.json with GATE_MARGIN_DB.
-# tag "baseline" instead re-freezes the port half of the baseline against the existing references.
-@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
-def gate(variant: str, tag: str) -> str:
+# the port's dit and vae on the card, and nothing else: no pipeline, no text encoder.
+def load_port(variant: str) -> tuple[Any, Any]:
     import torch
     from diffusers import AutoencoderKLQwenImage21, QwenImage21Transformer2DModel
     from huggingface_hub import hf_hub_download
@@ -624,13 +621,111 @@ def gate(variant: str, tag: str) -> str:
     snapshot = pl.Path(hf_hub_download(REPOS[variant], "model_index.json", local_files_only=True)).parent
     transformer = QwenImage21Transformer2DModel.from_pretrained(f"{snapshot}/transformer", torch_dtype=torch.bfloat16).to("cuda")
     autoencoder = AutoencoderKLQwenImage21.from_pretrained(f"{snapshot}/vae", torch_dtype=torch.bfloat16).to("cuda")
-    dit, vae = lean.adopt(transformer.state_dict(), autoencoder.state_dict(), autoencoder.config.latents_mean, autoencoder.config.latents_std)
+    return lean.adopt(transformer.state_dict(), autoencoder.state_dict(), autoencoder.config.latents_mean, autoencoder.config.latents_std)
+
+
+# the gate for a candidate build of `src/magpie`: only the dit and vae are loaded. results go to
+# /out/gate/<tag>/<variant>; compare against baseline/<variant>.json with GATE_MARGIN_DB.
+# tag "baseline" instead re-freezes the port half of the baseline against the existing references.
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
+def gate(variant: str, tag: str) -> str:
+    import torch
+
+    dit, vae = load_port(variant)
     folder = pl.Path(OUT_ROOT) / "baseline" / variant
     out = folder / "magpie" if tag == "baseline" else pl.Path(OUT_ROOT) / "gate" / tag / variant
     result = {"variant": variant, "tag": tag, "device": device_info(), "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
               "magpie": gate_pass(dit, vae, variant, GATE_CASES, folder, out, {})}
     out_volume.commit()
     return json.dumps(result)
+
+
+# wraps `owner.attr` so every call shows up in the profiler trace as a named span.
+def label(owner: Any, attr: str, name: str) -> None:
+    from torch.profiler import record_function
+
+    function = getattr(owner, attr)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with record_function(name):
+            return function(*args, **kwargs)
+
+    setattr(owner, attr, wrapper)
+
+
+# names every stage of the port for the trace: steps, blocks, the pieces of a block, and the vae's levels.
+def label_port(dit: Any, vae: Any) -> None:
+    import magpie.dit as dit_module
+
+    label(dit, "prefill", "dit step 1 (prefill)")
+    label(dit, "decode", "dit step (decode)")
+    for attr, name in (("time_embed", "time embed"), ("text_embed", "text embed"), ("modulate", "modulation"), ("head", "head")):
+        label(dit, attr, name)
+    label(dit_module, "sdpa", "attention (sdpa)")
+    for index, block in enumerate(dit.transformer_blocks):
+        label(block, "prefill", f"block {index:02d}")
+        label(block, "decode", f"block {index:02d}")
+        label(block, "norm", "layer norm")
+        label(block.attn, "qkv", "qkv + qk-norm + rope")
+        label(block.attn, "out", "attention out")
+        label(block.img_mlp, "forward", "mlp (swiglu)")
+    label(vae, "encode", "vae encode")
+    label(vae, "decode", "vae decode")
+    label(vae.encoder.mid_block, "forward", "vae encoder mid")
+    label(vae.decoder.mid_block, "forward", "vae decoder mid")
+    for index, block in enumerate(vae.encoder.down_blocks):
+        label(block, "forward", f"vae down {index}")
+    for index, block in enumerate(vae.decoder.up_blocks):
+        label(block, "forward", f"vae up {index}")
+
+
+# one warm, profiled turbo request per case through the port's dit + vae. writes a chrome trace per case
+# to /out/trace/<variant>/ (open in perfetto) and returns gpu time per aten op. span times come from the
+# trace files (tools/trace_kernels.py): key_averages() double-counts nested labels.
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=1800, retries=0, volumes=VOLUMES)
+def trace(variant: str, cases: list[str]) -> str:
+    import gzip
+
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    import magpie.pipeline as lean
+    from magpie.sampling import BASE, TURBO
+
+    dit, vae = load_port(variant)
+    label_port(dit, vae)
+    sampler = TURBO if variant == "turbo" else BASE
+    folder, out = pl.Path(OUT_ROOT) / "baseline" / variant, pl.Path(OUT_ROOT) / "trace" / variant
+    out.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {"device": device_info()}
+    for case in cases:
+        spec = CASES[case]
+        saved = torch.load(folder / "conditioning" / case / "00.pt")
+        images = lean.resized(gate_input(case, 0)[1], spec["size"])
+
+        def request() -> Any:
+            return lean.render(dit, vae, saved["text"], saved["slots"], sampler, images, None if images else (spec["size"],) * 2, spec["size"], 0)
+
+        request()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        request()
+        torch.cuda.synchronize()
+        unprofiled = time.perf_counter() - start
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            start = time.perf_counter()
+            request()
+            torch.cuda.synchronize()
+            profiled = time.perf_counter() - start
+        prof.export_chrome_trace(str(out / f"{case}.json"))
+        (out / f"{case}.json.gz").write_bytes(gzip.compress((out / f"{case}.json").read_bytes()))
+        (out / f"{case}.json").unlink()
+        ops = {event.key: {"calls": event.count, "self_gpu_ms": event.self_device_time_total / 1e3}
+               for event in prof.key_averages() if event.key.startswith("aten::") and event.self_device_time_total > 0}
+        report[case] = {"unprofiled_ms": unprofiled * 1e3, "profiled_ms": profiled * 1e3, "ops": ops}
+        print(f"trace {case}: {unprofiled:.3f} s plain, {profiled:.3f} s profiled", flush=True)
+    out_volume.commit()
+    return json.dumps(report)
 
 
 # pass / fail of a gate run against the frozen baseline: per item, psnr against the official reference
@@ -660,6 +755,10 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         for name, payload in zip(("turbo", "base", "parity"), modal.FunctionCall.gather(*calls)):
             target = out / "parity.json" if name == "parity" else frozen / f"{name}.json"
             target.write_text(json.dumps(json.loads(payload), indent=1))
+        return
+    if mode == "trace":
+        (ROOT / "out" / "trace").mkdir(parents=True, exist_ok=True)
+        (ROOT / "out" / "trace" / "ops.json").write_text(json.dumps(json.loads(trace.remote("turbo", ["t2i_1024", "edit_1024", "t2i_2048"])), indent=1))
         return
     if mode == "gate":
         (ROOT / "out" / "gate").mkdir(parents=True, exist_ok=True)
