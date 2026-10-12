@@ -22,13 +22,12 @@ import numpy as np
 from PIL import Image
 
 type Event = dict[str, Any]
-Source = Literal["t2i_1024", "edit_1024", "t2i_2048"]
+Source = Literal["edit_1024", "edit_2048"]
 
 ROOT = pl.Path(__file__).resolve().parents[1]
 TRACES: dict[Source, pl.Path] = {
-    "t2i_1024": ROOT / "out/trace/turbo/t2i_1024.json.gz",
     "edit_1024": ROOT / "out/trace/turbo/edit_1024.json.gz",
-    "t2i_2048": ROOT / "out/trace/turbo/t2i_2048.json.gz",
+    "edit_2048": ROOT / "out/trace/turbo/edit_2048.json.gz",
 }
 CROPS = ROOT / "out/trace/crops"
 OUT = ROOT / "assets/traces"
@@ -158,34 +157,33 @@ def pad(span: Span, us: float) -> Span:
 
 def plan_shots(spans: dict[Source, tuple[Span, ...]]) -> tuple[Shot, ...]:
     """Choose the window of each of the twelve requested shots from GPU-side spans."""
-    t2i, edit, big = spans["t2i_1024"], spans["edit_1024"], spans["t2i_2048"]
-    t2i_steps, edit_steps, big_steps = step_windows(t2i), step_windows(edit), step_windows(big)
-    step = t2i_steps[DECODE_STEP]
-    block = child(t2i, step, f"block {BLOCK:02d}")
-    b31 = child(t2i, step, "block 31")
-    b00 = child(t2i, t2i_steps[DECODE_STEP + 1], "block 00")
-    up = max(("vae up 3", "vae up 4"), key=lambda n: sum(s.dur for s in named(t2i, n)))
-    up_ms = sum(s.dur for s in named(t2i, up)) / 1000
-    edit_block = child(edit, edit_steps[0], f"block {BLOCK:02d}")
-    big_block = child(big, big_steps[DECODE_STEP], f"block {BLOCK:02d}")
+    edit, big = spans["edit_1024"], spans["edit_2048"]
+    steps, big_steps = step_windows(edit), step_windows(big)
+    step = steps[DECODE_STEP]
+    block = child(edit, step, f"block {BLOCK:02d}")
+    b31 = child(edit, step, "block 31")
+    b00 = child(edit, steps[DECODE_STEP + 1], "block 00")
+    up = max(("vae up 3", "vae up 4"), key=lambda n: sum(s.dur for s in named(edit, n)))
+    up_ms = sum(s.dur for s in named(edit, up)) / 1000
     return (
-        Shot("mg_01-request", "t2i_1024", cover(t2i, "request"), "all gpu annotations, 8 dit steps + vae decode"),
-        Shot("mg_02-step", "t2i_1024", step, f"dit step index {DECODE_STEP} (4th decode step)"),
-        Shot("mg_03-block", "t2i_1024", block, f"block {BLOCK:02d} of dit step {DECODE_STEP}"),
-        Shot("mg_04-qkv", "t2i_1024",
-             pad(child(t2i, block, "qkv + qk-norm + rope"), PAD_US), f"zoom: block {BLOCK:02d} qkv span"),
-        Shot("mg_05-mlp", "t2i_1024",
-             pad(child(t2i, block, "mlp (swiglu)"), PAD_US), f"zoom: block {BLOCK:02d} mlp span"),
-        Shot("mg_06-step-boundary", "t2i_1024", Span("boundary", b31.ts, b00.end - b31.ts),
+        Shot("mg_01-request", "edit_1024", cover(edit, "request"), "all gpu annotations: vae encode, 8 dit steps, vae decode"),
+        Shot("mg_02-step", "edit_1024", step, f"dit step index {DECODE_STEP} (4th decode step)"),
+        Shot("mg_03-block", "edit_1024", block, f"block {BLOCK:02d} of dit step {DECODE_STEP}"),
+        Shot("mg_04-qkv", "edit_1024",
+             pad(child(edit, block, "qkv + qk-norm + rope"), PAD_US), f"zoom: block {BLOCK:02d} qkv span"),
+        Shot("mg_05-mlp", "edit_1024",
+             pad(child(edit, block, "mlp (swiglu)"), PAD_US), f"zoom: block {BLOCK:02d} mlp span"),
+        Shot("mg_06-step-boundary", "edit_1024", Span("boundary", b31.ts, b00.end - b31.ts),
              f"block 31 of dit step {DECODE_STEP} to block 00 of dit step {DECODE_STEP + 1}, one block context each side"),
-        Shot("mg_07-vae-decode", "t2i_1024", single(t2i, "vae decode"), "whole vae decode"),
-        Shot("mg_08-vae-up", "t2i_1024", pad(cover(named(t2i, up), up), PAD_US),
+        Shot("mg_07-vae-decode", "edit_1024", single(edit, "vae decode"), "whole vae decode"),
+        Shot("mg_08-vae-up", "edit_1024", pad(cover(named(edit, up), up), PAD_US),
              f"zoom: {up} chosen as the more busy of vae up 3/4 ({up_ms:.3f} ms gpu total)"),
-        Shot("mg_09-edit-request", "edit_1024", cover(edit, "request"), "all gpu annotations of the edit request"),
-        Shot("mg_10-edit-prefill-block", "edit_1024", edit_block,
+        Shot("mg_09-prefill-block", "edit_1024", child(edit, steps[0], f"block {BLOCK:02d}"),
              f"block {BLOCK:02d} of dit step 0 (prefill)"),
-        Shot("mg_11-vae-encode", "edit_1024", single(edit, "vae encode"), "whole vae encode"),
-        Shot("mg_12-block-2048", "t2i_2048", big_block, f"block {BLOCK:02d} of dit step {DECODE_STEP}, 16384 tokens"),
+        Shot("mg_10-vae-encode", "edit_1024", single(edit, "vae encode"), "whole vae encode"),
+        Shot("mg_11-block-2048", "edit_2048", child(big, big_steps[DECODE_STEP], f"block {BLOCK:02d}"),
+             f"block {BLOCK:02d} of dit step {DECODE_STEP}, 16384 target tokens over a 16384-token cached prefix"),
+        Shot("mg_12-request-2048", "edit_2048", cover(big, "request"), "all gpu annotations of the 2048 edit"),
     )
 
 

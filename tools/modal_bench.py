@@ -758,7 +758,7 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         return
     if mode == "trace":
         (ROOT / "out" / "trace").mkdir(parents=True, exist_ok=True)
-        (ROOT / "out" / "trace" / "ops.json").write_text(json.dumps(json.loads(trace.remote("turbo", ["t2i_1024", "edit_1024", "t2i_2048"])), indent=1))
+        (ROOT / "out" / "trace" / "ops.json").write_text(json.dumps(json.loads(trace.remote("turbo", ["edit_1024", "edit_2048"])), indent=1))
         return
     if mode == "gate":
         (ROOT / "out" / "gate").mkdir(parents=True, exist_ok=True)

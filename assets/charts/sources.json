@@ -1,8 +1,8 @@
 {
-  "generated": "2026-10-11",
+  "generated": "2026-10-12",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": null
+    "head": "23bbd8cdb5d1f7f8dfba5a2d200033f0b178c4de"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -10,35 +10,31 @@
   },
   "charts": {
     "stage-split": [
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].total_ms",
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].text_ms",
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].dit_ms",
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].vae_encode_ms",
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].vae_decode_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].total_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].text_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].dit_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].vae_encode_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].vae_decode_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].total_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].text_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].dit_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].vae_encode_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].vae_decode_ms",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].total_ms",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].text_ms",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].dit_ms",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].vae_encode_ms",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].vae_decode_ms",
       "rows[variant=base,engine=diffusers,case=edit_1024].total_ms",
       "rows[variant=base,engine=diffusers,case=edit_1024].text_ms",
       "rows[variant=base,engine=diffusers,case=edit_1024].dit_ms",
       "rows[variant=base,engine=diffusers,case=edit_1024].vae_encode_ms",
-      "rows[variant=base,engine=diffusers,case=edit_1024].vae_decode_ms"
+      "rows[variant=base,engine=diffusers,case=edit_1024].vae_decode_ms",
+      "rows[variant=base,engine=diffusers,case=edit_2048].total_ms",
+      "rows[variant=base,engine=diffusers,case=edit_2048].text_ms",
+      "rows[variant=base,engine=diffusers,case=edit_2048].dit_ms",
+      "rows[variant=base,engine=diffusers,case=edit_2048].vae_encode_ms",
+      "rows[variant=base,engine=diffusers,case=edit_2048].vae_decode_ms"
     ],
     "request-latency": [
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].total_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].total_ms",
-      "rows[variant=turbo,engine=diffusers,case=t2i_2048].total_ms",
       "rows[variant=turbo,engine=diffusers,case=edit_2048].total_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].total_ms",
       "rows[variant=base,engine=diffusers,case=edit_1024].total_ms",
-      "rows[variant=base,engine=diffusers,case=t2i_2048].total_ms",
       "rows[variant=base,engine=diffusers,case=edit_2048].total_ms"
     ],
     "prefix-cache": [
@@ -50,31 +46,27 @@
       "rows[variant=turbo,engine=diffusers,case=edit_1024_nocache].total_ms"
     ],
     "utilisation": [
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].later_step_tflops",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].later_step_tflops",
-      "rows[variant=base,engine=diffusers,case=t2i_1024].later_step_tflops",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].later_step_tflops",
       "rows[variant=base,engine=diffusers,case=edit_1024].later_step_tflops",
+      "rows[variant=base,engine=diffusers,case=edit_2048].later_step_tflops",
       "roofline.gemm_8192_bf16_tflops",
       "roofline.mlp_4096x4096x12288_bf16_tflops",
       "roofline.sdpa_16384_bf16_tflops"
     ],
     "peak-memory": [
-      "rows[variant=turbo,engine=diffusers,case=t2i_1024].peak_gib",
       "rows[variant=turbo,engine=diffusers,case=edit_1024].peak_gib",
-      "rows[variant=turbo,engine=diffusers,case=t2i_2048].peak_gib",
       "rows[variant=turbo,engine=diffusers,case=edit_2048].peak_gib",
-      "rows[variant=turbo,engine=magpie,case=t2i_1024].peak_gib",
       "rows[variant=turbo,engine=magpie,case=edit_1024].peak_gib",
-      "rows[variant=turbo,engine=magpie,case=t2i_2048].peak_gib",
       "rows[variant=turbo,engine=magpie,case=edit_2048].peak_gib",
       "resident_gib",
       "device.vram_gib"
     ],
     "op-groups": [
-      "op_groups_ms.t2i_1024.matmul (linear layers)",
-      "op_groups_ms.t2i_1024.attention",
-      "op_groups_ms.t2i_1024.convolution (vae)",
-      "op_groups_ms.t2i_1024.elementwise, casts and copies"
+      "op_groups_ms.edit_1024.matmul (linear layers)",
+      "op_groups_ms.edit_1024.attention",
+      "op_groups_ms.edit_1024.convolution (vae)",
+      "op_groups_ms.edit_1024.elementwise, casts and copies"
     ]
   }
 }

@@ -31,15 +31,12 @@ RTX_5090_GB = 32.0
 ROOFLINE: tuple[str, ...] = ("gemm_8192_bf16_tflops", "mlp_4096x4096x12288_bf16_tflops", "sdpa_16384_bf16_tflops")
 STAGE_FIELDS: tuple[str, ...] = ("total_ms", "text_ms", "dit_ms", "vae_encode_ms", "vae_decode_ms")
 CaseRow = tuple[str, str, str]  # (variant, case, label)
-CASE_ROWS: tuple[CaseRow, ...] = (
-    (TURBO, "t2i_1024", "Turbo (8 steps)\ntext-to-image"), (TURBO, "edit_1024", "Turbo (8 steps)\nedit"),
-    (BASE, "t2i_1024", "base (40 steps)\ntext-to-image"), (BASE, "edit_1024", "base (40 steps)\nedit"),
+CASE_ROWS: tuple[CaseRow, ...] = (  # edits only: the project follows image editing
+    (TURBO, "edit_1024", "Turbo (8 steps)\nedit 1024"), (TURBO, "edit_2048", "Turbo (8 steps)\nedit 2048"),
+    (BASE, "edit_1024", "base (40 steps)\nedit 1024"), (BASE, "edit_2048", "base (40 steps)\nedit 2048"),
 )
-SIZE_ROWS: tuple[tuple[str, str], ...] = (
-    ("t2i_1024", "text-to-image\n1024"), ("edit_1024", "edit\n1024"),
-    ("t2i_2048", "text-to-image\n2048"), ("edit_2048", "edit\n2048"),
-)
-SCALE_PAIRS: tuple[tuple[str, str], ...] = (("t2i_2048", "t2i_1024"), ("edit_2048", "edit_1024"))
+SIZE_ROWS: tuple[tuple[str, str], ...] = (("edit_1024", "edit\n1024"), ("edit_2048", "edit\n2048"))
+SCALE_PAIRS: tuple[tuple[str, str], ...] = (("edit_2048", "edit_1024"),)
 OP_LABELS: dict[str, str] = {
     "matmul (linear layers)": "matmul\n(linear layers)", "attention": "attention",
     "convolution (vae)": "convolution\n(VAE)", "elementwise, casts and copies": "elementwise, casts\nand copies",
@@ -92,7 +89,7 @@ def stage_split(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ..
         shares.append((total, pct(text, total), pct(dit, total), pct(enc + dec, total)))
     dit_share = [s[2] for s in shares]
     fig, ax = canvas(th, sh, sh.pick(5.2, 6.4),
-                     f"The DiT takes {min(dit_share):.0f} to {max(dit_share):.0f} percent of every official request",
+                     f"The DiT takes {min(dit_share):.0f} to {max(dit_share):.0f} percent of every edit request",
                      "Percent of each request's total time, official pipeline, bf16, batch 1. Total seconds at right.",
                      "One NVIDIA RTX PRO 6000 Blackwell (95 GiB), PyTorch 2.14.1, CUDA 13.0. Warm p50 of 5 Turbo and 3 "
                      "base requests. The unfilled end of each bar is other overhead, under 3 %. VAE encode and decode "
@@ -116,17 +113,17 @@ def stage_split(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ..
 
 
 def request_latency(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
-    """End-to-end seconds, Turbo against base, for text-to-image and edit at 1024 and 2048."""
+    """End-to-end seconds, Turbo against base, for an edit at 1024 and 2048."""
     tt = {c: get(d, TURBO, OFFICIAL, c, "total_ms") for c, _ in SIZE_ROWS}
     bb = {c: get(d, BASE, OFFICIAL, c, "total_ms") for c, _ in SIZE_ROWS}
     srcs = tuple(p.src for p in (*tt.values(), *bb.values()))
     speed = [bb[c].value / tt[c].value for c, _ in SIZE_ROWS]
     cost = [row[big].value / row[small].value for row in (tt, bb) for big, small in SCALE_PAIRS]
-    fig, ax = canvas(th, sh, sh.pick(5.6, 7.4),
+    fig, ax = canvas(th, sh, sh.pick(4.2, 5.4),
                      f"Turbo is {min(speed):.1f} to {max(speed):.1f} x faster than base, end to end",
-                     "Seconds per request, warm p50, official pipeline, batch 1. Lower is better.",
-                     f"At 2048 each request costs {min(cost):.1f} to {max(cost):.1f} times its 1024 time. Edit rows "
-                     "include the VAE encode of the input image. One RTX PRO 6000 Blackwell, bf16.",
+                     "Seconds per edit request, warm p50, official pipeline, batch 1. Lower is better.",
+                     f"At 2048 an edit costs {min(cost):.1f} to {max(cost):.1f} times its 1024 time. Each request "
+                     "includes the VAE encode of the input image. One RTX PRO 6000 Blackwell, bf16.",
                      left=sh.pick(2.5, 2.1), right=sh.pick(2.9, 1.0),
                      key=[(th.hero, "Turbo (8 steps)"), (th.other, "base (40 steps)")])
     n = len(SIZE_ROWS)
@@ -182,7 +179,7 @@ def utilisation(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ..
     square, model, attn = (p.value for p in roof)
     lo, hi = min(u.value for u in util), max(u.value for u in util)
     fig, ax = canvas(th, sh, sh.pick(5.2, 6.8),
-                     f"At 1024, DiT steps run at {pct(lo, square):.0f} to {pct(hi, square):.0f} "
+                     f"DiT steps in an edit run at {pct(lo, square):.0f} to {pct(hi, square):.0f} "
                      "percent of the card's measured matmul speed",
                      "Achieved TFLOP/s per denoising step after the first, official pipeline, bf16. Higher is better.",
                      f"Against the model-shaped matmul ({model:.1f} TFLOP/s) the same steps reach {pct(lo, model):.0f} "
@@ -213,12 +210,12 @@ def peak_memory(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ..
     card = Pt(d["device"]["vram_gib"], "device.vram_gib")
     saved = [o.value - l.value for o, l in zip(off, lean)]
     srcs = tuple(p.src for p in (*off, *lean, weights, card))
-    fig, ax = canvas(th, sh, sh.pick(5.6, 7.4),
+    fig, ax = canvas(th, sh, sh.pick(4.4, 5.6),
                      f"The lean port needs {min(saved):.1f} to {max(saved):.1f} GiB less at peak",
-                     "Peak GPU memory in GiB during one Turbo (8 steps) request, batch 1. Lower is better.",
+                     "Peak GPU memory in GiB during one Turbo (8 steps) edit, batch 1, text encoder loaded. Lower is better.",
                      f"Dotted line: resident weights, {gib(weights.value)}. Dashed: the 32 GB RTX 5090, plotted as 32 "
-                     f"GiB, and this card at {gib(card.value)}. The lowest lean-port peak, "
-                     f"{gib(min(l.value for l in lean))}, does not fit a 32 GB card even unquantised.",
+                     f"GiB, and this card at {gib(card.value)}. With the text encoder on the card the lowest lean-port "
+                     f"peak, {gib(min(l.value for l in lean))}, still misses 32 GB.",
                      left=sh.pick(2.5, 2.1), right=sh.pick(1.0, 0.9),
                      key=[(th.other, "official pipeline"), (th.hero, "lean port")])
     n = len(SIZE_ROWS)
@@ -244,8 +241,8 @@ def peak_memory(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ..
 
 
 def op_groups(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
-    """GPU time per operation group for one text-to-image request at 1024, from the profile in summary.json."""
-    ops = {k: Pt(v, f"op_groups_ms.t2i_1024.{k}") for k, v in d["op_groups_ms"]["t2i_1024"].items()}
+    """GPU time per operation group for one edit request at 1024, from the profile in summary.json."""
+    ops = {k: Pt(v, f"op_groups_ms.edit_1024.{k}") for k, v in d["op_groups_ms"]["edit_1024"].items()}
     total = sum(p.value for p in ops.values())
     srcs = tuple(p.src for p in ops.values())
     order = sorted(ops, key=lambda k: -ops[k].value)
@@ -255,7 +252,7 @@ def op_groups(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]
     fig, ax = canvas(th, sh, sh.pick(4.6, 5.6),
                      f"Matmul is {pct(matmul, total):.0f} percent of op time; elementwise, casts and copies cost "
                      f"{elem / attn:.1f} times attention",
-                     "Milliseconds of GPU time in one Turbo text-to-image request at 1024, by operation group.",
+                     "Milliseconds of GPU time in one Turbo edit request at 1024, by operation group.",
                      f"Turbo, official pipeline, one profiled request (torch profiler, top 30 ops). Shares are of "
                      f"the four groups' {total:.0f} ms sum.",
                      left=sh.pick(2.6, 2.1), right=sh.pick(1.0, 0.9))
