@@ -1,12 +1,13 @@
 """what low-precision linear layers would buy and cost, before any are built. no provider in it.
 
-    python tools/quant_probe.py speed|quality|ranges|ablate
+    python tools/quant_probe.py speed|quality|ranges|ablate|inside
 
 `speed`: tflop/s of a matmul at the dit's three linear shapes, for torch (cublas) and a plain triton gemm
 in bf16, fp16, fp8 (e4m3) and int8. `quality`: the dit's step error on the gate items when its block
 linears see fp8- or nvfp4-rounded weights and activations (arithmetic still bf16, so only rounding is measured).
 `ranges`: the largest hidden value of every block's mlp over the gate items, which decides how its fp8 scale must be chosen.
 `ablate`: the current build through the gate (images, step error, dinov2), then again with the attention linears fp8-rounded.
+`inside`: the same gate with changes inside attention: fp8 q and k, fp8 v, reference keys merged 2x2.
 """
 
 import itertools
@@ -160,7 +161,6 @@ def step_pass(dit: Any, case: str, items: int) -> list[list[float]]:
 # the activations entering them. every format on all linears over the five gate items, then one group of
 # linears at a time over two items to see which layers carry the error.
 def quality(case: str = "edit_1024") -> str:
-    import torch
     from torch import nn
 
     import magpie.dit as dit_module
@@ -246,5 +246,72 @@ def ablate(case: str = "edit_1024") -> str:
     return json.dumps(report)
 
 
+# the gate on the current build with one change inside attention at a time, all emulated in torch so only the
+# quality is measured: q and k rounded to fp8 per (token, head) (what an fp8 score matmul would see), v rounded
+# the same way, and the reference image's keys and values averaged over 2x2 token groups with ln 4 added to
+# their logits (so a merged key keeps the weight of the four it replaces; 8,239 keys become 5,167 at 1024).
+# keys are averaged either as they are (rope already applied) or with rope undone first and reapplied at the
+# group's centre. `pick` limits the run to the probes whose label contains it.
+def inside(pick: str = "", case: str = "edit_1024") -> str:
+    import math
+
+    import torch
+
+    import magpie.dit as dit_module
+    import magpie.pipeline as lean
+    from gate import OUT_ROOT, gate_pass, load_port
+
+    dit, vae = load_port("turbo")
+    folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
+    plain, build = dit_module.attend, dit_module.layout
+    seen: dict[str, Any] = {}
+
+    def layout(slots: Any, shapes: list, cfg: Any) -> Any:
+        seen.update(lay=build(slots, shapes, cfg), shape=shapes[0])
+        return seen["lay"]
+
+    def merged(q: Any, k: Any, v: Any, bound: float, mask: Any = None, centred: bool = False) -> Any:
+        lay, (height, width) = seen["lay"], seen["shape"]
+        if mask is not None or k.shape[1] != lay.image.numel() or q.shape[1] != k.shape[1] - lay.prefix:
+            return plain(q, k, v, bound, mask)
+        image = lay.image[: lay.prefix]
+        grid = (height // 2, 2, width // 2, 2)
+
+        def fold(x: Any, rotated: bool) -> Any:
+            rows = x[:, : lay.prefix][:, image].float()
+            if rotated:  # undo each token's rope, average, then rotate by the phase of the group's centre
+                phase = lay.rope[: lay.prefix][image].unflatten(0, grid)
+                corner = phase[:, 0, :, 0]
+                centre = (corner * torch.sqrt(phase[:, 0, :, 1] / corner) * torch.sqrt(phase[:, 1, :, 0] / corner)).flatten(0, 1)
+                pairs = torch.view_as_complex(rows.unflatten(-1, (-1, 2)).contiguous()) * lay.rope[: lay.prefix][image].conj()[None, :, None]
+                groups = torch.view_as_real(pairs.unflatten(1, grid).mean((2, 4)).flatten(1, 2) * centre[None, :, None]).flatten(-2)
+            else:
+                groups = rows.unflatten(1, grid).mean((2, 4)).flatten(1, 2)
+            return torch.cat([x[:, : lay.prefix][:, ~image], groups.to(x.dtype), x[:, lay.prefix :]], dim=1)
+
+        texts, groups = int((~image).sum()), height * width // 4
+        bias = q.new_zeros(texts + groups + q.shape[1])
+        bias[texts : texts + groups] = math.log(4)
+        return dit_module.sdpa(q, fold(k, centred), fold(v, False), bias[None])
+
+    probes = {"current build": plain,
+              "fp8 q and k": lambda q, k, v, bound, mask=None: plain(fp8_rounded(q), fp8_rounded(k), v, bound, mask),
+              "fp8 v": lambda q, k, v, bound, mask=None: plain(q, k, fp8_rounded(v), bound, mask),
+              "reference keys merged 2x2": merged,
+              "reference keys merged 2x2, rope at the centre": lambda q, k, v, bound, mask=None: merged(q, k, v, bound, mask, True)}
+    dit_module.layout = lean.layout = layout
+    report: dict[str, Any] = {}
+    for label, attend in probes.items():
+        if pick not in label:
+            continue
+        dit_module.attend = attend
+        row = gate_pass(dit, vae, "turbo", [case], folder, pl.Path(OUT_ROOT) / "gate" / f"inside-{list(probes).index(label)}" / "turbo", {})[case]
+        steps = [e for item in row["step_error"] for e in item]
+        report[label] = {"worst_step_error": max(steps), "mean_step_error": sum(steps) / len(steps), "dino": row["dino_vs_baseline"],
+                         "psnr_vs_baseline_db": row["psnr_vs_baseline_db"]}
+        print(label, json.dumps(report[label]), flush=True)
+    return json.dumps(report)
+
+
 if __name__ == "__main__":
-    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate}[sys.argv[1]]())
+    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate, "inside": inside}[sys.argv[1]](*sys.argv[2:]))

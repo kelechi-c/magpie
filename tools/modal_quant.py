@@ -38,12 +38,19 @@ def run_ablate() -> str:
     return ablate()
 
 
-# modal run tools/modal_quant.py [--only speed,quality,ranges,ablate]: the chosen probes at once -> out/quant/<name>.json
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
+def run_inside(pick: str = "", case: str = "edit_1024") -> str:
+    from quant_probe import inside
+
+    return inside(pick, case)
+
+
+# modal run tools/modal_quant.py [--only speed,quality,ranges,ablate,inside]: the chosen probes at once -> out/quant/<name>.json
 @app.local_entrypoint()
-def main(only: str = "speed,quality") -> None:
+def main(only: str = "speed,quality", pick: str = "", case: str = "edit_1024") -> None:
     out = ROOT / "out" / "quant"
     out.mkdir(parents=True, exist_ok=True)
     names = only.split(",")
-    calls = [{"speed": run_speed, "quality": run_quality, "ranges": run_ranges, "ablate": run_ablate}[name].spawn() for name in names]
+    calls = [{"speed": run_speed, "quality": run_quality, "ranges": run_ranges, "ablate": run_ablate, "inside": run_inside}[name].spawn(*((pick, case) if name == "inside" else ())) for name in names]
     for name, payload in zip(names, modal.FunctionCall.gather(*calls)):
         (out / f"{name}.json").write_text(json.dumps(json.loads(payload), indent=1))
