@@ -20,7 +20,8 @@ import triton.language as tl
 
 SHAPES = [(4096, 4096, 4096), (4096, 4096, 12288), (4096, 12288, 4096)]  # (tokens, in, out): q/k/v/out, mlp in, mlp out
 TILES = list(itertools.product(((128, 128, 32), (128, 128, 64), (128, 256, 32), (128, 256, 64), (256, 128, 32), (64, 128, 64), (128, 128, 128)), (4, 8)))
-GROUPS = {"all": ("",), "qkv": ("to_q", "to_k", "to_v"), "attn_out": ("to_out.0",), "mlp_in": ("proj", "gate_layer"), "mlp_out": ("img_mlp.out",)}
+GROUPS = {"all": ("",), "qkv": ("to_q", "to_k", "to_v"), "attn_out": ("to_out.0",), "mlp_in": ("proj", "gate_layer"), "mlp_out": ("img_mlp.out",),
+          "q": ("to_q",), "k": ("to_k",), "v": ("to_v",)}
 
 
 # out = x @ w for one (BM, BN) tile of the output: x is (M, K), w is (K, N), walked BK columns of x at a time.
@@ -216,17 +217,17 @@ def ranges(case: str = "edit_1024") -> str:
 
 
 # the gate on the build as it is, then with fp8-rounded weights and inputs on the attention linears (the layers
-# still in bf16): q/k/v, the output projection, both. each row is a full gate verdict against the frozen baseline.
+# still in bf16), one projection or pair at a time. each row is a full gate verdict against the frozen baseline.
 def ablate(case: str = "edit_1024") -> str:
     from torch import nn
 
     from gate import OUT_ROOT, gate_pass, load_port
 
-    dit, vae = load_port("turbo")
+    dit, vae = load_port("turbo", slim=False, attention=False)
     folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
     linears = {name: module for name, module in dit.transformer_blocks.named_modules() if isinstance(module, nn.Linear)}
     report: dict[str, Any] = {}
-    for label, groups in (("mlp only", ()), ("+ q/k/v", ("qkv",)), ("+ attention out", ("attn_out",)), ("+ q/k/v + attention out", ("qkv", "attn_out"))):
+    for label, groups in (("+ q", ("q",)), ("+ k", ("k",)), ("+ v", ("v",)), ("+ q + k", ("q", "k")), ("+ v + attention out", ("v", "attn_out"))):
         chosen = [name for name in linears if any(name.endswith(end) for group in groups for end in GROUPS[group])]
         plain = {name: linears[name].weight.data for name in chosen}
         hooks = [linears[name].register_forward_pre_hook(lambda _, args: (fp8_rounded(args[0]),)) for name in chosen]

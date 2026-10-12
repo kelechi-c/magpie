@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import Fp8Mlp, flash, max_free, mlp_fp8, norm_mod, qk_prep
+from magpie.kernels import (Fp8Attention, Fp8Mlp, flash, fp8_blocks, fp8_linear, fp8_norm, fp8_project, max_free, mlp_fp8, norm_mod,
+                            qk_prep)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -110,6 +111,11 @@ def prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float, out: Tensor | None
     return plain if out is None else out.copy_(plain)
 
 
+# true when a layer carries packed fp8 weights (`pipeline.adopt` packs them) and x is bf16 on the gpu.
+def fp8_ready(packed: Fp8Attention | Fp8Mlp | None, x: Tensor) -> bool:
+    return packed is not None and x.is_cuda and x.dtype == torch.bfloat16
+
+
 # layer_norm(x) * mod, the input of both branches of a block; one kernel for bf16 tensors on the gpu.
 def normed(x: Tensor, mod: Tensor, eps: float) -> Tensor:
     fused = x.is_cuda and x.dtype == torch.bfloat16
@@ -151,6 +157,7 @@ class Attention(nn.Module):
         super().__init__()
         self.heads, self.eps = cfg.heads, cfg.eps
         self.bound = math.inf  # largest possible logit; `pipeline.adopt` sets it from the loaded qk-norm weights
+        self.packed: Fp8Attention | None = None
         self.to_q, self.to_k, self.to_v = (nn.Linear(cfg.width, cfg.width, bias=False) for _ in range(3))
         self.to_out = nn.ModuleList([nn.Linear(cfg.width, cfg.width, bias=False)])
         self.norm_q = nn.Module()
@@ -158,18 +165,28 @@ class Attention(nn.Module):
         self.norm_q.weight = nn.Parameter(torch.ones(cfg.width // cfg.heads))
         self.norm_k.weight = nn.Parameter(torch.ones(cfg.width // cfg.heads))
 
-    # projects to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
-    # with `into` = (keys, values) views of a kv buffer, k and v are written straight there.
-    def qkv(self, x: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor]:
-        q, k = (proj(x).unflatten(-1, (self.heads, -1)) for proj in (self.to_q, self.to_k))
+    # layer_norm(x) * mod projected to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
+    # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. with fp8 weights
+    # the norm writes fp8 rows and the three projections are fp8 matmuls.
+    def qkv(self, x: Tensor, mod: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        heads = (self.heads, -1)
+        if fp8_ready(self.packed, x):
+            rows, step = fp8_norm(x.flatten(0, 1), mod.flatten(0, 1).contiguous(), self.eps)
+            q, k = (fp8_project(rows, step, linear).view(*x.shape[:2], *heads) for linear in (self.packed.q, self.packed.k))
+            v = fp8_project(rows, step, self.packed.v, None if into is None else into[1].flatten(0, 1).flatten(1))
+        else:
+            n = normed(x, mod, self.eps)
+            q, k = (proj(n).unflatten(-1, heads) for proj in (self.to_q, self.to_k))
+            v = self.to_v(n) if into is None else torch.matmul(n, self.to_v.weight.t(), out=into[1].flatten(2))
         q = prep(q, self.norm_q.weight, rope, self.eps)
-        if into is None:
-            return q, prep(k, self.norm_k.weight, rope, self.eps), self.to_v(x).unflatten(-1, (self.heads, -1))
-        torch.matmul(x, self.to_v.weight.t(), out=into[1].flatten(2))
-        return q, prep(k, self.norm_k.weight, rope, self.eps, into[0]), into[1]
+        return q, prep(k, self.norm_k.weight, rope, self.eps, None if into is None else into[0]), v.view(*x.shape[:2], *heads)
 
-    def out(self, x: Tensor) -> Tensor:
-        return self.to_out[0](x.flatten(2, 3))
+    # the attention branch's residual: skip + gate * to_out(attended).
+    def out(self, attended: Tensor, skip: Tensor, gate: Tensor) -> Tensor:
+        if fp8_ready(self.packed, skip):
+            blocks, steps = fp8_blocks(attended.reshape(-1, skip.shape[-1]))
+            return fp8_linear(blocks, steps, *self.packed.out, skip.flatten(0, 1), gate.flatten(0, 1).contiguous()).view_as(skip)
+        return torch.addcmul(skip, gate, self.to_out[0](attended.flatten(2, 3)))
 
 
 class SwiGLU(nn.Module):
@@ -186,10 +203,9 @@ class SwiGLU(nn.Module):
 
 
 # a block's mlp branch with its residual: `x + gate * mlp(layer_norm(x) * mod)` defines it; bf16 tensors on
-# the gpu take the fp8 kernels when the mlp carries packed fp8 weights (`pipeline.adopt` packs them).
+# the gpu take the fp8 kernels when the mlp carries packed fp8 weights.
 def feed(mlp: SwiGLU, x: Tensor, mod: Tensor, gate: Tensor, eps: float) -> Tensor:
-    fused = mlp.packed is not None and x.is_cuda and x.dtype == torch.bfloat16
-    return mlp_fp8(x, mod, gate, mlp.packed, eps) if fused else x + gate * mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+    return mlp_fp8(x, mod, gate, mlp.packed, eps) if fp8_ready(mlp.packed, x) else x + gate * mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
 
 
 # one single-stream block. it owns no modulation: `mod` = (scale1, gate1, scale2, gate2) is computed
@@ -203,15 +219,15 @@ class Block(nn.Module):
 
     # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache.
     def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV]:
-        q, k, v = self.attn.qkv(normed(x, mod[0], self.eps), lay.rope)
-        x = torch.addcmul(x, mod[1], self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound)))
+        q, k, v = self.attn.qkv(x, mod[0], lay.rope)
+        x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), (k, v)
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
     # keys and values are written into the tail of the cache's buffers, so nothing is concatenated.
     def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV) -> Tensor:
-        q, _, _ = self.attn.qkv(normed(x, mod[0], self.eps), rope, (cache[0][:, -x.shape[1] :], cache[1][:, -x.shape[1] :]))
-        x = torch.addcmul(x, mod[1], self.attn.out(attend(q, *cache, self.attn.bound)))
+        q, _, _ = self.attn.qkv(x, mod[0], rope, (cache[0][:, -x.shape[1] :], cache[1][:, -x.shape[1] :]))
+        x = self.attn.out(attend(q, *cache, self.attn.bound), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
 
@@ -285,8 +301,10 @@ class Dit(nn.Module):
             cache = cache + [kv]
         return self.head(x[:, lay.prefix :], final[:, lay.prefix :]), cache
 
-    # later steps: only the target tokens are recomputed, attending to the cached prefix.
+    # later steps: only the target tokens are recomputed, attending to the cached prefix. batch 1 only: the
+    # kernels write the new keys and values into the buffers' tails, which are contiguous for a single sequence.
     def decode(self, target: Tensor, sigma: Tensor, lay: Layout, cache: list[KV]) -> Tensor:
+        assert target.shape[0] == 1
         x = self.img_in(target)
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
         mod, final = self.modulate(temb, None)

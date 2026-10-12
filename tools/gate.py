@@ -125,7 +125,7 @@ def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
 # the port's dit and vae on the card, and nothing else: no pipeline, no text encoder. the checkpoint's
 # safetensors are read directly and cast to bf16, so only torch and safetensors are needed. `slim` keeps the mlp
 # weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`).
-def load_port(variant: str, slim: bool = True) -> tuple[Any, Any]:
+def load_port(variant: str, slim: bool = True, attention: bool = False) -> tuple[Any, Any]:
     import torch
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
@@ -141,7 +141,7 @@ def load_port(variant: str, slim: bool = True) -> tuple[Any, Any]:
                 for file in sorted((snapshot / part).glob("*.safetensors")) for name, weight in load_file(file).items()}
 
     config = json.loads((snapshot / "vae" / "config.json").read_text())
-    return lean.adopt(read("transformer"), read("vae"), config["latents_mean"], config["latents_std"], slim)
+    return lean.adopt(read("transformer"), read("vae"), config["latents_mean"], config["latents_std"], slim, attention)
 
 
 # where one port request leaves the reference, with accumulation removed: every dit step is rerun on
@@ -179,7 +179,7 @@ def unfused(dit_module: Any) -> None:
 
     dit_module.prep = prep
     dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)
-    dit_module.feed = lambda mlp, x, mod, gate, eps: x + gate * mlp(dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+    dit_module.fp8_ready = lambda packed, x: False
     dit_module.normed = lambda x, mod, eps: dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod
 
 
@@ -302,10 +302,10 @@ def run(variant: str, tag: str, cases: list[str], compare: bool, sdpa: bool) -> 
                               "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2)}
     baseline = json.loads((pl.Path(__file__).resolve().parent.parent / "baseline" / f"{variant}.json").read_text())
     if compare:
-        kernels = dit_module.prep, dit_module.attend, dit_module.feed, dit_module.normed
+        kernels = dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed
         unfused(dit_module)
         baseline = {"magpie": gate_pass(dit, vae, variant, cases, folder, pl.Path(OUT_ROOT) / "gate" / f"{tag}-unfused" / variant, {})}
-        dit_module.prep, dit_module.attend, dit_module.feed, dit_module.normed = kernels
+        dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed = kernels
         result["unfused_here"] = baseline["magpie"]
     if sdpa:  # torch's attention under the other kernels, to price the attention kernel alone
         dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)

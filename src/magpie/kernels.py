@@ -12,7 +12,8 @@ BLOCK_M, BLOCK_N, ATTENTION_WARPS, STAGES = 256, 32, 8, 3  # queries and keys pe
 EXP_LIMIT = 88.0  # exp overflows fp32 just above this
 FP8_TOP = 448.0  # largest fp8 (e4m3) value: 4 exponent bits, 3 mantissa bits
 TOP = tl.constexpr(FP8_TOP)
-SWIGLU_TILE, LINEAR_TILE, GEMM_WARPS = (64, 128, 64), (64, 128, 128), 4  # (rows, columns, inner width) per program of each fp8 matmul (swept on sm_120)
+SWIGLU_TILE, LINEAR_TILE, PROJECT_TILE, GEMM_WARPS = (64, 128, 64), (64, 128, 128), (128, 128, 64), 4  # (rows, columns, inner width) per program of each fp8 matmul (swept on sm_120)
+SPAN = 128  # columns that share one step in a block-scaled fp8 tensor; the head width, and the swiglu tile's columns
 
 
 # bf16 bits (int16) -> the same number in fp32: bf16 is the top half of an fp32, so shift it into place.
@@ -150,6 +151,17 @@ def fp8_columns(weight: Tensor) -> tuple[Tensor, Tensor]:
     return (weight.float() / step[:, None]).t().contiguous().to(torch.float8_e4m3fn), step
 
 
+Fp8Linear = tuple[Tensor, Tensor]  # what `fp8_columns` returns
+
+
+# an attention's four linears as fp8.
+class Fp8Attention(NamedTuple):
+    q: Fp8Linear
+    k: Fp8Linear
+    v: Fp8Linear
+    out: Fp8Linear
+
+
 def pack_mlp(gate: Tensor, proj: Tensor, out: Tensor) -> Fp8Mlp:
     (g, g_step), (p, p_step), (o, o_step) = fp8_columns(gate), fp8_columns(proj), fp8_columns(out)
     return Fp8Mlp(g, p, o, g_step, p_step, o_step)
@@ -197,6 +209,34 @@ def swiglu_fp8_kernel(x_ptr, step_ptr, gate_ptr, proj_ptr, gate_step_ptr, proj_s
     tl.store(out_step_ptr + rows * (N // BN) + tl.program_id(1), step, mask=live)
 
 
+# out = x @ w for one (BM, BN) tile, in bf16: x is (M, K) fp8 with one step per row, w is (K, N) fp8 with one
+# step per column. both steps are applied once, to the finished sum.
+@triton.jit
+def project_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, out_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    live = rows < M
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for start in range(0, K, BK):
+        ks = start + tl.arange(0, BK)
+        a = tl.load(x_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None], other=0.0)
+        acc = tl.dot(a, tl.load(w_ptr + ks[:, None] * N + cols[None, :]), acc)
+    out = acc * tl.load(x_step_ptr + rows, mask=live, other=0.0)[:, None] * tl.load(w_step_ptr + cols)[None, :]
+    tl.store(out_ptr + rows[:, None] * N + cols[None, :], out.to(tl.bfloat16), mask=live[:, None])
+
+
+# bf16 (M, K) -> fp8 with one step per row and BLOCK columns (step is (M, K / BLOCK)), P rows of one block per program.
+@triton.jit
+def blocks_fp8_kernel(x_ptr, out_ptr, step_ptr, M, K, P: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * P + tl.arange(0, P)
+    at = rows[:, None] * K + tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)[None, :]
+    live = rows < M
+    x = tl.load(x_ptr + at, mask=live[:, None], other=0.0).to(tl.float32)
+    step = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30) / TOP
+    tl.store(out_ptr + at, tl.clamp(x / step[:, None], -TOP, TOP).to(tl.float8e4nv), mask=live[:, None])
+    tl.store(step_ptr + rows * (K // BLOCK) + tl.program_id(1), step, mask=live)
+
+
 # out = skip + gate * (x @ w) for one (BM, BN) tile, in bf16. x is (M, K) fp8 whose every SPAN columns of a row
 # share a step (x_step is (M, K / SPAN)); w is (K, N) fp8 with one step per column. BK divides SPAN, so each partial
 # product has a single step per row and is scaled by it before it joins the sum. skip is (M, N) bf16 and gate
@@ -240,6 +280,23 @@ def fp8_swiglu(x: Tensor, step: Tensor, packed: Fp8Mlp, tile: tuple[int, int, in
     swiglu_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, step, packed.gate, packed.proj, packed.gate_step, packed.proj_step, out, out_step,
                                                                m, n, k, BM=tile[0], BN=tile[1], BK=tile[2], num_warps=warps, num_stages=3)
     return out, out_step
+
+
+# x @ w in bf16 for fp8 x of shape (rows, in) with one step per row; written into `out` (rows, out) when given.
+def fp8_project(x: Tensor, x_step: Tensor, linear: Fp8Linear, out: Tensor | None = None,
+                tile: tuple[int, int, int] = PROJECT_TILE, warps: int = GEMM_WARPS) -> Tensor:
+    (m, k), n = x.shape, linear[0].shape[1]
+    out = x.new_empty(m, n, dtype=torch.bfloat16) if out is None else out
+    project_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, x_step, *linear, out, m, n, k, BM=tile[0], BN=tile[1], BK=tile[2],
+                                                                num_warps=warps, num_stages=3)
+    return out
+
+
+# bf16 (rows, width) -> (fp8 values, (rows, width / SPAN) steps), the input form `fp8_linear` takes.
+def fp8_blocks(x: Tensor) -> tuple[Tensor, Tensor]:
+    out, step = torch.empty_like(x, dtype=torch.float8_e4m3fn), x.new_empty(x.shape[0], x.shape[1] // SPAN, dtype=torch.float32)
+    blocks_fp8_kernel[(triton.cdiv(x.shape[0], 32), x.shape[1] // SPAN)](x, out, step, *x.shape, P=32, BLOCK=SPAN, num_warps=4)
+    return out, step
 
 
 # skip + gate * (x @ w) in bf16 for fp8 x of shape (rows, in) with block steps `x_step`, fp8 w of shape (in, out),

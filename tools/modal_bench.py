@@ -484,10 +484,10 @@ def steps(variant: str) -> str:
 # /out/gate/<tag>/<variant>; `verdict` judges them against STEP_ERROR_MAX and DINO_MIN.
 # tag "baseline" instead re-freezes the port half of the baseline against the existing references.
 @app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
-def gate(variant: str, tag: str, cases: list[str], slim: bool = False) -> str:
+def gate(variant: str, tag: str, cases: list[str], slim: bool = True, attention: bool = False) -> str:
     import torch
 
-    dit, vae = load_port(variant, slim)
+    dit, vae = load_port(variant, slim, attention)
     folder = pl.Path(OUT_ROOT) / "baseline" / variant
     out = folder / "magpie" if tag == "baseline" else pl.Path(OUT_ROOT) / "gate" / tag / variant
     result = {"variant": variant, "tag": tag, "device": device_info(), "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2),
@@ -656,7 +656,8 @@ def logits(variant: str, cases: list[str]) -> str:
 
 
 @app.local_entrypoint()
-def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants: str = "turbo,base", cases: str = TIMED_CASES, slim: bool = True) -> None:
+def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants: str = "turbo,base", cases: str = TIMED_CASES, slim: bool = True,
+         attention: bool = False) -> None:
     out = ROOT / "out" / "bench"
     out.mkdir(parents=True, exist_ok=True)
     frozen = ROOT / "baseline"
@@ -685,7 +686,7 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
     if mode == "gate":
         (ROOT / "out" / "gate").mkdir(parents=True, exist_ok=True)
         chosen = GATE_CASES if tag == "baseline" else cases.split(",")
-        for payload in gate.starmap([(variant, tag, chosen, slim) for variant in variants.split(",")]):
+        for payload in gate.starmap([(variant, tag, chosen, slim, attention) for variant in variants.split(",")]):
             result = json.loads(payload)
             baseline = json.loads((frozen / f"{result['variant']}.json").read_text())
             if tag == "baseline":
