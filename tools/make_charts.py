@@ -2,8 +2,8 @@
 
     cd /home/tensor/Shared/code/ml/magpie && uv run --no-project --with matplotlib python tools/make_charts.py [chart ...]
 
-Every plotted number is read from out/bench/summary.json. Writes qwen21_<chart>[_mobile][_dark].png and sources.json
-into assets/charts at 200 dpi.
+Numbers come from out/bench/summary.json, out/trace/kernels.json and baseline/turbo.json. Writes
+qwen21_<chart>[_mobile][_dark].png and sources.json into assets/charts at 200 dpi.
 """
 
 import datetime as dt
@@ -24,6 +24,8 @@ from chartkit import DARK, LIGHT, TALL, WIDE, Shape, Theme, bar, canvas, clean, 
 
 ROOT = pl.Path("/home/tensor/Shared/code/ml/magpie")
 SUMMARY = ROOT / "out/bench/summary.json"
+KERNELS = ROOT / "out/trace/kernels.json"
+BASELINE = ROOT / "baseline/turbo.json"
 OUT = ROOT / "assets/charts"
 PREFIX = "qwen21"
 TURBO, BASE, OFFICIAL, LEAN = "turbo", "base", "diffusers", "magpie"
@@ -41,6 +43,18 @@ OP_LABELS: dict[str, str] = {
     "matmul (linear layers)": "matmul\n(linear layers)", "attention": "attention",
     "convolution (vae)": "convolution\n(VAE)", "elementwise, casts and copies": "elementwise, casts\nand copies",
 }
+SpanNames = tuple[str, ...]
+SPAN_SEGMENTS: tuple[tuple[str, SpanNames], ...] = (  # kernel-time segments in stacking order; VAE decode + encode summed
+    ("MLP", ("mlp (swiglu)",)), ("QKV + QK-norm + RoPE", ("qkv + qk-norm + rope",)),
+    ("attention", ("attention (sdpa)",)), ("attention output", ("attention out",)),
+    ("VAE decode + encode", ("vae decode", "vae encode")),
+)
+KERNEL_SPANS: tuple[tuple[str, str], ...] = (
+    ("qkv + qk-norm + rope", "qkv + qk-norm +\nrope"), ("mlp (swiglu)", "mlp (swiglu)"), ("vae decode", "vae decode"),
+)
+MATMUL_KINDS: SpanNames = ("gemm", "conv", "attention")
+SMALL_KINDS: SpanNames = ("elementwise", "copy", "layout")
+LABEL_PCT = 6.0  # narrowest stacked segment, in percent, that still gets its label
 
 Summary = dict[str, Any]
 Plot = Callable[[Theme, Shape, Summary], tuple[Figure, tuple[str, ...]]]
@@ -77,6 +91,18 @@ def ref_text(ax: Axes, th: Theme, sh: Shape, x: float, y: float, text: str, ha: 
     """Boxed label placed beside a reference line, in the muted colour."""
     ax.text(x, y, text, ha=ha, va="center", fontsize=10.5 * sh.k, color=th.muted, zorder=6,
             bbox={"boxstyle": "square,pad=0.12", "fc": th.bg, "ec": "none"})
+
+
+def span_sum(d: Summary, case: str, names: SpanNames) -> Pt:
+    """GPU milliseconds of one or more profiled spans added together, with the paths they came from."""
+    pts = [Pt(d["kernels"][case]["spans"][n]["gpu_ms"], f"kernels[{case}].spans[{n}].gpu_ms") for n in names]
+    return Pt(sum(p.value for p in pts), ", ".join(p.src for p in pts))
+
+
+def kind_sum(d: Summary, case: str, name: str, kinds: SpanNames) -> Pt:
+    """Kernel milliseconds of the given kernel classes inside one profiled span, with the path they came from."""
+    by_kind = d["kernels"][case]["spans"][name]["kernels_ms"]
+    return Pt(sum(by_kind.get(k, 0.0) for k in kinds), f"kernels[{case}].spans[{name}].kernels_ms[{'+'.join(kinds)}]")
 
 
 def stage_split(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
@@ -270,9 +296,102 @@ def op_groups(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]
     return fig, srcs
 
 
+def span_split(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Share of GPU kernel time per labelled span in one Turbo edit, 1024 against 2048; the tail is everything else."""
+    colors = (th.peer, th.soft, th.hero, th.other, th.muted)
+    totals = {c: Pt(d["kernels"][c]["kernel_ms"], f"kernels[{c}].kernel_ms") for c, _ in SIZE_ROWS}
+    parts = {c: [span_sum(d, c, names) for _, names in SPAN_SEGMENTS] for c, _ in SIZE_ROWS}
+    srcs = tuple(p.src for c, _ in SIZE_ROWS for p in (totals[c], *parts[c]))
+    attn = [pct(parts[c][2].value, totals[c].value) for c, _ in SIZE_ROWS]
+    fig, ax = canvas(th, sh, sh.pick(4.0, 7.2),
+                     f"Attention grows from {attn[0]:.0f} to {attn[1]:.0f} percent of an edit's GPU time at 2048",
+                     "Percent of GPU kernel time in one Turbo (8 steps) edit, by span. Total kernel seconds at right.",
+                     "Lean port, DiT and VAE only, one profiled request per size on an RTX PRO 6000 Blackwell. The "
+                     "unfilled end of each bar is all other kernels. The profiler slowed the 2048 request by 8 %.",
+                     left=sh.pick(1.3, 1.2), right=sh.pick(1.0, 0.9),
+                     key=[(color, name) for color, (name, _) in zip(colors, SPAN_SEGMENTS)])
+    n = len(SIZE_ROWS)
+    for i, (case, label) in enumerate(SIZE_ROWS):
+        y, x = n - 1 - i, 0.0
+        for color, part in zip(colors, parts[case]):
+            share = pct(part.value, totals[case].value)
+            bar(ax, th, y, x, x + share, color, 0.56)
+            if share >= LABEL_PCT:
+                tag(ax, x + share / 2, y, f"{share:.0f}%", sh, th, ha="center", dx=0, size=11)
+            x += share
+        tag(ax, 100, y, f"{totals[case].value / 1000:.2f} s", sh, th)
+        row_label(ax, th, sh, y, label)
+    clean(ax)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.set_xticks([0, 25, 50, 75, 100], ["0 %", "25 %", "50 %", "75 %", "100 %"])
+    return fig, srcs
+
+
+def kernel_classes(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Milliseconds of big kernels against small ones inside three spans of the 1024 edit."""
+    big = [kind_sum(d, "edit_1024", name, MATMUL_KINDS) for name, _ in KERNEL_SPANS]
+    small = [kind_sum(d, "edit_1024", name, SMALL_KINDS) for name, _ in KERNEL_SPANS]
+    spans = [span_sum(d, "edit_1024", (name,)) for name, _ in KERNEL_SPANS]
+    srcs = tuple(p.src for p in (*big, *small, *spans))
+    fig, ax = canvas(th, sh, sh.pick(4.4, 5.6),
+                     f"Small kernels take {small[0].value:.0f} of the QKV span's {spans[0].value:.0f} ms",
+                     "Milliseconds of GPU kernel time inside three spans of one Turbo edit at 1024, by kernel kind.",
+                     "Small kernels are elementwise ops, copies and layout conversions: norms, RoPE, activations, "
+                     "casts. Lean port, one profiled request, RTX PRO 6000 Blackwell.",
+                     left=sh.pick(2.0, 1.9), right=sh.pick(1.0, 0.9),
+                     key=[(th.other, "matmul, attention or convolution kernels"), (th.hero, "small kernels")])
+    n = len(KERNEL_SPANS)
+    for i, ((_, label), b, s, span) in enumerate(zip(KERNEL_SPANS, big, small, spans)):
+        y = n - 1 - i
+        bar(ax, th, y, 0, b.value, th.other, 0.52)
+        bar(ax, th, y, b.value, b.value + s.value, th.hero, 0.52)
+        text = f"{s.value:.0f} ms small, {pct(s.value, span.value):.0f}%" if sh.wide else f"{s.value:.0f} ms"
+        tag(ax, b.value + s.value, y, text, sh, th)
+        row_label(ax, th, sh, y, label)
+    clean(ax)
+    ax.set_xlim(0, 1300)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.set_xticks([0, 400, 800, 1200], ["0", "400 ms", "800 ms", "1200 ms"])
+    return fig, srcs
+
+
+def fit_32gb(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Peak GiB of a Turbo edit: official pipeline, lean port, and lean port without the text encoder, against 32 GB."""
+    off = [get(d, TURBO, OFFICIAL, c, "peak_gib") for c, _ in SIZE_ROWS]
+    full = [get(d, TURBO, LEAN, c, "peak_gib") for c, _ in SIZE_ROWS]
+    lean = [Pt(max(d["baseline"]["magpie"][c]["stage_peak_gib"].values()), f"baseline.magpie[{c}].stage_peak_gib(max)")
+            for c, _ in SIZE_ROWS]
+    srcs = tuple(p.src for p in (*off, *full, *lean))
+    fig, ax = canvas(th, sh, sh.pick(5.0, 6.4),
+                     f"Without the text encoder an edit peaks at {lean[0].value:.0f} to {lean[-1].value:.0f} GiB, "
+                     "under a 32 GB card",
+                     "Peak GPU memory in GiB during one Turbo (8 steps) edit, batch 1, bf16. Lower is better.",
+                     "Dashed line: the 32 GB RTX 5090, plotted as 32 GiB. Measured on the 96 GB RTX PRO 6000 "
+                     "Blackwell, not on a 5090. DiT and VAE only means text states were computed beforehand.",
+                     left=sh.pick(1.3, 1.2), right=sh.pick(1.0, 0.9),
+                     key=[(th.other, "official pipeline"), (th.peer, "lean port"), (th.hero, "lean port, DiT and VAE only")])
+    n = len(SIZE_ROWS)
+    for i, ((_, label), o, f, l) in enumerate(zip(SIZE_ROWS, off, full, lean)):
+        y = n - 1 - i
+        for dy, p, color, ink in ((0.27, o, th.other, th.muted), (0, f, th.peer, th.muted), (-0.27, l, th.hero, None)):
+            bar(ax, th, y + dy, 0, p.value, color, 0.25)
+            tag(ax, p.value, y + dy, gib(p.value), sh, th, color=ink, size=11)
+        row_label(ax, th, sh, y, label)
+    top = n - 0.4
+    ref_line(ax, th, RTX_5090_GB)
+    ref_text(ax, th, sh, RTX_5090_GB + 1, top + 0.25, "RTX 5090, 32 GB", "left")
+    clean(ax)
+    ax.set_xlim(0, 80)
+    ax.set_ylim(-0.6, top + 0.6)
+    ax.set_xticks([0, 20, 40, 60, 80], ["0", "20", "40", "60", "80 GiB"])
+    return fig, srcs
+
+
 PLOTS: dict[str, Plot] = {
     "stage-split": stage_split, "request-latency": request_latency, "prefix-cache": prefix_cache,
     "utilisation": utilisation, "peak-memory": peak_memory, "op-groups": op_groups,
+    "span-split": span_split, "kernel-classes": kernel_classes, "fit-32gb": fit_32gb,
 }
 
 
@@ -295,7 +414,8 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "-q", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     doc = {"generated": dt.date.today().isoformat(), "repo": {"root": str(ROOT), "head": head or None},
-           "summary": {"path": str(SUMMARY), "sha256": hashlib.sha256(SUMMARY.read_bytes()).hexdigest()},
+           **{name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+              for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE))},
            "charts": {**prev, **{k: list(dict.fromkeys(v)) for k, v in charts.items()}}}
     path.write_text(json.dumps(doc, indent=2) + "\n")
     print("wrote sources.json")
@@ -303,7 +423,8 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
 
 def main(names: list[str]) -> None:
     """Render the requested charts (all by default) in every theme and shape, then write their provenance."""
-    d = json.loads(SUMMARY.read_text())
+    d = {**json.loads(SUMMARY.read_text()), "kernels": json.loads(KERNELS.read_text()),
+         "baseline": json.loads(BASELINE.read_text())}
     charts: dict[str, tuple[str, ...]] = {}
     for name in names or list(PLOTS):
         for th in (LIGHT, DARK):

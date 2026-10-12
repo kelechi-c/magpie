@@ -2,11 +2,19 @@
   "generated": "2026-10-12",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "23bbd8cdb5d1f7f8dfba5a2d200033f0b178c4de"
+    "head": "1a90e2dbc7ea92feb9bb4da2dfd1e13dd90e5868"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
     "sha256": "18406312ea84b299ee291f493477106333c52287443856c18ccdba19126e6c4f"
+  },
+  "kernels": {
+    "path": "/home/tensor/Shared/code/ml/magpie/out/trace/kernels.json",
+    "sha256": "069bfab07a45ce627e11769a371942ec286873c35aab8abe2d60a3439031e863"
+  },
+  "baseline": {
+    "path": "/home/tensor/Shared/code/ml/magpie/baseline/turbo.json",
+    "sha256": "f665718837dd304e2ecb8584de1446e6ca2439b777811bfec04c56f95363ccf6"
   },
   "charts": {
     "stage-split": [
@@ -67,6 +75,39 @@
       "op_groups_ms.edit_1024.attention",
       "op_groups_ms.edit_1024.convolution (vae)",
       "op_groups_ms.edit_1024.elementwise, casts and copies"
+    ],
+    "span-split": [
+      "kernels[edit_1024].kernel_ms",
+      "kernels[edit_1024].spans[mlp (swiglu)].gpu_ms",
+      "kernels[edit_1024].spans[qkv + qk-norm + rope].gpu_ms",
+      "kernels[edit_1024].spans[attention (sdpa)].gpu_ms",
+      "kernels[edit_1024].spans[attention out].gpu_ms",
+      "kernels[edit_1024].spans[vae decode].gpu_ms, kernels[edit_1024].spans[vae encode].gpu_ms",
+      "kernels[edit_2048].kernel_ms",
+      "kernels[edit_2048].spans[mlp (swiglu)].gpu_ms",
+      "kernels[edit_2048].spans[qkv + qk-norm + rope].gpu_ms",
+      "kernels[edit_2048].spans[attention (sdpa)].gpu_ms",
+      "kernels[edit_2048].spans[attention out].gpu_ms",
+      "kernels[edit_2048].spans[vae decode].gpu_ms, kernels[edit_2048].spans[vae encode].gpu_ms"
+    ],
+    "kernel-classes": [
+      "kernels[edit_1024].spans[qkv + qk-norm + rope].kernels_ms[gemm+conv+attention]",
+      "kernels[edit_1024].spans[mlp (swiglu)].kernels_ms[gemm+conv+attention]",
+      "kernels[edit_1024].spans[vae decode].kernels_ms[gemm+conv+attention]",
+      "kernels[edit_1024].spans[qkv + qk-norm + rope].kernels_ms[elementwise+copy+layout]",
+      "kernels[edit_1024].spans[mlp (swiglu)].kernels_ms[elementwise+copy+layout]",
+      "kernels[edit_1024].spans[vae decode].kernels_ms[elementwise+copy+layout]",
+      "kernels[edit_1024].spans[qkv + qk-norm + rope].gpu_ms",
+      "kernels[edit_1024].spans[mlp (swiglu)].gpu_ms",
+      "kernels[edit_1024].spans[vae decode].gpu_ms"
+    ],
+    "fit-32gb": [
+      "rows[variant=turbo,engine=diffusers,case=edit_1024].peak_gib",
+      "rows[variant=turbo,engine=diffusers,case=edit_2048].peak_gib",
+      "rows[variant=turbo,engine=magpie,case=edit_1024].peak_gib",
+      "rows[variant=turbo,engine=magpie,case=edit_2048].peak_gib",
+      "baseline.magpie[edit_1024].stage_peak_gib(max)",
+      "baseline.magpie[edit_2048].stage_peak_gib(max)"
     ]
   }
 }
