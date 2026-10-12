@@ -125,7 +125,7 @@ def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
 # the port's dit and vae on the card, and nothing else: no pipeline, no text encoder. the checkpoint's
 # safetensors are read directly and cast to bf16, so only torch and safetensors are needed. `slim` keeps the mlp
 # weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`).
-def load_port(variant: str, slim: bool = True, attention: bool = False) -> tuple[Any, Any]:
+def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("k", "v")) -> tuple[Any, Any]:
     import torch
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file

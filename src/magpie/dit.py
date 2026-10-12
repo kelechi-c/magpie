@@ -5,8 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import (Fp8Attention, Fp8Mlp, flash, fp8_blocks, fp8_linear, fp8_norm, fp8_project, max_free, mlp_fp8, norm_mod,
-                            qk_prep)
+from magpie.kernels import Fp8Attention, Fp8Mlp, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -166,26 +165,28 @@ class Attention(nn.Module):
         self.norm_k.weight = nn.Parameter(torch.ones(cfg.width // cfg.heads))
 
     # layer_norm(x) * mod projected to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
-    # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. with fp8 weights
-    # the norm writes fp8 rows and the three projections are fp8 matmuls.
+    # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. a projection with
+    # fp8 weights is an fp8 matmul on the norm's fp8 rows; the others read the norm's bf16 output.
     def qkv(self, x: Tensor, mod: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor]:
-        heads = (self.heads, -1)
-        if fp8_ready(self.packed, x):
-            rows, step = fp8_norm(x.flatten(0, 1), mod.flatten(0, 1).contiguous(), self.eps)
-            q, k = (fp8_project(rows, step, linear).view(*x.shape[:2], *heads) for linear in (self.packed.q, self.packed.k))
-            v = fp8_project(rows, step, self.packed.v, None if into is None else into[1].flatten(0, 1).flatten(1))
-        else:
-            n = normed(x, mod, self.eps)
-            q, k = (proj(n).unflatten(-1, heads) for proj in (self.to_q, self.to_k))
-            v = self.to_v(n) if into is None else torch.matmul(n, self.to_v.weight.t(), out=into[1].flatten(2))
-        q = prep(q, self.norm_q.weight, rope, self.eps)
-        return q, prep(k, self.norm_k.weight, rope, self.eps, None if into is None else into[0]), v.view(*x.shape[:2], *heads)
+        packed = self.packed if fp8_ready(self.packed, x) else Fp8Attention(None, None, None, None)
+        rows = fp8_norm(x.flatten(0, 1), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
+        n = normed(x, mod, self.eps) if not all(packed[:3]) else None
+
+        def project(linear: nn.Linear, fp8: tuple[Tensor, Tensor] | None, out: Tensor | None = None) -> Tensor:
+            if fp8 is not None:
+                return fp8_project(*rows, fp8, None if out is None else out.flatten(0, 1).flatten(1)).view(*x.shape[:2], self.heads, -1)
+            flat = linear(n) if out is None else torch.matmul(n, linear.weight.t(), out=out.flatten(2))
+            return flat.unflatten(-1, (self.heads, -1))
+
+        q = prep(project(self.to_q, packed.q), self.norm_q.weight, rope, self.eps)
+        k = prep(project(self.to_k, packed.k), self.norm_k.weight, rope, self.eps, None if into is None else into[0])
+        return q, k, project(self.to_v, packed.v, None if into is None else into[1])
 
     # the attention branch's residual: skip + gate * to_out(attended).
     def out(self, attended: Tensor, skip: Tensor, gate: Tensor) -> Tensor:
-        if fp8_ready(self.packed, skip):
-            blocks, steps = fp8_blocks(attended.reshape(-1, skip.shape[-1]))
-            return fp8_linear(blocks, steps, *self.packed.out, skip.flatten(0, 1), gate.flatten(0, 1).contiguous()).view_as(skip)
+        if fp8_ready(self.packed, skip) and self.packed.out is not None:
+            rows = fp8_rows(attended.reshape(-1, skip.shape[-1]))
+            return fp8_project(*rows, self.packed.out, skip=skip.flatten(0, 1), gate=gate.flatten(0, 1).contiguous()).view_as(skip)
         return torch.addcmul(skip, gate, self.to_out[0](attended.flatten(2, 3)))
 
 

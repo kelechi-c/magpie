@@ -223,7 +223,7 @@ def ablate(case: str = "edit_1024") -> str:
 
     from gate import OUT_ROOT, gate_pass, load_port
 
-    dit, vae = load_port("turbo", slim=False, attention=False)
+    dit, vae = load_port("turbo", slim=False, attention=())
     folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
     linears = {name: module for name, module in dit.transformer_blocks.named_modules() if isinstance(module, nn.Linear)}
     report: dict[str, Any] = {}

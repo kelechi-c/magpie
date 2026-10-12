@@ -12,8 +12,8 @@ BLOCK_M, BLOCK_N, ATTENTION_WARPS, STAGES = 256, 32, 8, 3  # queries and keys pe
 EXP_LIMIT = 88.0  # exp overflows fp32 just above this
 FP8_TOP = 448.0  # largest fp8 (e4m3) value: 4 exponent bits, 3 mantissa bits
 TOP = tl.constexpr(FP8_TOP)
-SWIGLU_TILE, LINEAR_TILE, PROJECT_TILE, GEMM_WARPS = (64, 128, 64), (64, 128, 128), (128, 128, 64), 4  # (rows, columns, inner width) per program of each fp8 matmul (swept on sm_120)
-SPAN = 128  # columns that share one step in a block-scaled fp8 tensor; the head width, and the swiglu tile's columns
+SWIGLU_TILE, SWIGLU_WARPS = (64, 128, 64), 4  # (rows, columns, inner width) per program and warps of each fp8 matmul (swept on sm_120)
+PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
 
 
 # bf16 bits (int16) -> the same number in fp32: bf16 is the top half of an fp32, so shift it into place.
@@ -154,12 +154,12 @@ def fp8_columns(weight: Tensor) -> tuple[Tensor, Tensor]:
 Fp8Linear = tuple[Tensor, Tensor]  # what `fp8_columns` returns
 
 
-# an attention's four linears as fp8.
+# the linears of an attention that run in fp8; None leaves one in bf16.
 class Fp8Attention(NamedTuple):
-    q: Fp8Linear
-    k: Fp8Linear
-    v: Fp8Linear
-    out: Fp8Linear
+    q: Fp8Linear | None
+    k: Fp8Linear | None
+    v: Fp8Linear | None
+    out: Fp8Linear | None
 
 
 def pack_mlp(gate: Tensor, proj: Tensor, out: Tensor) -> Fp8Mlp:
@@ -185,9 +185,11 @@ def norm_kernel(x_ptr, mod_ptr, out_ptr, step_ptr, mod_rows, eps, WIDTH: tl.cons
 
 
 # both input matmuls of the swiglu for one (BM, BN) tile, then silu(gate) * proj in registers, written as fp8.
-# x is (M, K) fp8 with one step per row; gate and proj are (K, N) fp8 with one step per column. each row of the
-# tile gets its own step (its largest value / TOP), stored at out_step[row, tile column]: hidden values span four
-# orders of magnitude between tokens, more than one fp8 scale can hold. the hidden tensor is never held in 16 bits.
+# x is (M, K) fp8 with one step per row; gate and proj are (K, N) fp8 with one step per column. a tile cannot see
+# the rest of its rows, so each row of the tile gets a provisional step, the power of two that puts its largest
+# value just under TOP, stored at out_step[row, tile column]; `align_fp8_kernel` then moves a whole row onto one
+# step. hidden values span four orders of magnitude between tokens, so one step per block of the model would not
+# do. the hidden tensor is never held in 16 bits.
 @triton.jit
 def swiglu_fp8_kernel(x_ptr, step_ptr, gate_ptr, proj_ptr, gate_step_ptr, proj_step_ptr, out_ptr, out_step_ptr, M, N, K,
                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
@@ -204,15 +206,47 @@ def swiglu_fp8_kernel(x_ptr, step_ptr, gate_ptr, proj_ptr, gate_step_ptr, proj_s
     step = tl.load(step_ptr + rows, mask=live, other=0.0)[:, None]
     gate = gate * step * tl.load(gate_step_ptr + cols)[None, :]
     hidden = gate * tl.sigmoid(gate) * proj * step * tl.load(proj_step_ptr + cols)[None, :]
-    step = tl.maximum(tl.max(tl.abs(hidden), axis=1), 1e-30) / TOP
+    step = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(hidden), axis=1), 1e-30) / TOP)))
     tl.store(out_ptr + rows[:, None] * N + cols[None, :], tl.clamp(hidden / step[:, None], -TOP, TOP).to(tl.float8e4nv), mask=live[:, None])
     tl.store(out_step_ptr + rows * (N // BN) + tl.program_id(1), step, mask=live)
 
 
-# out = x @ w for one (BM, BN) tile, in bf16: x is (M, K) fp8 with one step per row, w is (K, N) fp8 with one
-# step per column. both steps are applied once, to the finished sum.
+# rescales P rows of one BLOCK-column block of an fp8 tensor from the block's own step to the row's step, in place.
+# both are powers of two, so a value that stays a normal fp8 number only has its exponent field (bits 3-6)
+# lowered by their log2 ratio, exactly. one that falls below the smallest normal (1 / 28,672 of the largest fp8
+# value) becomes a subnormal: its mantissa, with the implicit leading 1, is shifted right and rounded. a row with one
+# huge value would otherwise lose every ordinary value in it.
 @triton.jit
-def project_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, out_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def align_fp8_kernel(x_ptr, step_ptr, row_step_ptr, M, K, P: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.program_id(0) * P + tl.arange(0, P)
+    at = rows[:, None] * K + tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)[None, :]
+    live = rows < M
+    ratio = tl.load(row_step_ptr + rows, mask=live, other=1.0) / tl.load(step_ptr + rows * (K // BLOCK) + tl.program_id(1), mask=live, other=1.0)
+    shift = (tl.log2(ratio) + 0.5).to(tl.int32)[:, None]
+    bits = tl.load(x_ptr + at, mask=live[:, None], other=0).to(tl.int32)
+    expo = (bits >> 3) & 15
+    down = tl.minimum(tl.maximum(shift - tl.maximum(expo, 1) + 1, 1), 5)
+    small = (((bits & 7) | tl.where(expo > 0, 8, 0)) + ((1 << down) >> 1)) >> down
+    moved = tl.where((expo > shift) | (shift == 0), bits - (shift << 3), (bits & 128) | small)
+    tl.store(x_ptr + at, moved.to(tl.uint8), mask=live[:, None])
+
+
+# bf16 rows -> fp8 with one step per row (row = fp8 * step). x is (rows, WIDTH).
+@triton.jit
+def rows_fp8_kernel(x_ptr, out_ptr, step_ptr, WIDTH: tl.constexpr):
+    at = tl.program_id(0) * WIDTH + tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + at).to(tl.float32)
+    step = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-30) / TOP
+    tl.store(out_ptr + at, tl.clamp(x / step, -TOP, TOP).to(tl.float8e4nv))
+    tl.store(step_ptr + tl.program_id(0), step)
+
+
+# out = x @ w for one (BM, BN) tile, in bf16: x is (M, K) fp8 with one step per row, w is (K, N) fp8 with one
+# step per column; both steps are applied once, to the finished sum. with RESIDUAL the tile leaves as
+# skip + gate * (x @ w): skip is (M, N) bf16 and gate (gate_rows, N) bf16, gate_rows 1 or the token count.
+@triton.jit
+def project_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, skip_ptr, gate_ptr, out_ptr, M, N, K, gate_rows,
+                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, RESIDUAL: tl.constexpr):
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     cols = tl.program_id(1) * BN + tl.arange(0, BN)
     live = rows < M
@@ -221,41 +255,11 @@ def project_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, out_ptr, M, N, K, B
         ks = start + tl.arange(0, BK)
         a = tl.load(x_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None], other=0.0)
         acc = tl.dot(a, tl.load(w_ptr + ks[:, None] * N + cols[None, :]), acc)
-    out = acc * tl.load(x_step_ptr + rows, mask=live, other=0.0)[:, None] * tl.load(w_step_ptr + cols)[None, :]
-    tl.store(out_ptr + rows[:, None] * N + cols[None, :], out.to(tl.bfloat16), mask=live[:, None])
-
-
-# bf16 (M, K) -> fp8 with one step per row and BLOCK columns (step is (M, K / BLOCK)), P rows of one block per program.
-@triton.jit
-def blocks_fp8_kernel(x_ptr, out_ptr, step_ptr, M, K, P: tl.constexpr, BLOCK: tl.constexpr):
-    rows = tl.program_id(0) * P + tl.arange(0, P)
-    at = rows[:, None] * K + tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)[None, :]
-    live = rows < M
-    x = tl.load(x_ptr + at, mask=live[:, None], other=0.0).to(tl.float32)
-    step = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-30) / TOP
-    tl.store(out_ptr + at, tl.clamp(x / step[:, None], -TOP, TOP).to(tl.float8e4nv), mask=live[:, None])
-    tl.store(step_ptr + rows * (K // BLOCK) + tl.program_id(1), step, mask=live)
-
-
-# out = skip + gate * (x @ w) for one (BM, BN) tile, in bf16. x is (M, K) fp8 whose every SPAN columns of a row
-# share a step (x_step is (M, K / SPAN)); w is (K, N) fp8 with one step per column. BK divides SPAN, so each partial
-# product has a single step per row and is scaled by it before it joins the sum. skip is (M, N) bf16 and gate
-# (gate_rows, N) bf16 with gate_rows 1 or the token count: the block's residual, added while the tile is in registers.
-@triton.jit
-def linear_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, skip_ptr, gate_ptr, out_ptr, M, N, K, gate_rows,
-                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, SPAN: tl.constexpr):
-    rows = tl.program_id(0) * BM + tl.arange(0, BM)
-    cols = tl.program_id(1) * BN + tl.arange(0, BN)
-    live = rows < M
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for start in range(0, K, BK):
-        ks = start + tl.arange(0, BK)
-        a = tl.load(x_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None], other=0.0)
-        step = tl.load(x_step_ptr + rows * (K // SPAN) + start // SPAN, mask=live, other=0.0)
-        acc += tl.dot(a, tl.load(w_ptr + ks[:, None] * N + cols[None, :])) * step[:, None]
     at = rows[:, None] * N + cols[None, :]
-    gate = tl.load(gate_ptr + (rows % gate_rows)[:, None] * N + cols[None, :]).to(tl.float32)
-    out = tl.load(skip_ptr + at, mask=live[:, None], other=0.0).to(tl.float32) + gate * acc * tl.load(w_step_ptr + cols)[None, :]
+    out = acc * tl.load(x_step_ptr + rows, mask=live, other=0.0)[:, None] * tl.load(w_step_ptr + cols)[None, :]
+    if RESIDUAL:
+        gate = tl.load(gate_ptr + (rows % gate_rows)[:, None] * N + cols[None, :]).to(tl.float32)
+        out = tl.load(skip_ptr + at, mask=live[:, None], other=0.0).to(tl.float32) + gate * out
     tl.store(out_ptr + at, out.to(tl.bfloat16), mask=live[:, None])
 
 
@@ -273,51 +277,54 @@ def norm_mod(x: Tensor, mod: Tensor, eps: float) -> Tensor:
     return out
 
 
-# silu(x @ gate) * (x @ proj) as (rows, hidden) fp8 and its (rows, hidden / tile columns) steps.
-def fp8_swiglu(x: Tensor, step: Tensor, packed: Fp8Mlp, tile: tuple[int, int, int] = SWIGLU_TILE, warps: int = GEMM_WARPS) -> tuple[Tensor, Tensor]:
+# silu(x @ gate) * (x @ proj) as (rows, hidden) fp8 and its (rows, hidden / tile columns) power-of-two steps.
+def fp8_swiglu(x: Tensor, step: Tensor, packed: Fp8Mlp, tile: tuple[int, int, int] = SWIGLU_TILE, warps: int = SWIGLU_WARPS,
+               stages: int = 3) -> tuple[Tensor, Tensor]:
     (m, k), n = x.shape, packed.gate.shape[1]
     out, out_step = x.new_empty(m, n), step.new_empty(m, n // tile[1])
     swiglu_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, step, packed.gate, packed.proj, packed.gate_step, packed.proj_step, out, out_step,
-                                                               m, n, k, BM=tile[0], BN=tile[1], BK=tile[2], num_warps=warps, num_stages=3)
+                                                               m, n, k, BM=tile[0], BN=tile[1], BK=tile[2], num_warps=warps, num_stages=stages)
     return out, out_step
 
 
-# x @ w in bf16 for fp8 x of shape (rows, in) with one step per row; written into `out` (rows, out) when given.
-def fp8_project(x: Tensor, x_step: Tensor, linear: Fp8Linear, out: Tensor | None = None,
-                tile: tuple[int, int, int] = PROJECT_TILE, warps: int = GEMM_WARPS) -> Tensor:
-    (m, k), n = x.shape, linear[0].shape[1]
-    out = x.new_empty(m, n, dtype=torch.bfloat16) if out is None else out
-    project_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, x_step, *linear, out, m, n, k, BM=tile[0], BN=tile[1], BK=tile[2],
-                                                                num_warps=warps, num_stages=3)
-    return out
+# moves a block-stepped fp8 tensor (x, its (rows, blocks) power-of-two steps) onto one step per row, in place;
+# returns the (rows,) steps.
+def fp8_align(x: Tensor, step: Tensor) -> Tensor:
+    row_step = step.amax(1)
+    align_fp8_kernel[(triton.cdiv(x.shape[0], 32), step.shape[1])](x.view(torch.uint8), step, row_step, *x.shape, P=32,
+                                                                   BLOCK=x.shape[1] // step.shape[1], num_warps=4)
+    return row_step
 
 
-# bf16 (rows, width) -> (fp8 values, (rows, width / SPAN) steps), the input form `fp8_linear` takes.
-def fp8_blocks(x: Tensor) -> tuple[Tensor, Tensor]:
-    out, step = torch.empty_like(x, dtype=torch.float8_e4m3fn), x.new_empty(x.shape[0], x.shape[1] // SPAN, dtype=torch.float32)
-    blocks_fp8_kernel[(triton.cdiv(x.shape[0], 32), x.shape[1] // SPAN)](x, out, step, *x.shape, P=32, BLOCK=SPAN, num_warps=4)
+# bf16 (rows, width) -> (fp8 rows, (rows,) steps).
+def fp8_rows(x: Tensor) -> tuple[Tensor, Tensor]:
+    out, step = torch.empty_like(x, dtype=torch.float8_e4m3fn), x.new_empty(x.shape[0], dtype=torch.float32)
+    rows_fp8_kernel[(x.shape[0],)](x, out, step, WIDTH=x.shape[1], num_warps=8)
     return out, step
 
 
-# skip + gate * (x @ w) in bf16 for fp8 x of shape (rows, in) with block steps `x_step`, fp8 w of shape (in, out),
-# bf16 skip of shape (rows, out) and bf16 gate of shape (1 or tokens, out).
-def fp8_linear(x: Tensor, x_step: Tensor, w: Tensor, w_step: Tensor, skip: Tensor, gate: Tensor,
-               tile: tuple[int, int, int] = LINEAR_TILE, warps: int = GEMM_WARPS) -> Tensor:
-    (m, k), n = x.shape, w.shape[1]
-    out = torch.empty_like(skip)
-    linear_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, x_step, w, w_step, skip, gate, out, m, n, k, gate.shape[0], BM=tile[0], BN=tile[1],
-                                                               BK=tile[2], SPAN=k // x_step.shape[1], num_warps=warps, num_stages=3)
+# x @ w in bf16 for fp8 x of shape (rows, in) with one step per row; written into `out` (rows, out) when given.
+# with `skip` (rows, out) and `gate` (1 or tokens, out), both bf16, the result is skip + gate * (x @ w).
+def fp8_project(x: Tensor, x_step: Tensor, linear: Fp8Linear, out: Tensor | None = None, skip: Tensor | None = None, gate: Tensor | None = None,
+                tile: tuple[int, int, int] = PROJECT_TILE, warps: int = PROJECT_WARPS, stages: int = 3) -> Tensor:
+    (m, k), n = x.shape, linear[0].shape[1]
+    out = x.new_empty(m, n, dtype=torch.bfloat16) if out is None else out
+    residual = skip is not None
+    project_fp8_kernel[(triton.cdiv(m, tile[0]), n // tile[1])](x, x_step, *linear, skip if residual else out, gate if residual else out, out, m, n, k,
+                                                                gate.shape[0] if residual else 1, BM=tile[0], BN=tile[1], BK=tile[2],
+                                                                RESIDUAL=residual, num_warps=warps, num_stages=stages)
     return out
 
 
 # a block's whole mlp branch and its residual, `x + gate * out(silu(gate_layer(n)) * proj(n))` with
-# n = layer_norm(x) * mod, in three launches: norm to fp8, both input matmuls with the swiglu in their tail,
-# the output matmul with the residual in its tail. x is (B, S, width) bf16; mod and gate are (B, 1 or S, width).
+# n = layer_norm(x) * mod, in four launches: norm to fp8, both input matmuls with the swiglu in their tail, the
+# hidden tensor moved onto one step per row, the output matmul with the residual in its tail.
+# x is (B, S, width) bf16; mod and gate are (B, 1 or S, width).
 def mlp_fp8(x: Tensor, mod: Tensor, gate: Tensor, packed: Fp8Mlp, eps: float) -> Tensor:
     flat = x.flatten(0, 1)
     rows, step = fp8_norm(flat, mod.flatten(0, 1).contiguous(), eps)
-    hidden, hidden_step = fp8_swiglu(rows, step, packed)
-    return fp8_linear(hidden, hidden_step, packed.out, packed.out_step, flat, gate.flatten(0, 1).contiguous()).view_as(x)
+    hidden, steps = fp8_swiglu(rows, step, packed)
+    return fp8_project(hidden, fp8_align(hidden, steps), (packed.out, packed.out_step), skip=flat, gate=gate.flatten(0, 1).contiguous()).view_as(x)
 
 
 # the vae's norm for P pixels of a channels-last image: each pixel's channel vector is scaled to length
