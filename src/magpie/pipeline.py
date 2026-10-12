@@ -43,6 +43,7 @@ def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list
     reference = next(iter(vae_state.values()))
     vae = Vae(VaeConfig(), mean, std).to(reference.device, reference.dtype)
     vae.load_state_dict(image_weights(vae_state), assign=True)
+    vae.to(memory_format=torch.channels_last)
     return dit.eval(), vae.eval()
 
 
@@ -53,15 +54,16 @@ def fit(area: int, ratio: float) -> Shape:
 
 
 # pil -> (1, 4, H, W) in [-1, 1].
-def to_pixels(image: Image.Image) -> Tensor:
-    array = np.asarray(image.convert("RGBA")).astype(np.float32) / 255.0
-    return torch.from_numpy(array).permute(2, 0, 1)[None] * 2.0 - 1.0
+# the bytes are moved to `device` first, so the arithmetic runs there.
+def to_pixels(image: Image.Image, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> Tensor:
+    raw = torch.from_numpy(np.array(image.convert("RGBA"))).to(device)
+    return (raw.float().div(255.0).permute(2, 0, 1)[None] * 2.0 - 1.0).to(dtype)
 
 
 # (1, 4, H, W) in [-1, 1] -> rgba pil.
 def to_image(pixels: Tensor) -> Image.Image:
-    array = (pixels[0].float() / 2 + 0.5).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
-    return Image.fromarray((array * 255).round().astype("uint8"))
+    array = ((pixels[0].float() / 2 + 0.5).clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0)
+    return Image.fromarray(array.cpu().numpy())
 
 
 # (B, 64, h, w) <-> (B, h*w, 64): the dit reads one token per latent pixel, no patching.
@@ -108,7 +110,7 @@ def render(
     device, dtype = dit.img_in.weight.device, dit.img_in.weight.dtype
     images = images or []
     width, height = size or (images[-1].size if images else (resolution,) * 2)
-    encoded = [vae.encode(to_pixels(image).to(device, dtype)) for image in images]
+    encoded = [vae.encode(to_pixels(image, device, dtype)) for image in images]
     shapes = [tuple(latent.shape[-2:]) for latent in encoded] + [(height // 16, width // 16)]
     references = torch.cat([pack(latent) for latent in encoded], dim=1) if encoded else None
     generator = torch.Generator("cpu").manual_seed(seed)

@@ -5,10 +5,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import Fp8Mlp, flash, max_free, mlp_fp8, qk_prep
+from magpie.kernels import Fp8Mlp, flash, max_free, mlp_fp8, norm_mod, qk_prep
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
-KV = tuple[Tensor, Tensor]  # one layer's prefix keys and values, each (B, P, heads, head_dim)
+KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
+# the prefix rows are the cache, the target rows are scratch that every decode step overwrites
 SLOT = 4  # one vision-language image slot stands for a 2x2 group of latent tokens
 
 
@@ -100,10 +101,19 @@ def rotate(x: Tensor, rope: Tensor) -> Tensor:
     return torch.view_as_real(pairs * rope[:, None]).flatten(3).type_as(x)
 
 
-# qk-norm then rope. `rotate(rms(...))` defines it; bf16 tensors on the gpu take the fused kernel instead.
-def prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float) -> Tensor:
+# qk-norm then rope, written into `out` when given. `rotate(rms(...))` defines it; bf16 tensors on the gpu
+# take the fused kernel instead.
+def prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float, out: Tensor | None = None) -> Tensor:
+    if x.is_cuda and x.dtype == torch.bfloat16:
+        return qk_prep(x, weight, rope, eps, out)
+    plain = rotate(rms(x, weight, eps), rope)
+    return plain if out is None else out.copy_(plain)
+
+
+# layer_norm(x) * mod, the input of both branches of a block; one kernel for bf16 tensors on the gpu.
+def normed(x: Tensor, mod: Tensor, eps: float) -> Tensor:
     fused = x.is_cuda and x.dtype == torch.bfloat16
-    return qk_prep(x, weight, rope, eps) if fused else rotate(rms(x, weight, eps), rope)
+    return norm_mod(x, mod, eps) if fused else F.layer_norm(x, x.shape[-1:], eps=eps) * mod
 
 
 # scaled dot-product attention over (B, S, heads, head_dim) tensors.
@@ -149,9 +159,14 @@ class Attention(nn.Module):
         self.norm_k.weight = nn.Parameter(torch.ones(cfg.width // cfg.heads))
 
     # projects to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
-    def qkv(self, x: Tensor, rope: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        q, k, v = (proj(x).unflatten(-1, (self.heads, -1)) for proj in (self.to_q, self.to_k, self.to_v))
-        return prep(q, self.norm_q.weight, rope, self.eps), prep(k, self.norm_k.weight, rope, self.eps), v
+    # with `into` = (keys, values) views of a kv buffer, k and v are written straight there.
+    def qkv(self, x: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor]:
+        q, k = (proj(x).unflatten(-1, (self.heads, -1)) for proj in (self.to_q, self.to_k))
+        q = prep(q, self.norm_q.weight, rope, self.eps)
+        if into is None:
+            return q, prep(k, self.norm_k.weight, rope, self.eps), self.to_v(x).unflatten(-1, (self.heads, -1))
+        torch.matmul(x, self.to_v.weight.t(), out=into[1].flatten(2))
+        return q, prep(k, self.norm_k.weight, rope, self.eps, into[0]), into[1]
 
     def out(self, x: Tensor) -> Tensor:
         return self.to_out[0](x.flatten(2, 3))
@@ -170,11 +185,11 @@ class SwiGLU(nn.Module):
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 
-# the mlp branch of a block: `mlp(layer_norm(x) * mod)` defines it; bf16 tensors on the gpu take the fp8
-# kernels when the mlp carries packed fp8 weights (`pipeline.adopt` packs them).
-def feed(mlp: SwiGLU, x: Tensor, mod: Tensor, eps: float) -> Tensor:
+# a block's mlp branch with its residual: `x + gate * mlp(layer_norm(x) * mod)` defines it; bf16 tensors on
+# the gpu take the fp8 kernels when the mlp carries packed fp8 weights (`pipeline.adopt` packs them).
+def feed(mlp: SwiGLU, x: Tensor, mod: Tensor, gate: Tensor, eps: float) -> Tensor:
     fused = mlp.packed is not None and x.is_cuda and x.dtype == torch.bfloat16
-    return mlp_fp8(x, mod, mlp.packed, eps) if fused else mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+    return mlp_fp8(x, mod, gate, mlp.packed, eps) if fused else x + gate * mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
 
 
 # one single-stream block. it owns no modulation: `mod` = (scale1, gate1, scale2, gate2) is computed
@@ -186,22 +201,18 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.img_mlp = SwiGLU(cfg)
 
-    def norm(self, x: Tensor) -> Tensor:
-        return F.layer_norm(x, (self.width,), eps=self.eps)
-
-    # full-sequence pass; also returns this layer's prefix keys and values for the cache.
+    # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache.
     def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV]:
-        q, k, v = self.attn.qkv(self.norm(x) * mod[0], lay.rope)
-        x = x + mod[1] * self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound))
-        x = x + mod[3] * feed(self.img_mlp, x, mod[2], self.eps)
-        return x, (k[:, : lay.prefix].clone(), v[:, : lay.prefix].clone())
+        q, k, v = self.attn.qkv(normed(x, mod[0], self.eps), lay.rope)
+        x = torch.addcmul(x, mod[1], self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound)))
+        return feed(self.img_mlp, x, mod[2], mod[3], self.eps), (k, v)
 
-    # target-only pass: target queries attend to [cached prefix, target] with no mask at all.
+    # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
+    # keys and values are written into the tail of the cache's buffers, so nothing is concatenated.
     def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV) -> Tensor:
-        q, k, v = self.attn.qkv(self.norm(x) * mod[0], rope)
-        attended = attend(q, torch.cat([cache[0], k], dim=1), torch.cat([cache[1], v], dim=1), self.attn.bound)
-        x = x + mod[1] * self.attn.out(attended)
-        return x + mod[3] * feed(self.img_mlp, x, mod[2], self.eps)
+        q, _, _ = self.attn.qkv(normed(x, mod[0], self.eps), rope, (cache[0][:, -x.shape[1] :], cache[1][:, -x.shape[1] :]))
+        x = torch.addcmul(x, mod[1], self.attn.out(attend(q, *cache, self.attn.bound)))
+        return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
 
 # qwen-image 2.1 single-stream dit. parameter names match the diffusers checkpoint, so

@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from magpie.kernels import grow_add, pixel_norm
+
 
 # the released vae descends from a causal video vae; for one image every temporal op is a no-op,
 # so this port is plain 2d: (B, C, H, W) in and out. `temporal[i]` only decides how the parameter-free
@@ -18,15 +20,28 @@ class VaeConfig:
     channels: int = 4  # rgba
 
 
-# l2-normalises over channels in fp32 and rescales by sqrt(C) * gamma.
+# true for the tensors the triton kernels take (bf16 on the gpu); they read them channels-last.
+def fusable(x: Tensor) -> bool:
+    return x.is_cuda and x.dtype == torch.bfloat16
+
+
+def channels_last(x: Tensor) -> Tensor:
+    return x.contiguous(memory_format=torch.channels_last)
+
+
+# l2-normalises over channels in fp32 and rescales by sqrt(C) * gamma, then applies silu if asked.
+# bf16 tensors on the gpu take one fused kernel.
 class Norm(nn.Module):
     def __init__(self, dim: int, rank: int) -> None:
         super().__init__()
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim, *[1] * rank))
 
-    def forward(self, x: Tensor) -> Tensor:
-        return F.normalize(x.float(), dim=1).to(x.dtype) * self.scale * self.gamma.view(1, -1, 1, 1)
+    def forward(self, x: Tensor, silu: bool = False) -> Tensor:
+        if fusable(x):
+            return pixel_norm(channels_last(x), self.gamma, self.scale, silu)
+        plain = F.normalize(x.float(), dim=1).to(x.dtype) * self.scale * self.gamma.view(1, -1, 1, 1)
+        return F.silu(plain) if silu else plain
 
 
 class Resnet(nn.Module):
@@ -37,8 +52,8 @@ class Resnet(nn.Module):
         self.conv_shortcut = nn.Conv2d(inp, out, 1) if inp != out else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
-        h = self.conv1(F.silu(self.norm1(x)))
-        return self.conv2(F.silu(self.norm2(h))) + self.conv_shortcut(x)
+        h = self.conv1(self.norm1(x, True))
+        return self.conv2(self.norm2(h, True)) + self.conv_shortcut(x)
 
 
 # single-head self-attention over all H*W positions, at the lowest resolution only.
@@ -111,8 +126,8 @@ class Up(nn.Module):
         h = self.resnets[2](self.resnets[1](self.resnets[0](x)))
         if self.upsampler is None:
             return h
-        grown = F.interpolate(h.float(), scale_factor=2.0, mode="nearest-exact").type_as(h)
-        return self.upsampler.resample[1](grown) + dup_up(x, self.out, self.temporal)
+        grown = self.upsampler.resample[1](F.interpolate(h, scale_factor=2.0, mode="nearest-exact"))
+        return grow_add(channels_last(grown), channels_last(x), self.temporal) if fusable(grown) else grown + dup_up(x, self.out, self.temporal)
 
 
 class Encoder(nn.Module):
@@ -131,7 +146,7 @@ class Encoder(nn.Module):
         x = self.conv_in(x)
         for block in self.down_blocks:
             x = block(x)
-        return self.conv_out(F.silu(self.norm_out(self.mid_block(x))))
+        return self.conv_out(self.norm_out(self.mid_block(x), True))
 
 
 class Decoder(nn.Module):
@@ -151,7 +166,7 @@ class Decoder(nn.Module):
         x = self.mid_block(self.conv_in(z))
         for block in self.up_blocks:
             x = block(x)
-        return self.conv_out(F.silu(self.norm_out(x)))
+        return self.conv_out(self.norm_out(x, True))
 
 
 # qwen-image 2.1 autoencoder for single images: 16x spatial compression, 64 latent channels, rgba.
@@ -167,12 +182,12 @@ class Vae(nn.Module):
 
     # pixels (B, 4, H, W) in [-1, 1] -> normalised latents (B, 64, H/16, W/16); takes the posterior mean.
     def encode(self, pixels: Tensor) -> Tensor:
-        moments = self.quant_conv(self.encoder(pixels))
+        moments = self.quant_conv(self.encoder(channels_last(pixels)))
         return (moments.chunk(2, dim=1)[0] - self.mean) / self.std
 
     # normalised latents -> pixels (B, 4, H, W) in [-1, 1].
     def decode(self, latents: Tensor) -> Tensor:
-        return self.decoder(self.post_quant_conv(latents * self.std + self.mean)).clamp(-1.0, 1.0)
+        return self.decoder(self.post_quant_conv(channels_last(latents * self.std + self.mean))).clamp(-1.0, 1.0)
 
 
 # drops the temporal convolutions a single image never runs, leaving exactly this port's keys.

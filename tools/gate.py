@@ -173,9 +173,14 @@ def diagnose(dit: Any, vae: Any, record: dict, text: Any, slots: Any, shapes: li
 
 # the baseline port's behaviour for a build that has since gained kernels: qk-norm + rope unfused, torch's sdpa, bf16 mlp.
 def unfused(dit_module: Any) -> None:
-    dit_module.prep = lambda x, weight, rope, eps: dit_module.rotate(dit_module.rms(x, weight, eps), rope)
+    def prep(x: Any, weight: Any, rope: Any, eps: float, out: Any = None) -> Any:
+        plain = dit_module.rotate(dit_module.rms(x, weight, eps), rope)
+        return plain if out is None else out.copy_(plain)
+
+    dit_module.prep = prep
     dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)
-    dit_module.feed = lambda mlp, x, mod, eps: mlp(dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+    dit_module.feed = lambda mlp, x, mod, gate, eps: x + gate * mlp(dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+    dit_module.normed = lambda x, mod, eps: dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod
 
 
 # relative l2 error of every dit step when the candidate is fed the baseline's own step inputs
@@ -297,10 +302,10 @@ def run(variant: str, tag: str, cases: list[str], compare: bool, sdpa: bool) -> 
                               "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2)}
     baseline = json.loads((pl.Path(__file__).resolve().parent.parent / "baseline" / f"{variant}.json").read_text())
     if compare:
-        kernels = dit_module.prep, dit_module.attend, dit_module.feed
+        kernels = dit_module.prep, dit_module.attend, dit_module.feed, dit_module.normed
         unfused(dit_module)
         baseline = {"magpie": gate_pass(dit, vae, variant, cases, folder, pl.Path(OUT_ROOT) / "gate" / f"{tag}-unfused" / variant, {})}
-        dit_module.prep, dit_module.attend, dit_module.feed = kernels
+        dit_module.prep, dit_module.attend, dit_module.feed, dit_module.normed = kernels
         result["unfused_here"] = baseline["magpie"]
     if sdpa:  # torch's attention under the other kernels, to price the attention kernel alone
         dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)

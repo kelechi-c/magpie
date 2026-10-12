@@ -154,13 +154,14 @@ def run_mlp(tokens: list[int], sweep: list[tuple[tuple[int, int, int], int]]) ->
         want = reference().float()
         rows, step = fp8_norm(x[0], mod[0], cfg.eps)
         middle, middle_step = fp8_swiglu(rows, step, packed)
-        row = {"gap": float((mlp_fp8(x, mod, packed, cfg.eps).float() - want).norm() / want.norm()),
+        zero = torch.zeros_like(x)
+        row = {"gap": float((mlp_fp8(x, mod, torch.ones_like(mod), packed, cfg.eps).float() - x.float() - want).norm() / want.norm()),
                "norm_gap": float((rows.float() * step[:, None] - normed()[0].float()).norm() / normed().float().norm()),
-               "reference_ms": bench(reference), "fused_ms": bench(lambda: mlp_fp8(x, mod, packed, cfg.eps)),
+               "reference_ms": bench(reference), "fused_ms": bench(lambda: mlp_fp8(x, mod, mod, packed, cfg.eps)),
                "norm_ms": bench(lambda: fp8_norm(x[0], mod[0], cfg.eps)), "swiglu": {}, "linear": {}}
         for tile, warps in sweep:
             for name, fn, flops in (("swiglu", lambda: fp8_swiglu(rows, step, packed, tile, warps), 4 * count * width * hidden),
-                                    ("linear", lambda: fp8_linear(middle, middle_step, packed.out, packed.out_step, tile, warps), 2 * count * width * hidden)):
+                                    ("linear", lambda: fp8_linear(middle, middle_step, packed.out, packed.out_step, zero[0], mod[0], tile, warps), 2 * count * width * hidden)):
                 try:  # a tile can need more shared memory than an sm has; that setting is skipped
                     ms = bench(fn)
                 except (OutOfResources, CompilationError):
