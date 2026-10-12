@@ -5,9 +5,14 @@
 `check` is small enough for any gpu; `sweep` uses the model's real shapes and every tuning setting.
 """
 
+import functools
 import itertools
 import json
+import math
 import sys
+
+import triton
+import triton.language as tl
 
 SWEEP = list(itertools.product((8, 16, 32), (1, 2, 4, 8)))  # (rows per program, warps)
 
@@ -53,7 +58,52 @@ def run(tokens: list[int]) -> str:
     return json.dumps(report)
 
 
-ATTENTION_SWEEP = list(itertools.product((128, 256), (16, 32, 48, 64), (4, 8, 16), (1, 2, 3, 4)))  # block_m, block_n, warps, stages
+PARTS = ("whole kernel", "exp2 replaced by a multiply", "no weights x values product (no value load)", "no q x k product (no key load)",
+         "query load and store only", "q x k product in fp8", "both products in fp8")
+
+
+# a copy of the max-free attention kernel that leaves one piece out, to see what each piece costs.
+# PART: 0 whole, 1 exp2 -> multiply, 2 second product dropped, 3 first product dropped, 4 neither product nor exp2,
+# 5 q and k arrive as fp8, 6 v too and the weights are cast to fp8 (what fp8 tensor cores could give at best).
+@triton.jit
+def attend_parts_kernel(q_ptr, k_ptr, v_ptr, out_ptr, queries, keys, heads, scale,
+                        DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, PART: tl.constexpr):
+    head, batch = tl.program_id(1) % heads, tl.program_id(1) // heads
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, DIM)
+    stride = heads * DIM
+    mine = (batch * queries + rows[:, None]) * stride + head * DIM + dims[None, :]
+    q = tl.load(q_ptr + mine, mask=rows[:, None] < queries, other=0.0)
+    if PART < 5:
+        q = (q.to(tl.float32) * scale).to(k_ptr.dtype.element_ty)
+    acc = tl.zeros((BLOCK_M, DIM), dtype=tl.float32)
+    total = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for start in range(0, keys, BLOCK_N):
+        cols = start + tl.arange(0, BLOCK_N)
+        live = cols < keys
+        theirs = (batch * keys + cols[:, None]) * stride + head * DIM + dims[None, :]
+        k = tl.load(k_ptr + theirs, mask=live[:, None], other=0.0)
+        v = tl.load(v_ptr + theirs, mask=live[:, None], other=0.0)
+        if PART == 3 or PART == 4:
+            scores = (rows[:, None] + cols[None, :]).to(tl.float32) * 1e-6
+        elif PART >= 5:
+            scores = tl.dot(q, tl.trans(k)) * scale
+        else:
+            scores = tl.dot(q, tl.trans(k))
+        if PART == 1 or PART == 4:
+            p = tl.where(live[None, :], scores * 0.001, 0.0).to(v.dtype)
+        else:
+            p = tl.where(live[None, :], tl.exp2(scores), 0.0).to(v.dtype)
+        total += tl.sum(p.to(tl.float32), axis=1)
+        if PART == 2 or PART == 4:
+            acc += total[:, None]
+        else:
+            acc = tl.dot(p, v, acc)
+    tl.store(out_ptr + mine, (acc / total[:, None]).to(tl.bfloat16), mask=rows[:, None] < queries)
+
+
+ATTENTION_SWEEP = [(256, 32, 8, 3), (256, 32, 8, 2), (256, 32, 8, 4), (128, 32, 4, 2), (128, 32, 8, 3), (256, 48, 8, 3), (256, 64, 8, 3),
+                   (256, 16, 8, 3), (256, 64, 16, 3), (128, 64, 8, 3), (512, 32, 16, 3), (128, 16, 4, 3)]  # block_m, block_n, warps, stages
 
 
 # the flash kernels against torch's sdpa on q, k that went through the real qk-prep (so logits are bounded like
@@ -64,7 +114,7 @@ def run_attention(shapes: list[tuple[int, int]], sweep: list[tuple[int, int, int
     import torch.nn.functional as F
 
     from magpie.dit import DitConfig, rope_table
-    from magpie.kernels import flash, logit_bound, max_free, qk_prep
+    from magpie.kernels import ATTENTION_WARPS, BLOCK_M, BLOCK_N, STAGES, flash, logit_bound, max_free, qk_prep
     from triton.compiler.errors import CompilationError
     from triton.runtime.errors import OutOfResources
 
@@ -78,6 +128,20 @@ def run_attention(shapes: list[tuple[int, int]], sweep: list[tuple[int, int, int
         end.record()
         torch.cuda.synchronize()
         return start.elapsed_time(end) / iters
+
+    # an fp8 copy of a tensor, made once per tensor so the cast stays out of the timing.
+    @functools.cache
+    def low(x):
+        return (x.float() / x.float().abs().max() * 448).to(torch.float8_e4m3fn)
+
+    # the max-free kernel with one piece taken out (results are wrong on purpose; only the time matters).
+    def parts(q, k, v, part: int):
+        out = torch.empty_like(q)
+        q, k, v = (low(q), low(k), low(v) if part == 6 else v) if part >= 5 else (q, k, v)
+        grid = (triton.cdiv(q.shape[1], BLOCK_M), q.shape[0] * q.shape[2])
+        attend_parts_kernel[grid](q, k, v, out, q.shape[1], k.shape[1], q.shape[2], 1e-4 if part >= 5 else math.log2(math.e) / math.sqrt(q.shape[3]), DIM=q.shape[3],
+                                  BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, PART=part, num_warps=ATTENTION_WARPS, num_stages=STAGES)
+        return out
 
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
@@ -97,7 +161,8 @@ def run_attention(shapes: list[tuple[int, int]], sweep: list[tuple[int, int, int
         sdpa_ms = bench(sdpa)
         row = {"bound": logit_bound(weight, weight), "max_free_allowed": max_free(logit_bound(weight, weight), keys),
                "gap_stable": gap(flash(q, k, v, True)), "gap_max_free": gap(flash(q, k, v, False)),
-               "sdpa_ms": sdpa_ms, "sdpa_tflops": tflops(sdpa_ms), "stable": {}, "max_free": {}}
+               "sdpa_ms": sdpa_ms, "sdpa_tflops": tflops(sdpa_ms), "stable": {}, "max_free": {},
+               "parts_ms": {name: bench(lambda: parts(q, k, v, part)) for part, name in enumerate(PARTS)}}
         for m, n, warps, stages in sweep:
             for name, stable in (("stable", True), ("max_free", False)):
                 try:  # a tile setting can need more shared memory than an sm has; that setting is skipped
