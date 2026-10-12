@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 INPUTS = "/root/inputs"
 OUT_ROOT = "/out"
+WIDE_INPUTS = "/out/baseline/turbo/inputs16"
 REPOS = {"turbo": "Qwen/Qwen-Image-2.1-Turbo", "base": "Qwen/Qwen-Image-2.1"}
 Timings = dict[str, list[float]]
 
@@ -36,6 +37,44 @@ SUITE = [
 ]
 
 
+# the wide set, sixteen items for the final gate: (prompt for the text-to-image input, edit instruction). the inputs
+# are generated once by the official pipeline (`freeze-wide`) and live on the volume under WIDE_INPUTS.
+WIDE = [
+    ("Pencil drawing of a lighthouse on a rocky headland, dense cross-hatched cliffs, a pale wash of grey-blue sea, soft graphite clouds, cream paper, generous empty sky, no text",
+     "Turn the scene to night: darken the sky with a deep indigo ink wash and add a bright beam of light from the lighthouse, keep the pencil hatching of the rocks"),
+    ("Ink drawing of an old bicycle leaning against a brick wall, thin black pen lines, brick texture in loose hatching, a single red watercolour accent on the bicycle frame, ivory paper, no text",
+     "Add a wicker basket full of yellow flowers on the handlebars, drawn in the same thin pen lines with a light watercolour wash, keep everything else unchanged"),
+    ("Graphite sketch of a fox curled asleep among ferns, soft shading on the fur, fine pencil strokes for the fern fronds, a faint ochre wash, warm grey paper, no text",
+     "Cover the ferns and the ground with snow, leaving the fox uncovered, using sparse pencil strokes and bare paper for the snow"),
+    ("Pen and ink drawing of a wooden sailing ship on calm water, rigging in hair-thin lines, stippled reflections, pale turquoise wash over the sea, off-white paper, no text",
+     "Add a large full moon behind the masts, drawn as a plain circle with a light yellow wash, keep the ship and the water unchanged"),
+    ("Charcoal drawing of a stone bridge with three arches over a slow river, smudged shadows under the arches, reeds drawn with quick strokes, textured beige paper, no text",
+     "Redraw this as a clean technical ink line drawing with no shading, thin uniform black lines on white paper, keep the composition"),
+    ("Coloured pencil drawing of a teapot and two cups on a checked tablecloth, soft hatching in blue and terracotta, visible pencil grain, cream paper, no text",
+     "Change the colour of the teapot to deep green, keeping the coloured pencil hatching style and everything else unchanged"),
+    ("Ink sketch of a narrow street of timber-framed houses, overhanging upper floors, cobblestones in loose circles, sepia pen lines with a light brown wash, ivory paper, no text",
+     "Add strings of small paper lanterns hanging between the houses, in red and orange watercolour, keep the sepia linework unchanged"),
+    ("Pencil study of an owl perched on a fence post, detailed feather pattern in graphite, large dark eyes, loose grass sketched at the base, off-white paper, no text",
+     "Make it rain: add fine diagonal pencil strokes for rain across the whole drawing and small puddles at the base of the post"),
+    ("Ink and watercolour drawing of a greenhouse full of potted plants, glass panes as thin ruled lines, leaves in three shades of green wash, pale paper, no text",
+     "Remove all colour and render the drawing in black ink only, with hatching where the green washes were"),
+    ("Fine pen drawing of a pocket watch with its back open, visible gears and springs in precise line work, light stippling for shadow, a touch of gold ochre wash, white paper, no text",
+     "Replace the gold ochre wash with a cool blue wash and keep every line of the mechanism unchanged"),
+    ("Graphite drawing of a mountain hut beside a lake, pine trees as vertical hatched shapes, the lake left as bare paper with a few horizontal strokes, grey-toned paper, no text",
+     "Add a small rowing boat on the lake with one figure in it, drawn in the same graphite style, keep the hut and the trees unchanged"),
+    ("Ink drawing of a market stall with crates of fruit, awning in broad striped wash of red and white, fruit as simple circles with dots of colour, cream paper, no text",
+     "Change the awning stripes to blue and white, keep the pen lines, the fruit and the crates unchanged"),
+    ("Pencil drawing of a grand piano seen from above, the lid open, strings drawn as fine parallel lines, soft shadow on a wooden floor, warm ivory paper, no text",
+     "Add an open book of sheet music on the music stand and a single red rose lying on the closed part of the lid, in coloured pencil"),
+    ("Ink sketch of a windmill on a flat plain, sails as crossed lattice lines, long grass in quick upward strokes, a wide sky with three small birds, pale buff paper, no text",
+     "Turn the season to autumn: add orange and brown watercolour washes to the grass and a few falling leaves, keep the ink lines unchanged"),
+    ("Detailed pen drawing of a snail on a mossy branch, spiral shell with fine concentric lines, moss as dense stippling, a pale green wash, white paper, no text",
+     "Redraw this as a soft watercolour painting with no ink lines, loose washes and blurred edges, keep the composition"),
+    ("Graphite and white chalk drawing of a row of glass bottles on a shelf, highlights in chalk, soft grey reflections, mid-grey paper, no text",
+     "Fill three of the bottles with coloured liquid, one amber, one teal, one crimson, using transparent watercolour, keep the graphite and chalk unchanged"),
+]
+
+
 CASES: dict[str, dict[str, Any]] = {
     "t2i_512": dict(edit=False, size=512),
     "edit_512": dict(edit=True, size=512),
@@ -44,6 +83,8 @@ CASES: dict[str, dict[str, Any]] = {
     "edit_1024_nocache": dict(edit=True, size=1024, use_kv_cache=False),
     "t2i_2048": dict(edit=False, size=2048),
     "edit_2048": dict(edit=True, size=2048),
+    "edit16_1024": dict(edit=True, size=1024, wide=True),
+    "edit16_2048": dict(edit=True, size=2048, wide=True),
 }
 
 
@@ -92,9 +133,9 @@ def psnr(a: Any, b: Any) -> float:
     return float(10 * np.log10(255.0**2 / max(error, 1e-12)))
 
 
-# gate items per case: every suite prompt, except base at 2048 where three keep the session short.
+# gate items per case: every suite prompt (sixteen for the wide cases), except base at 2048 where three keep the session short.
 def gate_items(variant: str, case: str) -> int:
-    return 3 if variant == "base" and "2048" in case else len(SUITE)
+    return len(WIDE) if CASES[case].get("wide") else 3 if variant == "base" and "2048" in case else len(SUITE)
 
 
 # like `timed`, and also keeps the stage's peak allocation in gib (resident weights included).
@@ -118,6 +159,8 @@ def staged(function: Callable, name: str, timings: Timings, peaks: dict[str, flo
 def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
     from PIL import Image
 
+    if CASES[case].get("wide"):
+        return WIDE[index][1], (Image.open(f"{WIDE_INPUTS}/{index:02d}.png"),)
     prompt, source, instruction = SUITE[index % len(SUITE)]
     return (instruction, (Image.open(f"{INPUTS}/{source}"),)) if CASES[case]["edit"] else (prompt, ())
 
@@ -171,8 +214,11 @@ def diagnose(dit: Any, vae: Any, record: dict, text: Any, slots: Any, shapes: li
             "vae_decode_same_input_mean_abs": float((raw.float().cpu() - pixels[:, :, 0].float()).abs().mean())}
 
 
-# the baseline port's behaviour for a build that has since gained kernels: qk-norm + rope unfused, torch's sdpa, bf16 mlp.
-def unfused(dit_module: Any) -> None:
+# the baseline port's behaviour for a build that has since gained kernels: qk-norm + rope unfused, torch's sdpa,
+# bf16 linears; with `vae_module`, the vae's norms and shortcuts as plain torch ops too.
+def unfused(dit_module: Any, vae_module: Any = None) -> None:
+    if vae_module is not None:
+        vae_module.fusable = lambda x: False
     def prep(x: Any, weight: Any, rope: Any, eps: float, out: Any = None) -> Any:
         plain = dit_module.rotate(dit_module.rms(x, weight, eps), rope)
         return plain if out is None else out.copy_(plain)
@@ -282,8 +328,10 @@ def verdict(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, An
     for case, row in candidate["magpie"].items():
         frozen = baseline["magpie"][case]
         worst_step, worst_dino = max(max(item) for item in row["step_error"]), min(row["dino_vs_baseline"])
+        steps = [error for item in row["step_error"] for error in item]
         cases[case] = {"pass": worst_step <= STEP_ERROR_MAX and worst_dino >= DINO_MIN,
-                       "worst_step_error": round(worst_step, 5), "worst_dino": round(worst_dino, 4),
+                       "worst_step_error": round(worst_step, 5), "mean_step_error": round(sum(steps) / len(steps), 5),
+                       "steps_over_line": f"{sum(error > STEP_ERROR_MAX for error in steps)} of {len(steps)}", "worst_dino": round(worst_dino, 4),
                        "worst_psnr_change_db": round(min(ours - theirs for ours, theirs in zip(row["psnr_db"], frozen["psnr_db"])), 2),
                        "dit_vae_ms": round(row["total"]["p50"] * 1e3, 1), "baseline_ms": round(frozen["total"]["p50"] * 1e3, 1),
                        "speedup": round(frozen["total"]["p50"] / row["total"]["p50"], 3)}

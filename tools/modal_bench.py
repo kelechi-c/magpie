@@ -434,22 +434,16 @@ def freeze_rehearsal() -> str:
     return run_freeze("turbo", ["t2i_512", "edit_512"], offload=True)
 
 
-# records what the baseline port feeds each dit step and what comes out, for every gate item, into
-# /out/baseline/<variant>/steps. kernels are switched off so this is the frozen baseline's arithmetic;
-# `repeat_psnr_db` against the frozen baseline images shows that it is (168 = bit-identical).
-@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
-def steps(variant: str) -> str:
+# records what `dit` (the baseline arithmetic) is fed at each step and what comes out, for every item of
+# `cases`, into <folder>/steps. returns each render's psnr against the frozen baseline image (168 = bit-identical).
+def record_steps(dit: Any, vae: Any, variant: str, cases: list[str], folder: pl.Path) -> dict[str, list[float]]:
     import torch
     from PIL import Image
 
-    import magpie.dit as dit_module
     import magpie.pipeline as lean
     from magpie.sampling import BASE, TURBO
 
-    dit, vae = load_port(variant, slim=False)
-    unfused(dit_module)
     sampler = TURBO if variant == "turbo" else BASE
-    folder = pl.Path(OUT_ROOT) / "baseline" / variant
     prefill, decode = dit.prefill, dit.decode
     record: dict[str, Any] = {}
 
@@ -466,7 +460,7 @@ def steps(variant: str) -> str:
 
     dit.prefill, dit.decode = spy_prefill, spy_decode
     repeat: dict[str, list[float]] = {}
-    for case in GATE_CASES:
+    for case in cases:
         spec = CASES[case]
         (folder / "steps" / case).mkdir(parents=True, exist_ok=True)
         for index in range(gate_items(variant, case)):
@@ -476,8 +470,55 @@ def steps(variant: str) -> str:
             torch.save(dict(record), folder / "steps" / case / f"{index:02d}.pt")
             repeat.setdefault(case, []).append(psnr(output, Image.open(folder / "magpie" / case / f"{index:02d}.png")))
         print(f"steps {case}: repeat psnr min {min(repeat[case]):.1f} dB", flush=True)
+    dit.prefill, dit.decode = prefill, decode
+    return repeat
+
+
+# the step recordings of the original gate cases, kernels off, into /out/baseline/<variant>/steps.
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
+def steps(variant: str) -> str:
+    import magpie.dit as dit_module
+
+    dit, vae = load_port(variant, slim=False)
+    unfused(dit_module)
+    repeat = record_steps(dit, vae, variant, GATE_CASES, pl.Path(OUT_ROOT) / "baseline" / variant)
     out_volume.commit()
     return json.dumps({"variant": variant, "repeat_psnr_db": repeat})
+
+
+WIDE_CASES = ["edit16_1024", "edit16_2048"]
+
+
+# freezes the wide gate set (turbo): sixteen text-to-image inputs from the official pipeline, its edit of each as
+# the reference, the text conditioning, then the port in baseline arithmetic (every kernel off, vae included):
+# its images, stage times and per-step recordings.
+@app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=5400, retries=0, volumes=VOLUMES)
+def freeze_wide() -> str:
+    import torch
+
+    import magpie.dit as dit_module
+    import magpie.pipeline as lean
+    import magpie.vae as vae_module
+    from gate import WIDE, WIDE_INPUTS
+
+    torch.set_grad_enabled(False)
+    folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
+    pipe, _ = load("turbo", offload=False)
+    pl.Path(WIDE_INPUTS).mkdir(parents=True, exist_ok=True)
+    for index, (prompt, _) in enumerate(WIDE):
+        image = pipe(prompt=prompt, width=1024, height=1024, generator=torch.Generator("cpu").manual_seed(1000 + index)).images[0]
+        image.convert("RGB").save(f"{WIDE_INPUTS}/{index:02d}.png")
+    print("inputs: done", flush=True)
+    result: dict[str, Any] = {"device": device_info()}
+    result["reference"], _ = reference_pass(pipe, "turbo", WIDE_CASES, folder, capture=False)
+    pipe.text_encoder.to("cpu")
+    dit, vae = lean.adopt(pipe.transformer.state_dict(), pipe.vae.state_dict(), pipe.vae.config.latents_mean, pipe.vae.config.latents_std)
+    torch.cuda.empty_cache()
+    unfused(dit_module, vae_module)
+    result["magpie"] = gate_pass(dit, vae, "turbo", WIDE_CASES, folder, folder / "magpie", {})
+    result["repeat_psnr_db"] = record_steps(dit, vae, "turbo", WIDE_CASES, folder)
+    out_volume.commit()
+    return json.dumps(result)
 
 
 # the gate for a candidate build of `src/magpie`: only the dit and vae are loaded. results go to
@@ -677,6 +718,14 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         return
     if mode == "steps":
         print(steps.remote("turbo"))
+        return
+    if mode == "freeze-wide":
+        result = json.loads(freeze_wide.remote())
+        baseline = json.loads((frozen / "turbo.json").read_text())
+        merged = {**baseline, "magpie": {**baseline["magpie"], **result["magpie"]}, "reference": {**baseline.get("reference", {}), **result["reference"]}}
+        (frozen / "turbo.json").write_text(json.dumps(merged, indent=1))
+        print(json.dumps({case: {"p50_ms": round(row["total"]["p50"] * 1e3), "repeat_psnr_min": min(result["repeat_psnr_db"][case])}
+                          for case, row in result["magpie"].items()}, indent=1))
         return
     if mode == "logits":
         (ROOT / "out" / "logits").mkdir(parents=True, exist_ok=True)
