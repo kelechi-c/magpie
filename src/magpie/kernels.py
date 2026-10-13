@@ -1,3 +1,4 @@
+import functools
 import math
 import os
 from importlib.util import find_spec
@@ -19,6 +20,8 @@ PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
 MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scaled matmuls, built by tools/build_native.sh
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
+ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
+PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "16384")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 
@@ -93,6 +96,7 @@ def sage(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 # one layer's keys and values as sage's kernel reads them, quantised once and kept between steps:
 #   k (1, S, heads, dim) int8 with the mean key subtracted, k_scale (1, heads, ceil(S / 64)) one step per 64 keys
 #   v (1, dim, heads, S padded to 64) fp8 with the tokens shuffled in 16s, v_scale (1, heads, dim) one step per channel
+#     (or nvfp4 tiles and their mean: see `sage_pack`)
 #   mean (1, heads, dim) bf16, the key mean of step 1, and v_scale are frozen so cached rows never need redoing
 #   tail: bf16 (keys, values) for the rows from `start` on, `start` being the last multiple of 64 inside the prefix.
 #   its last rows are the target, which every decode step overwrites; the few before them are prefix rows that share
@@ -125,38 +129,62 @@ def value_fp8_kernel(v_ptr, out_ptr, step_ptr, tokens, start, padded, heads, DIM
     tl.store(out_ptr + (channel[:, None] * heads + head) * padded + start + slot[None, :], turned)
 
 
+# the dim x dim hadamard matrix over dim^0.5 (dim a power of two): symmetric and orthogonal, so its own inverse.
+@functools.lru_cache
+def hadamard(dim: int, device: torch.device) -> Tensor:
+    h = torch.ones(1, 1, device=device)
+    while h.shape[0] < dim:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return h / dim**0.5
+
+
 # quantises bf16 keys and values (1, rows, heads, dim) into `kv` from row `start` (a multiple of 64) to the end,
 # with kv's frozen key mean and value steps. the key scales come back in a fresh tensor because sage's quantiser
-# wants a contiguous one, then are copied into place.
+# wants a contiguous one, then are copied into place. nvfp4 values (a uint8 `kv.v`) go through the native kernel.
 def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
     from sageattention.quant import _fused
     rows, heads, dim = k.shape[1:]
     scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
     _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
     kv.k_scale[:, :, start // KEY_BLOCK :] = scale
+    if kv.v.dtype == torch.uint8:
+        import magpie_attn
+        magpie_attn.values(v, kv.v_scale, kv.v, start // KEY_BLOCK)
+        return kv
     value_fp8_kernel[(-(-rows // KEY_BLOCK), heads)](v, kv.v, kv.v_scale, rows, start, kv.v.shape[-1], heads, DIM=dim, TOKENS=KEY_BLOCK, num_warps=4)
     return kv
 
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
-# number of leading rows that will never change.
+# number of leading rows that will never change. from PV4_KEYS keys up the values are kept in nvfp4 for the native
+# kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
+# basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 def sage_pack(k: Tensor, v: Tensor, prefix: int) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
-    step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
-    kv = SageKV(torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK),
-                torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device), step, k.mean(dim=1),
+    if tokens >= PV4_KEYS:
+        values = torch.empty((1, heads, padded // KEY_BLOCK, 4608), dtype=torch.uint8, device=k.device)
+        step = (v.mean(dim=1, dtype=torch.float32) @ hadamard(dim, v.device)).contiguous()
+    else:
+        values = torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device)
+        step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
+    kv = SageKV(torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), values, step, k.mean(dim=1),
                 (k[:, start:].clone(), v[:, start:].clone()), start)
     return sage_write(kv, k, v, 0)
 
 
-# `sage` on keys and values that are already quantised: only the queries are quantised here.
+# `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
+# native kernel (int8 q x k as in sage, 4-bit weights x values).
 def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
     from sageattention.core import sm89_compile
     from sageattention.quant import _fused
     q8, out = torch.empty_like(q, dtype=torch.int8), torch.empty_like(q)
     scale = kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP))
     _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
+    if kv.v.dtype == torch.uint8:
+        import magpie_attn
+        magpie_attn.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
+        return out
     sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, 0, 0, 2, q.shape[-1] ** -0.5, 0)
     return out
 

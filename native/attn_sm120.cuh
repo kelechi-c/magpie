@@ -6,6 +6,8 @@
 //   ATTN_PV4     1: the weights x values matmul runs on blackwell's block-scaled 4-bit instruction (mxf4nvf4, 64 keys
 //                per instruction instead of 32). the values arrive as nvfp4 (see `load_fp4_values`), the weights are
 //                rounded to nvfp4 in registers (`weights_to_fp4`), and the denominator sums the rounded weights.
+//                the values are rounded in a hadamard basis of the 128 channels (`values_fp4_kernel`), which spreads
+//                a channel's outliers; the output is turned back before it is stored (`turn_back`).
 //   ATTN_ABLATE  profiling only: 1 skips the q x k matmul, 2 the softmax update, 3 the weights x values matmul,
 //                5 / 6 / 7 run the weights x values matmul / the q x k matmul / both at the 4-bit instruction's cost,
 //                4 the key and value loads, in the main loop. the output is then wrong by design.
@@ -163,6 +165,178 @@ __device__ __forceinline__ void values_fp4(b128_t *smem_v, uint32_t RA[][4], uin
       mma_fp4(RO[fq][fv] + 4, RA[fq], RV + 2, SF[fq], second);
     }
   }
+}
+
+// one warp's output (32 queries x 128 channels in registers) times the 128 x 128 hadamard matrix over 128^0.5, in
+// place: the values were rounded in that basis, and the matrix is its own inverse. channel c of a row sits in tile
+// fv = c / 16, element (c / 8) % 2 * 4 + c % 2 of lane % 4 == (c / 2) % 4, so five of the seven butterfly stages
+// stay inside a thread and two exchange with lane ^ 1 and lane ^ 2. once per thread block, not per key tile.
+template <uint32_t num_tiles_q, uint32_t num_tiles_v>
+__device__ __forceinline__ void turn_back(float RO[][num_tiles_v][8])
+{
+  static_assert(num_tiles_v == 8, "the hadamard turn is written for 128 channels");
+  const uint32_t lane = get_lane_id();
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; i += 2) // channel bit 0
+      {
+        const float a = RO[fq][fv][i], b = RO[fq][fv][i + 1];
+        RO[fq][fv][i] = a + b;
+        RO[fq][fv][i + 1] = a - b;
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < 4; i++) // channel bit 3
+      {
+        const float a = RO[fq][fv][i], b = RO[fq][fv][i + 4];
+        RO[fq][fv][i] = a + b;
+        RO[fq][fv][i + 4] = a - b;
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < 8; i++) // channel bits 1 and 2: across the 4 lanes of a row
+      {
+        float other = __shfl_xor_sync(0xffffffff, RO[fq][fv][i], 0x1);
+        RO[fq][fv][i] = (lane & 1) ? other - RO[fq][fv][i] : RO[fq][fv][i] + other;
+        other = __shfl_xor_sync(0xffffffff, RO[fq][fv][i], 0x2);
+        RO[fq][fv][i] = (lane & 2) ? other - RO[fq][fv][i] : RO[fq][fv][i] + other;
+      }
+    }
+#pragma unroll
+    for (uint32_t span = 1; span < num_tiles_v; span *= 2) // channel bits 4 to 6
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+        if ((fv & span) == 0)
+#pragma unroll
+          for (uint32_t i = 0; i < 8; i++)
+          {
+            const float a = RO[fq][fv][i], b = RO[fq][fv + span][i];
+            RO[fq][fv][i] = a + b;
+            RO[fq][fv + span][i] = a - b;
+          }
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+#pragma unroll
+      for (uint32_t i = 0; i < 8; i++)
+        RO[fq][fv][i] *= 0.08838834764831845f;
+  }
+}
+
+#ifndef ATTN_TRIES
+#define ATTN_TRIES 4
+#endif
+
+// an e2m1 nibble -> its value: sign, then 0, 0.5, 1, 1.5, 2, 3, 4, 6 (from 1 up: a float's exponent and top
+// mantissa bit).
+__device__ __forceinline__ float fp4_value(uint32_t nibble)
+{
+  const uint32_t code = nibble & 7;
+  const float size = code < 2 ? 0.5f * code : __uint_as_float(((126 + (code >> 1)) << 23) | ((code & 1) << 22));
+  return __uint_as_float(__float_as_uint(size) | ((nibble & 8) << 28));
+}
+
+// bf16 values (tokens, heads, 128) -> the nvfp4 tiles `load_fp4_values` reads, one thread block of 128 threads per
+// (64-key tile, head): row 0 of `v` is the first key of tile `first_tile`. per tile: every token's 128 channels are turned by the hadamard
+// matrix over 128^0.5, `mean` (heads, 128, in the turned basis) is subtracted, and each channel's 64 keys go out in
+// slot order (see `weights_to_fp4`) as e2m1 nibbles with one e4m3 scale per 16 slots. the scale is the block's
+// largest magnitude over 6, or that times a shrink where clipping the largest costs less squared error than a
+// coarser grid for the rest (ATTN_TRIES candidates). keys past `tokens` are zeros.
+// first every thread turns half of one token's channels in registers (six butterfly stages over 64 values read
+// straight from global memory) and leaves them in shared memory; then every thread owns one channel, and the
+// seventh stage is the sum or difference of the two halves as it reads its 64 keys.
+__global__ void values_fp4_kernel(const nv_bfloat16 *__restrict__ v, const float *__restrict__ mean, uint8_t *__restrict__ out,
+                                  const uint32_t tokens, const uint32_t heads, const uint32_t first_tile, const uint32_t tiles)
+{
+  constexpr float shrinks[4] = {1.f, 0.7f, 0.85f, 0.55f};
+  __shared__ float x[64][128];
+  const uint32_t tile = first_tile + blockIdx.x, head = blockIdx.y, t = threadIdx.x;
+  {
+    const uint32_t key = blockIdx.x * 64 + t % 64, half = t / 64;
+    float r[64];
+    if (key < tokens)
+    {
+      const uint4 *row = reinterpret_cast<const uint4 *>(v + (size_t(key) * heads + head) * 128 + half * 64);
+#pragma unroll
+      for (uint32_t i = 0; i < 8; i++)
+      {
+        const uint4 w = row[i];
+        const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (uint32_t j = 0; j < 4; j++)
+        {
+          r[i * 8 + j * 2] = __uint_as_float(words[j] << 16); // a bf16 is the top half of an fp32
+          r[i * 8 + j * 2 + 1] = __uint_as_float(words[j] & 0xFFFF0000);
+        }
+      }
+#pragma unroll
+      for (uint32_t span = 1; span < 64; span *= 2)
+#pragma unroll
+        for (uint32_t c = 0; c < 64; c++)
+          if ((c & span) == 0)
+          {
+            const float a = r[c], b = r[c + span];
+            r[c] = a + b;
+            r[c + span] = a - b;
+          }
+    }
+#pragma unroll
+    for (uint32_t c = 0; c < 64; c++)
+      x[t % 64][half * 64 + c] = key < tokens ? r[c] : 0.f;
+  }
+  __syncthreads();
+  const float centre = mean[head * 128 + t];
+  const uint32_t low = t % 64, valid = tokens - min(tokens, blockIdx.x * 64);
+  uint32_t *target = reinterpret_cast<uint32_t *>(out + (size_t(head) * tiles + tile) * (FP4_TILE_LINES * 16));
+  uint32_t scales = 0;
+#pragma unroll
+  for (uint32_t block = 0; block < 4; block++)
+  {
+    float a[16];
+    float top = 0.f;
+#pragma unroll
+    for (uint32_t i = 0; i < 16; i++)
+    {
+      const uint32_t s = block * 16 + i, key = 32 * (s / 32) + 8 * ((s % 8) / 2) + 2 * ((s % 32) / 8) + s % 2;
+      const float first = x[key][low], second = x[key][low + 64];
+      a[i] = key < valid ? (t < 64 ? first + second : first - second) * 0.08838834764831845f - centre : 0.f;
+      top = max(top, fabsf(a[i]));
+    }
+    float best = 3.4e38f;
+    uint32_t words[2] = {0, 0}, byte = 0;
+#pragma unroll
+    for (uint32_t n = 0; n < ATTN_TRIES; n++)
+    {
+      const uint32_t bits = (__float_as_uint(min(max(top * shrinks[n] * (1.f / 6.f), 0.015625f), 448.f)) + 0xFFFFF) & 0xFFF00000;
+      const float scale = __uint_as_float(bits), inverse = 1.f / scale;
+      float scaled[16];
+#pragma unroll
+      for (uint32_t i = 0; i < 16; i++)
+        scaled[i] = a[i] * inverse;
+      const uint32_t tried[2] = {fp4_pack(scaled), fp4_pack(scaled + 8)};
+      float error = 0.f;
+#pragma unroll
+      for (uint32_t i = 0; i < 16; i++)
+      {
+        const float miss = fp4_value(tried[i / 8] >> (4 * (i % 8))) - scaled[i];
+        error += miss * miss;
+      }
+      error *= scale * scale;
+      if (error < best)
+      {
+        best = error;
+        words[0] = tried[0];
+        words[1] = tried[1];
+        byte = (bits >> 20) - 960;
+      }
+    }
+    target[t * 8 + block * 2] = words[0];
+    target[t * 8 + block * 2 + 1] = words[1];
+    scales |= byte << (8 * block);
+  }
+  target[1024 + t] = scales;
 }
 
 // profiling only (ATTN_ABLATE 5, 7): the weights x values matmul at the 4-bit instruction's cost, half the
@@ -962,6 +1136,9 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     }
   }
 
+#if ATTN_PV4
+  turn_back<num_tiles_q, num_tiles_v>(RO);
+#endif
   // save the result to shared memory
   uint32_t smem_O_row_base = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
 #pragma unroll

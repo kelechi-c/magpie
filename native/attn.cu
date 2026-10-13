@@ -53,4 +53,17 @@ void attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor out
       out.stride(0), out.stride(1), out.stride(2), sm_scale);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) { module.def("attend", &attend); }
+// bf16 values (1, rows, heads, 128) -> nvfp4 tiles in `out` (1, heads, tiles, 4608) from tile `first_tile` on (row 0
+// is that tile's first key), in the hadamard basis with `mean` (1, heads, 128, fp32, that basis) subtracted. what an
+// ATTN_PV4 build reads.
+void values(torch::Tensor v, torch::Tensor mean, torch::Tensor out, int first_tile) {
+  const int rows = v.size(1), heads = v.size(2), tiles = out.size(2);
+  TORCH_CHECK(v.size(3) == HEAD_DIM && v.is_contiguous() && out.is_contiguous() && out.size(3) == 4608 && (tiles - first_tile) * 64 >= rows, "values: bad layout");
+  values_fp4_kernel<<<dim3(div_ceil(rows, 64), heads), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const nv_bfloat16 *>(v.data_ptr()), mean.data_ptr<float>(), out.data_ptr<uint8_t>(), rows, heads, first_tile, tiles);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("attend", &attend);
+  module.def("values", &values);
+}

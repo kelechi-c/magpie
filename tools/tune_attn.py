@@ -19,7 +19,7 @@ FLAGS = ["-O3", "-std=c++20", "-DENABLE_BF16", "-U__CUDA_NO_HALF_OPERATORS__", "
          "-diag-suppress=174", "-gencode", "arch=compute_120a,code=sm_120a"]
 INCLUDES = ["/sage/csrc", "/sage/csrc/qattn"]
 SHAPES = [(4096, 8239), (16384, 32911)]  # (queries, keys): edit decode steps at 1024 and 2048
-BASE: Config = {"CTA_Q": 128, "CTA_K": 64, "WARP_Q": 32, "WARP_K": 64, "INST_BUF": 1, "LAZY": 0, "ABLATE": 0, "PV4": 0}
+BASE: Config = {"CTA_Q": 128, "CTA_K": 64, "WARP_Q": 32, "WARP_K": 64, "INST_BUF": 1, "LAZY": 0, "ABLATE": 0, "PV4": 0, "TRIES": 4}
 TILES = [(128, 128, 32, 128), (128, 128, 32, 64), (128, 64, 16, 64), (64, 64, 32, 64), (64, 64, 16, 64), (64, 128, 32, 128), (64, 128, 16, 128), (64, 128, 32, 64)]
 WORKERS = 4
 
@@ -89,17 +89,30 @@ def slot_keys() -> Any:
     return 32 * (s // 32) + 8 * ((s % 8) // 2) + 2 * ((s % 32) // 8) + s % 2
 
 
-# values (1, keys, heads, 128) -> nvfp4 for the PV4 kernel: bytes (1, heads, key tiles, 4608) and the per (head,
-# channel) mean (1, heads, 128) that the kernel adds back (zero unless `centre`). per tile and channel: 64 keys in
-# slot order as e2m1 nibbles, then 4 e4m3 scales, one per 16 slots. `shrinks`: each block keeps the scale, among
-# its largest value over 6 times each shrink, with the least squared error.
+# the 128 x 128 hadamard matrix over 128^0.5: symmetric and orthogonal, so its own inverse.
+def hadamard(device: Any) -> Any:
+    import torch
+
+    h = torch.ones(1, 1, device=device)
+    for _ in range(7):
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return h / 128**0.5
+
+
+# values (1, keys, heads, 128) -> nvfp4 for the PV4 kernel, in torch (the reference for the native `values` kernel):
+# bytes (1, heads, key tiles, 4608) and the per (head, channel) mean (1, heads, 128) the kernel adds back (zero
+# unless `centre`). the channels are turned by the hadamard matrix first (the kernel turns its output back). per tile
+# and channel: 64 keys in slot order as e2m1 nibbles, then 4 e4m3 scales, one per 16 slots. `shrinks`: each block
+# keeps the scale, among its largest value over 6 times each shrink, with the least squared error.
 def nvfp4_values(v: Any, centre: bool, shrinks: tuple[float, ...] = (1.0,)) -> tuple[Any, Any]:
     import torch
     import torch.nn.functional as F
 
-    x = v.float().permute(0, 2, 3, 1)  # (1, heads, 128, keys)
+    x = (v.float() @ hadamard(v.device)).permute(0, 2, 3, 1)  # (1, heads, 128, keys)
+    keys = x.shape[-1]
     mean = x.mean(-1) if centre else torch.zeros_like(x[..., 0])
-    x = F.pad(x - mean[..., None], (0, -x.shape[-1] % 64)).unflatten(-1, (-1, 64))[..., slot_keys().to(x.device)].unflatten(-1, (4, 16))
+    x = x - mean[..., None]
+    x = F.pad(x, (0, -keys % 64)).unflatten(-1, (-1, 64))[..., slot_keys().to(x.device)].unflatten(-1, (4, 16))
     top = (x.abs().amax(-1, keepdim=True) / 6).clamp(2.0**-6, 448.0)
     grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device)
     best_error, best_codes, best_scale = None, None, None
@@ -132,7 +145,7 @@ def main() -> None:
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     one = lambda **change: {**BASE, **change}
-    configs = [BASE, one(PV4=1)]
+    configs = [one(PV4=1), one(PV4=1, TRIES=2), one(PV4=1, TRIES=1)]
     built = build_all(configs)
     data = {shape: inputs(*shape) for shape in SHAPES}
     gap = lambda out, want: round(float((out.float() - want).norm() / want.norm()), 5)
@@ -145,15 +158,23 @@ def main() -> None:
         for shape in SHAPES:
             q, k, v, want = data[shape]
             operands = quantised(q, k, v, config)
-            for name, values in ({"plain": (False, (1.0,)), "centred": (True, (1.0,)), "fitted": (False, (1.0, 0.85, 0.7, 0.55)),
-                                  "centred, fitted": (True, (1.0, 0.85, 0.7, 0.55))} if config["PV4"] else {"": None}).items():
-                v_operands = nvfp4_values(v, *values) if values else (operands[2], operands[5])
+            fit = (1.0, 0.85, 0.7, 0.55)
+            for name in (("torch, centred, fitted", "native values") if config["PV4"] else ("",)):
+                v_operands = (operands[2], operands[5])
+                if name.startswith("torch"):
+                    v_operands = nvfp4_values(v, True, fit)
+                if name.startswith("native"):
+                    mean = (v.float().mean(1) @ hadamard(v.device)).contiguous()
+                    tiles = torch.empty(1, v.shape[2], -(-v.shape[1] // 64), 4608, dtype=torch.uint8, device=v.device)
+                    write = lambda: module.values(v, mean, tiles, 0)
+                    values_ms = timed(write)
+                    v_operands = (tiles, mean)
                 out = torch.empty_like(q)
                 call = lambda: module.attend(*operands[:2], v_operands[0], out, *operands[3:5], v_operands[1], q.shape[-1] ** -0.5)
                 ms = timed(call)
                 torch.cuda.synchronize()
                 rows.append({"config": label(config), "values": name, "shape": "x".join(map(str, shape)), "ms": round(ms, 3), "gap": gap(out, want),
-                             "tflops": round(4 * shape[0] * shape[1] * 4096 / ms / 1e9)})
+                             "tflops": round(4 * shape[0] * shape[1] * 4096 / ms / 1e9), **({"values_ms": round(values_ms, 3)} if name.startswith("native") else {})})
                 print("attn", json.dumps(rows[-1]), flush=True)
     pl.Path("/out/tune_attn.json").write_text(json.dumps(rows, indent=1))
 
