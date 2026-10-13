@@ -439,12 +439,12 @@ def ladder(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
     steps = [(s["step"], s["ms"]) for s in d["ladder"]["steps"]]
     first, last = steps[0][1], steps[-1][1]
     fig, ax = canvas(th, sh, sh.pick(7.0, 9.8),
-                     f"Ten changes took a 1024² edit from {first / 1000:.2f} s to {last / 1000:.2f} s, "
+                     f"{len(steps) - 1} changes took a 1024² edit from {first / 1000:.2f} s to {last / 1000:.2f} s, "
                      f"{first / last:.1f} x faster",
                      "Milliseconds per Turbo (8 steps) edit at 1024², DiT + VAE, median of 5 warm requests, RTX PRO 6000 "
                      "Blackwell. Lower is better.",
-                     "One change per row, in the order they were made. The last step misses the DINOv2 0.98 line on one "
-                     "image; the current default measures 1,054 ms.",
+                     "One change per row, in the order they were made. The last two steps miss the DINOv2 0.98 line on one "
+                     "and two of sixteen images; the last step is the earlier figure less its measured gain.",
                      left=sh.pick(2.5, 3.0), right=sh.pick(1.6, 0.5),
                      key=[(th.other, "port baseline"), (th.soft, "earlier steps"), (th.hero, "last step")])
     n = len(steps)
@@ -559,7 +559,7 @@ def quality_gate(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, .
                      "DINOv2 similarity of each edit to its frozen baseline image, per item. Higher is better. Axis "
                      "zoomed to 0.97 to 1.00.",
                      "Frozen set of 16 edits, RTX PRO 6000 Blackwell, Turbo (8 steps), edit, DiT + VAE. A VLM judge "
-                     "called item 0 identical. Item 15 is the lettering poster.",
+                     "called item 0 identical and had no stable preference on item 4. Item 15 is the lettering poster.",
                      left=sh.pick(2.0, 1.8), right=sh.pick(0.6, 0.9),
                      key=[(th.hero, "1024²"), (th.peer, "2048²"), (th.soft, "under the line")])
     for i, (a, b) in enumerate(zip(g1, g2)):

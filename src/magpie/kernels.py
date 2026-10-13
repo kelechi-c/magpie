@@ -514,8 +514,9 @@ def rows_mx_kernel(x_ptr, out_ptr, sf_ptr, width, cells, TILE: tl.constexpr, SWI
     row, first = tl.program_id(0), tl.program_id(1) * TILE
     at = first + tl.arange(0, TILE)
     if SWIGLU:
-        gate = tl.load(x_ptr + row * 2 * width + at).to(tl.float32)
-        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + row * 2 * width + width + at).to(tl.float32)
+        base = row.to(tl.int64) * 2 * width  # 64-bit: rows x 2 x width passes 2^31 from 87,382 rows of the dit's mlp
+        gate = tl.load(x_ptr + base + at).to(tl.float32)
+        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + base + width + at).to(tl.float32)
     else:
         y = tl.load(x_ptr + row * width + at).to(tl.float32)
     store_mx(y, out_ptr, sf_ptr, row, first, width, cells, TILE)
@@ -616,8 +617,9 @@ def rows_nv_kernel(x_ptr, out_ptr, sf_ptr, width, cells, scale, TILE: tl.constex
     row, first = tl.program_id(0), tl.program_id(1) * TILE
     at = first + tl.arange(0, TILE)
     if SWIGLU:
-        gate = tl.load(x_ptr + row * 2 * width + at).to(tl.float32)
-        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + row * 2 * width + width + at).to(tl.float32)
+        base = row.to(tl.int64) * 2 * width  # 64-bit: rows x 2 x width passes 2^31 from 87,382 rows of the dit's mlp
+        gate = tl.load(x_ptr + base + at).to(tl.float32)
+        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + base + width + at).to(tl.float32)
     else:
         y = tl.load(x_ptr + row * width + at).to(tl.float32)
     even, odd = tl.split(tl.reshape(y * scale, (TILE // 2, 2)))

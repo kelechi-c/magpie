@@ -2,7 +2,7 @@
   "generated": "2026-10-13",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "c2ce5708978a8fa7bb0364df053aa111b27ca65c"
+    "head": "6c36bef48099023515ef8fff0644bcd9de8c22a3"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -22,11 +22,11 @@
   },
   "ladder": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/ladder.json",
-    "sha256": "112657c27356498ca43db201d9ac5e5893d4c4a4245a719ae90f6fcd51c8ef12"
+    "sha256": "4361ba45046812f1e662dd367dbb46afbd0b8f28bf47943f9aafcff2f471b150"
   },
   "compare": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/compare.json",
-    "sha256": "4e059d5963985bfbea3315cf98f93b05830a49e9047876b5fef4871ff4507f02"
+    "sha256": "709301752273d6f1d5fb5b0bc3859eeed3631393e9ea252bb997870cc9220e28"
   },
   "charts": {
     "stage-split": [
