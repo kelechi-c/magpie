@@ -21,8 +21,8 @@ MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scale
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
 ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
-PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "16384")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
-QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "16384")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
+PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "32768")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
+QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "32768")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 
@@ -163,7 +163,7 @@ def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
 
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
-# number of leading rows that will never change. from PV4_KEYS keys up the values are kept in nvfp4 for the native
+# number of leading rows that will never change. from PV4_KEYS keys up (32,768 by default: a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 # from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
