@@ -191,11 +191,28 @@ def from_disk(state: dict[str, Any]) -> dict[str, Any]:
     return {name.removesuffix("@f8"): (tensor.view(torch.float8_e4m3fn) if name.endswith("@f8") else tensor) for name, tensor in state.items()}
 
 
+# where the prepacked dit lives on the hub: a private repo (the weights' licence forbids passing them on).
+PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-nvfp4-mxfp8-bf16"
+
+
+# the prepacked dit for this build if there is one: the local file, else the private hub copy, downloaded once
+# next to it (skipped offline). None means it has to be packed here.
+def prepacked(local: pl.Path) -> pl.Path | None:
+    from huggingface_hub import HfApi, constants, hf_hub_download
+
+    if local.exists():
+        return local
+    if constants.HF_HUB_OFFLINE or not HfApi().file_exists(PACKED_REPO, local.name):
+        return None
+    print(f"downloading {local.name} from {PACKED_REPO}", flush=True)
+    return pl.Path(hf_hub_download(PACKED_REPO, local.name, local_dir=local.parent))
+
+
 # the port's dit and vae on the card, and nothing else: no pipeline, no text encoder. the checkpoint's
 # safetensors are read directly and cast to bf16, so only torch and safetensors are needed. `slim` keeps the mlp
 # weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`). a slim dit on the
-# native matmul is saved once, packed, under HF_HOME/magpie/ (local only: the weights' licence forbids passing it
-# on) and read from there afterwards, so later loads never hold the bf16 dit.
+# native matmul is read packed from HF_HOME/magpie/ (fetched from the private PACKED_REPO if missing, else packed
+# here and saved), so later loads never hold the bf16 dit and need no transformer/ download.
 def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("q", "k", "v", "out")) -> tuple[Any, Any]:
     import torch
     from huggingface_hub import hf_hub_download
@@ -214,8 +231,9 @@ def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("q"
 
     config = json.loads((snapshot / "vae" / "config.json").read_text())
     packed = pl.Path(os.environ.get("HF_HOME", pl.Path.home() / ".cache/huggingface")) / "magpie" / f"{variant}-nv_{'_'.join(sorted(NV))}-fp8_{'_'.join(attention)}.safetensors"
-    if slim and MX and packed.exists() and not os.environ.get("MAGPIE_REPACK"):
-        return lean.adopt_packed(from_disk(load_file(packed, device="cuda")), read("vae"), config["latents_mean"], config["latents_std"])
+    ready = prepacked(packed) if slim and MX and not os.environ.get("MAGPIE_REPACK") else None
+    if ready:
+        return lean.adopt_packed(from_disk(load_file(ready, device="cuda")), read("vae"), config["latents_mean"], config["latents_std"])
     dit, vae = lean.adopt(read("transformer"), read("vae"), config["latents_mean"], config["latents_std"], slim, attention)
     if slim and MX:
         packed.parent.mkdir(parents=True, exist_ok=True)
