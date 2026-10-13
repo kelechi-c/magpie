@@ -4,6 +4,8 @@
 #                                           an edit at 2048 to see whether it fits
 #   python tools/full_request.py staged     2048 edits with the dit and vae resident and the encoder parked in pinned
 #                                           host memory: copied to the gpu for the encode, dropped before the denoise
+#   python tools/full_request.py refs <resident|staged>   edits with 1, 2, 3, ... condition images at 1024 and 2048
+#                                           until one does not fit: time and peak memory per count
 #   python tools/full_request.py cold <tag> a new process up to its first and second 1024 edit: imports, both loads,
 #                                           the first request (run it after dropping the page cache, and again)
 import json
@@ -13,15 +15,17 @@ import time
 from typing import Any, Callable
 
 import torch
+from PIL import Image
 
 import magpie.pipeline as lean
-from gate import REPOS, gate_input, load_port
+from gate import REPOS, WIDE_INPUTS, gate_input, load_port
 from magpie.sampling import TURBO
 from magpie.text import encode, load_encoder as port_encoder, reslot
 
 OUT = pl.Path("/out/full")
 RUNS = 5
 GIB = 2**30
+MOST = 8  # condition images tried at most
 LOOK = 1024  # the encoder reads condition images no larger than this, as pipeline.generate does
 TFLOP = {1024: 685.8, 2048: 4537.5}  # arithmetic in one edit's dit + vae (tools/roofline.py), for the achieved rate
 
@@ -61,8 +65,8 @@ def median(values: list[float]) -> float:
 # one request in two stages: the encoder, then vae encode + denoise + vae decode. `between` runs after the encode
 # (the staged mode frees the encoder there); `before` runs first (it brings the encoder back).
 def request(encoder: Any, processor: Any, dit: Any, vae: Any, case: str, size: int, before: Callable[[], None] = lambda: None,
-            between: Callable[[], None] = lambda: None) -> tuple[Any, dict[str, float]]:
-    prompt, images = gate_input(case, 0)
+            between: Callable[[], None] = lambda: None, given: tuple[str, tuple[Any, ...]] | None = None) -> tuple[Any, dict[str, float]]:
+    prompt, images = given or gate_input(case, 0)
     sized = lean.resized(images, size)
     _, load_ms, _ = stage(before)
     (text, slots), text_ms, text_peak = stage(lambda: conditioning(encoder, processor, prompt, images, sized, size))
@@ -121,14 +125,8 @@ def resident() -> dict[str, Any]:
     return report
 
 
-def staged() -> dict[str, Any]:
-    start = time.perf_counter()
-    dit, vae = load_port("turbo")
-    torch.cuda.synchronize()
-    port_s = time.perf_counter() - start
-    start = time.perf_counter()
-    encoder, processor = load_encoder()
-    encoder_s = time.perf_counter() - start
+# (fetch, park) for an encoder kept in pinned host memory: fetch copies it to the gpu, park drops that copy.
+def parking(encoder: Any) -> tuple[Callable[[], None], Callable[[], None]]:
     host = {name: weight.cpu().pin_memory() for name, weight in encoder.state_dict().items()}
 
     def park() -> None:
@@ -139,6 +137,43 @@ def staged() -> dict[str, Any]:
         encoder.load_state_dict({name: weight.to("cuda", non_blocking=True) for name, weight in host.items()}, assign=True)
 
     park()
+    return fetch, park
+
+
+# how many condition images fit: one edit per count at each size, up to MOST, stopping at the first that fails.
+def references(mode: str) -> dict[str, Any]:
+    dit, vae = load_port("turbo")
+    encoder, processor = load_encoder()
+    fetch, park = parking(encoder) if mode == "staged" else (lambda: None, lambda: None)
+    pictures = [Image.open(f"{WIDE_INPUTS}/{index:02d}.png") for index in range(MOST)]
+    report: dict[str, Any] = {"mode": mode}
+    for size in (1024, 2048):
+        for count in range(1, MOST + 1):
+            given = ("Combine the subjects of all the images into one ink-and-watercolour drawing on cream paper.", tuple(pictures[:count]))
+            try:
+                image, row = request(encoder, processor, dit, vae, "", size, fetch, park, given)
+            except (torch.OutOfMemoryError, RuntimeError) as error:  # the point of the run: the first count that does not fit
+                report[f"{size} x{count}"] = {"failed": str(error)[:200]}
+                print(size, count, "failed", str(error)[:200].replace("\n", " "), flush=True)
+                del error
+                park()
+                torch.cuda.empty_cache()
+                break
+            image.convert("RGB").save(OUT / f"refs-{mode}-{size}-{count}.jpg", quality=90)
+            report[f"{size} x{count}"] = {key: round(value, 2 if key.endswith("gib") else 0) for key, value in row.items() if key != "dit_vae_tflops"}
+            print(size, count, json.dumps(report[f"{size} x{count}"]), flush=True)
+    return report
+
+
+def staged() -> dict[str, Any]:
+    start = time.perf_counter()
+    dit, vae = load_port("turbo")
+    torch.cuda.synchronize()
+    port_s = time.perf_counter() - start
+    start = time.perf_counter()
+    encoder, processor = load_encoder()
+    encoder_s = time.perf_counter() - start
+    fetch, park = parking(encoder)
     report: dict[str, Any] = {"load_encoder_from_disk_s": round(encoder_s, 1), "load_dit_vae_from_disk_s": round(port_s, 1),
                               "resident_gib_encoder_parked": round(torch.cuda.memory_allocated() / GIB, 2)}
     for name, case, size in (("edit_2048", "edit16_2048", 2048), ("edit_1024", "edit_1024", 1024)):
@@ -151,5 +186,5 @@ if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     mode = sys.argv[1]
     result = {"device": torch.cuda.get_device_name(0), "total_gib": round(torch.cuda.get_device_properties(0).total_memory / GIB, 2),
-              **{"resident": resident, "staged": staged, "cold": cold}[mode]()}
+              **(references(sys.argv[2]) if mode == "refs" else {"resident": resident, "staged": staged, "cold": cold}[mode]())}
     (OUT / f"{'-'.join(sys.argv[1:])}.json").write_text(json.dumps(result, indent=1))

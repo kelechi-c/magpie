@@ -1,6 +1,6 @@
 # does the model still letter words correctly? eight requests whose image must carry a given string (six
 # text-to-image, two edits), rendered by one build, then read back by the checkpoint's own qwen3-vl.
-#   python tools/text_render.py render <tag> [--mlp F] [--attention F] [--baseline]   -> /out/lettering/<tag>/NN.png
+#   python tools/text_render.py render <tag> [--mlp F] [--attention F] [--calibrated REPO] [--baseline]   -> /out/lettering/<tag>/NN.png
 #   python tools/text_render.py read                                                 -> /out/lettering/read.json
 # `--baseline` is the port with every kernel off and bf16 weights. `read` transcribes every folder's images and
 # scores each against its string (difflib ratio on lowercased letters and digits; 1.0 is a perfect reading).
@@ -32,7 +32,7 @@ def letters(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
-def render(tag: str, mlp: str, attention: str, baseline: bool) -> None:
+def render(tag: str, mlp: str, attention: str, baseline: bool, calibrated: str = "") -> None:
     from huggingface_hub import hf_hub_download
 
     import magpie.dit as dit_module
@@ -46,7 +46,7 @@ def render(tag: str, mlp: str, attention: str, baseline: bool) -> None:
     dit, vae = load_port("turbo", slim=not baseline)
     if baseline:
         unfused(dit_module, vae_module)
-    encoder, processor = load_encoder(snapshot, mlp, attention)
+    encoder, processor = load_encoder(snapshot, mlp, attention, pl.Path(hf_hub_download(calibrated, "config.json", local_files_only=True)).parent if calibrated else None)
     (OUT / tag).mkdir(parents=True, exist_ok=True)
     for index, (_, prompt, source) in enumerate(ITEMS):
         sized = lean.resized((Image.open(f"{INPUTS}/{source}"),), 1024) if source else []
@@ -86,6 +86,7 @@ if __name__ == "__main__":
     parser.add_argument("--mlp", default="bf16")
     parser.add_argument("--attention", default="bf16")
     parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--calibrated", default="")  # repo id of a calibrated nvfp4 encoder already in the hf cache
     args = parser.parse_args()
     torch.set_grad_enabled(False)
-    read() if args.mode == "read" else render(args.tag, args.mlp, args.attention, args.baseline)
+    read() if args.mode == "read" else render(args.tag, args.mlp, args.attention, args.baseline, args.calibrated)
