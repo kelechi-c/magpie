@@ -1,0 +1,29 @@
+{
+ "measured": "2026-10-13, one RTX PRO 6000 Blackwell (colab), Qwen-Image 2.1 Turbo, 8 steps, batch 1, median of 5 warm requests",
+ "sglang": "sglang[diffusion] 0.5.21, sglang serve; http_ms is curl total time (png encode and transfer included), stages_ms is the server's own encode + denoise + decode log for the last request; peak_gib is nvidia-smi memory.used",
+ "magpie": "in-process, text encoder included; peak_gib is torch's peak allocated",
+ "cases": {
+  "edit 1024": {
+   "magpie": {"total_ms": 1130, "text_ms": 102, "dit_vae_ms": 1027, "peak_gib": 25.8},
+   "magpie, nvfp4 encoder": {"total_ms": 1093, "text_ms": 73, "dit_vae_ms": 1020, "peak_gib": 16.5},
+   "sglang default": {"http_ms": 2204, "peak_gib": 26.6},
+   "sglang sage": {"http_ms": 2045, "peak_gib": 26.4},
+   "sglang fp8 + sage": {"http_ms": 1498, "stages_ms": 1252, "text_ms": 20, "denoise_ms": 1068, "decode_ms": 164, "peak_gib": 19.5}
+  },
+  "text-to-image 1024": {
+   "magpie": {"total_ms": 791, "text_ms": 20, "dit_vae_ms": 771, "peak_gib": 23.3},
+   "sglang default": {"http_ms": 1747, "peak_gib": 24.0},
+   "sglang sage": {"http_ms": 1668, "peak_gib": 24.0},
+   "sglang fp8 + sage": {"http_ms": 1186, "stages_ms": 967, "text_ms": 2, "denoise_ms": 822, "decode_ms": 143, "peak_gib": 16.6}
+  },
+  "edit 2048": {
+   "magpie": {"total_ms": 6879, "text_ms": 104, "dit_vae_ms": 6775, "peak_gib": 41.0},
+   "sglang default": {"http_ms": 13724, "stages_ms": 12825, "text_ms": 134, "denoise_ms": 9370, "decode_ms": 3320, "peak_gib": 49.4},
+   "sglang sage": {"http_ms": 10826, "peak_gib": 49.4},
+   "sglang fp8 + sage": {"http_ms": 8876, "stages_ms": 7966, "text_ms": 134, "denoise_ms": 6808, "decode_ms": 1024, "peak_gib": 44.8}
+  }
+ },
+ "notes": ["sglang's 20 ms and 2 ms text stages are conditioning-cache hits on a repeated prompt; magpie re-encodes every request",
+           "sglang --enable-torch-compile failed to start for this model on 0.5.21 (pack_qkv_weights); --performance-mode speed measured the same as default (2,184 / 1,730 / 13,713 ms) at 41-64 gib",
+           "fractalyze's showcase (1.85 s on an rtx 5090) is text-to-image with the 40-step base model and step caching: a different model, step count and task, not placed on these axes"]
+}

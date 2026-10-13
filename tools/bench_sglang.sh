@@ -18,6 +18,11 @@ install_sglang() {
   python3 -m pip install -q uv
   python3 -m uv venv /sgl --python 3.12
   python3 -m uv pip install --python /sgl/bin/python 'sglang[diffusion]==0.5.21' --prerelease=allow
+  # sageattention at the commit sglang names, or its sage_attn backend silently falls back to torch sdpa; torch 2.14 headers need c++20
+  git clone -q https://github.com/thu-ml/SageAttention /sgl-sage && git -C /sgl-sage checkout -q d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4
+  sed -i 's/-std=c++17/-std=c++20/g' /sgl-sage/setup.py
+  python3 -m uv pip install --python /sgl/bin/python setuptools wheel ninja
+  (cd /sgl-sage && CC=gcc CXX=g++ CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0 python3 -m uv pip install --python /sgl/bin/python . --no-build-isolation)
 }
 
 wait_ready() {  # $1 server pid; returns 1 if the server exits or does not answer in 30 min
@@ -106,11 +111,15 @@ main() {
   mkdir -p "$OUT"
   [[ -d /sgl ]] || install_sglang
   trap '/sgl/bin/killall_sglang >/dev/null 2>&1 || true' EXIT
-  run_variant default
-  run_variant compile --enable-torch-compile
-  run_variant speed --performance-mode speed
-  run_variant sage --attention-backend sage_attn
-  run_variant fp8sage --component-quantizations.transformer fp8 --attention-backend sage_attn
+  for variant in ${VARIANTS:-default speed sage fp8sage}; do
+    case $variant in
+      default) run_variant default ;;
+      compile) run_variant compile --enable-torch-compile ;;  # fails to start on 0.5.21 for this model (pack_qkv_weights)
+      speed) run_variant speed --performance-mode speed ;;
+      sage) run_variant sage --attention-backend sage_attn ;;
+      fp8sage) run_variant fp8sage --component-quantizations.transformer fp8 --attention-backend sage_attn ;;
+    esac
+  done
 }
 
 main "$@"
