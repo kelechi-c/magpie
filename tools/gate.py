@@ -192,7 +192,7 @@ def from_disk(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # where the prepacked dit lives on the hub: a private repo (the weights' licence forbids passing them on).
-PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-nvfp4-mxfp8-bf16"
+PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16"
 
 
 # the prepacked dit for this build if there is one: the local file, else the private hub copy, downloaded once
