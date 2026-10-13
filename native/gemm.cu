@@ -20,10 +20,34 @@
 
 using namespace cute;
 
-template <class Element, int Alignment>
+// compile-time settings, searched by tools/tune_gemm.py: the tile one thread block computes, the kernel schedule per
+// format (0: cooperative, 1: ping-pong) and the number of tiles loaded ahead (0: as many as fit). on sm_120 only
+// 128 x {64, 128} x 128 tiles compile; ping-pong is 4 % faster for mxfp8 and no faster for nvfp4.
+#ifndef TILE_M
+#define TILE_M 128
+#endif
+#ifndef TILE_N
+#define TILE_N 128
+#endif
+#ifndef TILE_K
+#define TILE_K 128
+#endif
+#ifndef SCHEDULE_MX
+#define SCHEDULE_MX 1
+#endif
+#ifndef SCHEDULE_NV
+#define SCHEDULE_NV 0
+#endif
+#ifndef STAGES
+#define STAGES 0
+#endif
+using Cooperative = cutlass::gemm::collective::KernelScheduleAuto;
+using Pingpong = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+
+template <class Element, int Alignment, class Schedule>
 struct BlockScaled {
   using ElementD = cutlass::bfloat16_t;
-  using Tile = Shape<_128, _128, _128>;
+  using Tile = Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>;
   using Cluster = Shape<_1, _1, _1>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, Tile, Cluster,
@@ -33,8 +57,12 @@ struct BlockScaled {
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
       Element, cutlass::layout::RowMajor, Alignment, Element, cutlass::layout::ColumnMajor, Alignment, float, Tile, Cluster,
+#if STAGES > 0
+      cutlass::gemm::collective::StageCount<STAGES>,
+#else
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+#endif
+      Schedule>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
   using Config = typename Mainloop::Sm1xxBlkScaledConfig;
@@ -67,7 +95,7 @@ struct BlockScaled {
 // number of scale bytes cutlass reads for `rows` rows of `k` elements with one scale per `group` elements.
 template <class Element, int Alignment>
 int64_t slots(int rows, int k) {
-  using Config = typename BlockScaled<Element, Alignment>::Config;
+  using Config = typename BlockScaled<Element, Alignment, Cooperative>::Config;
   return size(filter_zeros(Config::tile_atom_to_shape_SFA(make_shape(rows, 1, k, 1))));
 }
 
@@ -76,10 +104,10 @@ using Nvfp4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("mxfp8", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, float alpha) {
-    BlockScaled<Mxfp8, 16>::run(a, sfa, b, sfb, d, a.size(1), alpha);
+    BlockScaled<Mxfp8, 16, std::conditional_t<SCHEDULE_MX == 1, Pingpong, Cooperative>>::run(a, sfa, b, sfb, d, a.size(1), alpha);
   });
   module.def("nvfp4", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, float alpha) {
-    BlockScaled<Nvfp4, 32>::run(a, sfa, b, sfb, d, a.size(1) * 2, alpha);
+    BlockScaled<Nvfp4, 32, std::conditional_t<SCHEDULE_NV == 1, Pingpong, Cooperative>>::run(a, sfa, b, sfb, d, a.size(1) * 2, alpha);
   });
   module.def("mxfp8_slots", [](int rows, int k) { return slots<Mxfp8, 16>(rows, k); });
   module.def("nvfp4_slots", [](int rows, int k) { return slots<Nvfp4, 32>(rows, k); });

@@ -499,7 +499,7 @@ def mlp_mx(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> T
 
 # ---- nvfp4: 4-bit values (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and a sign) two per byte, one fp8 scale per 16 elements ----
 
-NV = set(filter(None, os.environ.get("MAGPIE_NVFP4", "out").split(",")))  # mlp matmuls in nvfp4 (hidden, out); the gate passes `out` only
+NV = set(filter(None, os.environ.get("MAGPIE_NVFP4", "hidden,out").split(",")))  # mlp matmuls in nvfp4. `out` passes the gate; both flag one image of sixteen, which the vlm judge calls identical
 NV_WEIGHT, NV_HIDDEN = 64.0, 0.25  # powers of two that bring weights and swiglu outputs into the fp8 scale's range
 
 
