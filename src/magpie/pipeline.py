@@ -8,9 +8,9 @@ from PIL import Image
 from torch import Tensor
 
 from magpie.dit import Dit, layout
-from magpie.kernels import Fp8Attention, fp8_columns, logit_bound, pack_mlp
+from magpie.kernels import Fp8Attention, MxMlp, fp8_columns, logit_bound, pack_mlp
 from magpie.sampling import SamplerConfig, euler, schedule
-from magpie.text import encode
+from magpie.text import encode, reslot
 from magpie.vae import Vae, VaeConfig, image_weights
 
 Shape = tuple[int, int]
@@ -45,11 +45,45 @@ def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list
             layers = tuple(layers.values())
             for layer in (mlp.gate_layer, mlp.proj, mlp.out, *layers) if slim else ():
                 layer.weight = None
+    return dit.eval(), adopt_vae(vae_state, mean, std)
+
+
+# the port's vae around already-loaded weights, channels-last.
+def adopt_vae(vae_state: dict[str, Tensor], mean: list[float], std: list[float]) -> Vae:
     reference = next(iter(vae_state.values()))
     vae = Vae(VaeConfig(), mean, std).to(reference.device, reference.dtype)
     vae.load_state_dict(image_weights(vae_state), assign=True)
     vae.to(memory_format=torch.channels_last)
-    return dit.eval(), vae.eval()
+    return vae.eval()
+
+
+PACKED = ("img_mlp.hidden", "img_mlp.out", "attn.q", "attn.k", "attn.v", "attn.out")  # a block's block-scaled linears
+
+
+# everything a slim, block-scaled dit holds as one flat dict: its bf16 parameters, and per block the values and
+# scales of each packed linear under "packed.<block>.<name>.<values|scales>". a hybrid bf16 + fp8 + nvfp4 checkpoint.
+def packed_state(dit: Dit) -> dict[str, Tensor]:
+    state = dict(dit.state_dict())
+    for index, block in enumerate(dit.transformer_blocks):
+        pairs = zip(PACKED, (*block.img_mlp.packed, *block.attn.packed))
+        state |= {f"packed.{index}.{name}.{part}": tensor for name, pair in pairs if pair is not None for part, tensor in zip(("values", "scales"), pair)}
+    return state
+
+
+# `adopt` from a `packed_state` dict: the bf16 originals of the packed linears never exist, so loading peaks at the
+# size of the packed weights. needs the native matmul the state was packed for.
+def adopt_packed(state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list[float], std: list[float]) -> tuple[Dit, Vae]:
+    with torch.device("meta"):
+        dit = Dit()
+    dit.load_state_dict({name: weight for name, weight in state.items() if not name.startswith("packed.")}, strict=False, assign=True)
+    for index, block in enumerate(dit.transformer_blocks):
+        pairs = [tuple(state[f"packed.{index}.{name}.{part}"] for part in ("values", "scales")) if f"packed.{index}.{name}.values" in state else None for name in PACKED]
+        mlp, attn = block.img_mlp, block.attn
+        attn.bound = logit_bound(attn.norm_q.weight, attn.norm_k.weight)
+        mlp.packed, attn.packed = MxMlp(*pairs[:2]), Fp8Attention(*pairs[2:])
+        for layer, pair in zip((mlp.gate_layer, mlp.proj, mlp.out, attn.to_q, attn.to_k, attn.to_v, attn.to_out[0]), (pairs[0], pairs[0], *pairs[1:])):
+            layer.weight = layer.weight if pair is None else None
+    return dit.eval(), adopt_vae(vae_state, mean, std)
 
 
 # (width, height) with the requested pixel area and aspect ratio, both multiples of 32.
@@ -124,12 +158,16 @@ def render(
     return to_image(vae.decode(unpack(latents, shapes[-1])))
 
 
-# prompt (+ optional condition images) -> rgba image: the text encoder, then `render`.
+# prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. with `look`, the encoder reads
+# look^2-pixel copies of the condition images while the vae still reads them at `resolution` (a 2048 edit with
+# look=1024 encodes three times faster); the slots are then resized to what the real images need.
 @torch.no_grad()
 def generate(
     models: Models, prompt: str, sampler: SamplerConfig, images: tuple[Image.Image, ...] = (),
-    size: Shape | None = None, resolution: int = 1024, seed: int = 0,
+    size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = None,
 ) -> Image.Image:
     sized = resized(images, resolution)
-    text, slots = encode(models.encoder, models.processor, prompt, sized)
+    text, slots = encode(models.encoder, models.processor, prompt, sized if look is None else resized(images, look))
+    if look is not None:
+        text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
     return render(models.dit, models.vae, text, slots, sampler, sized, size, resolution, seed)

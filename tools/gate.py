@@ -167,15 +167,32 @@ def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
     return (instruction, (Image.open(f"{INPUTS}/{source}"),)) if CASES[case]["edit"] else (prompt, ())
 
 
+# a `packed_state` dict <-> what safetensors can hold: fp8 tensors go to disk as bytes under "<name>@f8".
+def to_disk(state: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    return {(f"{name}@f8" if tensor.dtype == torch.float8_e4m3fn else name): (tensor.view(torch.uint8) if tensor.dtype == torch.float8_e4m3fn else tensor).cpu()
+            for name, tensor in state.items()}
+
+
+def from_disk(state: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    return {name.removesuffix("@f8"): (tensor.view(torch.float8_e4m3fn) if name.endswith("@f8") else tensor) for name, tensor in state.items()}
+
+
 # the port's dit and vae on the card, and nothing else: no pipeline, no text encoder. the checkpoint's
 # safetensors are read directly and cast to bf16, so only torch and safetensors are needed. `slim` keeps the mlp
-# weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`).
+# weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`). a slim dit on the
+# native matmul is saved once, packed, under HF_HOME/magpie/ (local only: the weights' licence forbids passing it
+# on) and read from there afterwards, so later loads never hold the bf16 dit.
 def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("q", "k", "v", "out")) -> tuple[Any, Any]:
     import torch
     from huggingface_hub import hf_hub_download
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file, save_file
 
     import magpie.pipeline as lean
+    from magpie.kernels import MX, NV
 
     torch.set_grad_enabled(False)
     # the cached snapshot folder; a repo id would query the hub, which is offline on modal
@@ -186,7 +203,14 @@ def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("q"
                 for file in sorted((snapshot / part).glob("*.safetensors")) for name, weight in load_file(file).items()}
 
     config = json.loads((snapshot / "vae" / "config.json").read_text())
-    return lean.adopt(read("transformer"), read("vae"), config["latents_mean"], config["latents_std"], slim, attention)
+    packed = pl.Path(os.environ.get("HF_HOME", pl.Path.home() / ".cache/huggingface")) / "magpie" / f"{variant}-nv_{'_'.join(sorted(NV))}-fp8_{'_'.join(attention)}.safetensors"
+    if slim and MX and packed.exists() and not os.environ.get("MAGPIE_REPACK"):
+        return lean.adopt_packed(from_disk(load_file(packed, device="cuda")), read("vae"), config["latents_mean"], config["latents_std"])
+    dit, vae = lean.adopt(read("transformer"), read("vae"), config["latents_mean"], config["latents_std"], slim, attention)
+    if slim and MX:
+        packed.parent.mkdir(parents=True, exist_ok=True)
+        save_file(to_disk(lean.packed_state(dit)), packed)
+    return dit, vae
 
 
 # where one port request leaves the reference, with accumulation removed: every dit step is rerun on

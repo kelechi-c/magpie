@@ -571,9 +571,18 @@ def nv_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
 
 
 # the mlp weights with the matmuls named in NV as nvfp4 (scaled up by NV_WEIGHT) and the rest as mxfp8.
-def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor) -> MxMlp:
+def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor, nv: set[str] | None = None) -> MxMlp:
+    nv = NV if nv is None else nv
     hidden = torch.cat([gate, proj])
-    return MxMlp(nv_rows(hidden, scale=NV_WEIGHT) if "hidden" in NV else mx_columns(hidden), nv_rows(out.contiguous(), scale=NV_WEIGHT) if "out" in NV else mx_columns(out))
+    return MxMlp(nv_rows(hidden, scale=NV_WEIGHT) if "hidden" in nv else mx_columns(hidden), nv_rows(out.contiguous(), scale=NV_WEIGHT) if "out" in nv else mx_columns(out))
+
+
+# out(silu(gate(x)) * proj(x)) for x (rows, width) bf16 and weights from `pack_mlp_nv` with the same `nv`: a swiglu
+# mlp with no norm and no residual, as a language model's block has it.
+def swiglu_block(x: Tensor, packed: MxMlp, nv: set[str]) -> Tensor:
+    first = mx_project(*nv_rows(x), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in nv else mx_project(*mx_rows(x), packed.hidden)
+    hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in nv else (mx_rows(first, True), 1.0)
+    return mx_project(*hidden, packed.out, alpha=alpha)
 
 
 # `mlp_mx` with the matmuls named in NV in nvfp4; `alpha` undoes the scaling of weights and swiglu outputs.
