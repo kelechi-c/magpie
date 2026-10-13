@@ -1,3 +1,4 @@
+import os
 import pathlib as pl
 from typing import Any, Literal
 
@@ -83,7 +84,7 @@ def rounded(weight: Tensor, nv: bool) -> PackedLinear:
 # weight is code * scale / weight_global_scale. inputs were calibrated as round(x * input_global_scale).
 def calibrated(state: dict[str, Tensor], name: str) -> PackedLinear:
     weights, inputs = float(state[f"{name}.weight_global_scale"]), float(state[f"{name}.input_global_scale"])
-    return PackedLinear((state[f"{name}.weight_packed"], nv_slots(state[f"{name}.weight_scale"])), True, 1 / (weights * inputs), inputs)
+    return PackedLinear((state[f"{name}.weight_packed"].cuda(), nv_slots(state[f"{name}.weight_scale"].cuda())), True, 1 / (weights * inputs), inputs)
 
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -96,6 +97,18 @@ def unpacked(state: dict[str, Tensor], name: str) -> Tensor:
     codes = torch.stack([packed & 15, packed >> 4], dim=-1).flatten(1)
     values = torch.tensor(E2M1, device=packed.device)[codes & 7] * torch.where(codes > 7, -1.0, 1.0)
     return values * state[f"{name}.weight_scale"].float().repeat_interleave(16, dim=1) / float(state[f"{name}.weight_global_scale"])
+
+
+CALIBRATED = "kaitchup/Qwen3-VL-8B-Instruct-NVFP4"  # auto-round w4a4 of the stock qwen3-vl-8b-instruct language model, apache-2.0
+
+
+# the calibrated nvfp4 encoder's folder when MAGPIE_ENCODER=nvfp4 asks for it (downloaded once), else None. it holds
+# 5.9 gib instead of 15.2, which lets a 32 gb card keep encoder, dit and vae loaded for 1024 edits; it fails the
+# gate on one image in sixteen (a different composition, not damage), so it is not the default.
+def calibrated_folder() -> pl.Path | None:
+    from huggingface_hub import snapshot_download
+
+    return pl.Path(snapshot_download(CALIBRATED, allow_patterns=["*.safetensors", "config.json"])) if os.environ.get("MAGPIE_ENCODER") == "nvfp4" else None
 
 
 # a decoder layer's swiglu mlp on block-scaled weights; `nv` names its matmuls that run in nvfp4.
@@ -120,8 +133,10 @@ def load_encoder(snapshot: pl.Path, mlp: Format = "bf16", attention: Format = "b
 
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(snapshot / "text_encoder", dtype=torch.bfloat16)
     encoder.lm_head = nn.Identity()
-    encoder = encoder.to("cuda").eval()
-    state = {name: tensor for file in sorted(nvfp4_from.glob("*.safetensors")) for name, tensor in load_file(file, device="cuda").items()} if nvfp4_from else {}
+    nvfp4_from = nvfp4_from or calibrated_folder()
+    # the calibrated linears replace ours while the model is still in host memory, so their bf16 originals never reach the gpu
+    encoder = (encoder if nvfp4_from else encoder.to("cuda")).eval()
+    state = {name: tensor for file in sorted(nvfp4_from.glob("*.safetensors")) for name, tensor in load_file(file).items()} if nvfp4_from else {}
     for index, layer in enumerate(language(encoder).layers):
         prefix = f"model.language_model.layers.{index}"
         if index == 0 and state:
@@ -134,4 +149,4 @@ def load_encoder(snapshot: pl.Path, mlp: Format = "bf16", attention: Format = "b
             layer.mlp = PackedMlp(layer.mlp, {"hidden", "out"} if mlp == "nvfp4" else set())
         for name in ("q_proj", "k_proj", "v_proj", "o_proj") if attention != "bf16" and not state else ():
             setattr(layer.self_attn, name, rounded(getattr(layer.self_attn, name).weight, attention == "nvfp4"))
-    return encoder, AutoProcessor.from_pretrained(snapshot / "processor")
+    return encoder.to("cuda"), AutoProcessor.from_pretrained(snapshot / "processor")

@@ -7,8 +7,10 @@
 #   python tools/full_request.py refs <resident|staged>   edits with 1, 2, 3, ... condition images at 1024 and 2048
 #                                           until one does not fit: time and peak memory per count
 #   python tools/full_request.py cold <tag> a new process up to its first and second 1024 edit: imports, both loads,
-#                                           the first request (run it after dropping the page cache, and again)
+#                                           the first request. tag "disk" first evicts the weight files from the page cache
+# MAGPIE_VRAM_GIB=31.36 caps torch's gpu memory (a 32 gb card on a larger one); MAGPIE_ENCODER=nvfp4 as in magpie.text.
 import json
+import os
 import pathlib as pl
 import sys
 import time
@@ -88,6 +90,15 @@ def timed(name: str, run: Callable[[], tuple[Any, dict[str, float]]]) -> dict[st
     return report
 
 
+# drops the weight files (prepacked dit, vae, text encoder) from the page cache, so the next load reads the disk.
+def evict() -> None:
+    home = pl.Path(os.environ.get("HF_HOME", pl.Path.home() / ".cache/huggingface"))
+    for file in [*(home / "magpie").glob("*.safetensors"), *snapshot().glob("vae/*.safetensors"), *snapshot().glob("text_encoder/*.safetensors")]:
+        with open(file, "rb") as handle:
+            os.fsync(handle.fileno())
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+
 # seconds since this process started.
 def alive() -> float:
     return time.time() - pl.Path("/proc/self").stat().st_ctime
@@ -95,6 +106,8 @@ def alive() -> float:
 
 # a new process up to its first image: seconds at each milestone, then the first and second 1024 edit.
 def cold() -> dict[str, Any]:
+    if sys.argv[2:] == ["disk"]:
+        evict()
     marks = {"imports_s": alive()}
     dit, vae = load_port("turbo")
     torch.cuda.synchronize()
@@ -114,7 +127,8 @@ def cold() -> dict[str, Any]:
 def resident() -> dict[str, Any]:
     dit, vae = load_port("turbo")  # first: its bf16 weights are on the card until they are packed, 19 gib at the peak
     encoder, processor = load_encoder()
-    report: dict[str, Any] = {"resident_gib": round(torch.cuda.memory_allocated() / GIB, 2)}
+    report: dict[str, Any] = {"resident_gib": round(torch.cuda.memory_allocated() / GIB, 2), "load_peak_gib": round(torch.cuda.max_memory_allocated() / GIB, 2)}
+    print("resident", json.dumps(report), flush=True)
     for name, case, size in (("edit_1024", "edit_1024", 1024), ("t2i_1024", "t2i_1024", 1024), ("edit_2048", "edit16_2048", 2048)):
         try:
             report[name] = timed(f"resident-{name}", lambda: request(encoder, processor, dit, vae, case, size))
@@ -154,12 +168,12 @@ def references(mode: str) -> dict[str, Any]:
                 image, row = request(encoder, processor, dit, vae, "", size, fetch, park, given)
             except (torch.OutOfMemoryError, RuntimeError) as error:  # the point of the run: the first count that does not fit
                 report[f"{size} x{count}"] = {"failed": str(error)[:200]}
+                (OUT / f"refs-{mode}-partial.json").write_text(json.dumps(report, indent=1))
                 print(size, count, "failed", str(error)[:200].replace("\n", " "), flush=True)
                 del error
                 park()
                 torch.cuda.empty_cache()
                 break
-            image.convert("RGB").save(OUT / f"refs-{mode}-{size}-{count}.jpg", quality=90)
             report[f"{size} x{count}"] = {key: round(value, 2 if key.endswith("gib") else 0) for key, value in row.items() if key != "dit_vae_tflops"}
             print(size, count, json.dumps(report[f"{size} x{count}"]), flush=True)
     return report
@@ -185,6 +199,8 @@ if __name__ == "__main__":
     torch.set_grad_enabled(False)
     OUT.mkdir(parents=True, exist_ok=True)
     mode = sys.argv[1]
+    if os.environ.get("MAGPIE_VRAM_GIB"):
+        torch.cuda.set_per_process_memory_fraction(float(os.environ["MAGPIE_VRAM_GIB"]) * GIB / torch.cuda.get_device_properties(0).total_memory)
     result = {"device": torch.cuda.get_device_name(0), "total_gib": round(torch.cuda.get_device_properties(0).total_memory / GIB, 2),
               **(references(sys.argv[2]) if mode == "refs" else {"resident": resident, "staged": staged, "cold": cold}[mode]())}
-    (OUT / f"{'-'.join(sys.argv[1:])}.json").write_text(json.dumps(result, indent=1))
+    (OUT / f"{'-'.join([*sys.argv[1:], os.environ.get('MAGPIE_ENCODER', 'bf16'), os.environ.get('MAGPIE_VRAM_GIB', 'full')])}.json").write_text(json.dumps(result, indent=1))
