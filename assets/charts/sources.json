@@ -2,7 +2,7 @@
   "generated": "2026-10-13",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "888072ae9b0151e70d3353b5ae63826b6ef2fa46"
+    "head": "c2ce5708978a8fa7bb0364df053aa111b27ca65c"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -23,6 +23,10 @@
   "ladder": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/ladder.json",
     "sha256": "112657c27356498ca43db201d9ac5e5893d4c4a4245a719ae90f6fcd51c8ef12"
+  },
+  "compare": {
+    "path": "/home/tensor/Shared/code/ml/magpie/baseline/compare.json",
+    "sha256": "4e059d5963985bfbea3315cf98f93b05830a49e9047876b5fef4871ff4507f02"
   },
   "charts": {
     "stage-split": [
@@ -155,6 +159,33 @@
     "quality-gate": [
       "ladder.gate.1024",
       "ladder.gate.2048"
+    ],
+    "vs-sglang": [
+      "compare.cases[edit 1024][magpie].total_ms",
+      "compare.cases[text-to-image 1024][magpie].total_ms",
+      "compare.cases[edit 2048][magpie].total_ms",
+      "compare.cases[edit 1024][sglang fp8 + sage].stages_ms",
+      "compare.cases[text-to-image 1024][sglang fp8 + sage].stages_ms",
+      "compare.cases[edit 2048][sglang fp8 + sage].stages_ms",
+      "compare.cases[edit 1024][sglang fp8 + sage].http_ms",
+      "compare.cases[text-to-image 1024][sglang fp8 + sage].http_ms",
+      "compare.cases[edit 2048][sglang fp8 + sage].http_ms",
+      "compare.cases[edit 1024][sglang default].http_ms",
+      "compare.cases[text-to-image 1024][sglang default].http_ms",
+      "compare.cases[edit 2048][sglang default].http_ms",
+      "compare.cases[edit 2048][sglang default].stages_ms"
+    ],
+    "vs-sglang-memory": [
+      "compare.cases[edit 1024][sglang default].peak_gib",
+      "compare.cases[edit 1024][sglang fp8 + sage].peak_gib",
+      "compare.cases[edit 1024][magpie].peak_gib",
+      "compare.cases[edit 1024][magpie, nvfp4 encoder].peak_gib",
+      "compare.cases[text-to-image 1024][sglang default].peak_gib",
+      "compare.cases[text-to-image 1024][sglang fp8 + sage].peak_gib",
+      "compare.cases[text-to-image 1024][magpie].peak_gib",
+      "compare.cases[edit 2048][sglang default].peak_gib",
+      "compare.cases[edit 2048][sglang fp8 + sage].peak_gib",
+      "compare.cases[edit 2048][magpie].peak_gib"
     ]
   }
 }

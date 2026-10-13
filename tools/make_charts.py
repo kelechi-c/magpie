@@ -2,8 +2,8 @@
 
     cd /home/tensor/Shared/code/ml/magpie && uv run --no-project --with matplotlib python tools/make_charts.py [chart ...]
 
-Numbers come from out/bench/summary.json, out/trace/kernels.json, out/roofline.json, baseline/turbo.json and
-baseline/ladder.json. Writes
+Numbers come from out/bench/summary.json, out/trace/kernels.json, out/roofline.json, baseline/turbo.json,
+baseline/ladder.json and baseline/compare.json. Writes
 qwen21_<chart>[_mobile][_dark].png and sources.json into assets/charts at 200 dpi.
 """
 
@@ -28,6 +28,7 @@ SUMMARY = ROOT / "out/bench/summary.json"
 KERNELS = ROOT / "out/trace/kernels.json"
 BASELINE = ROOT / "baseline/turbo.json"
 LADDER = ROOT / "baseline/ladder.json"
+COMPARE = ROOT / "baseline/compare.json"
 FLOORS = ROOT / "out/roofline.json"
 OUT = ROOT / "assets/charts"
 PREFIX = "qwen21"
@@ -37,6 +38,11 @@ ROOFLINE: tuple[str, ...] = ("gemm_8192_bf16_tflops", "mlp_4096x4096x12288_bf16_
 STAGE_FIELDS: tuple[str, ...] = ("total_ms", "text_ms", "dit_ms", "vae_encode_ms", "vae_decode_ms")
 CaseRow = tuple[str, str, str]  # (variant, case, label)
 StageRow = tuple[str, float, float]  # (stage, port ms, now ms)
+CmpPanel = tuple[str, str, int, int]  # (compare.json case, panel title, axis max, tick step)
+CMP_PANELS: tuple[CmpPanel, ...] = (
+    ("edit 1024", "edit, 1024²", 2800, 500), ("text-to-image 1024", "text-to-image, 1024²", 2800, 500),
+    ("edit 2048", "edit, 2048²", 19000, 4000),
+)
 CASE_ROWS: tuple[CaseRow, ...] = (  # edits only: the project follows image editing
     (TURBO, "edit_1024", "Turbo (8 steps)\nedit 1024"), (TURBO, "edit_2048", "Turbo (8 steps)\nedit 2048"),
     (BASE, "edit_1024", "base (40 steps)\nedit 1024"), (BASE, "edit_2048", "base (40 steps)\nedit 2048"),
@@ -574,12 +580,104 @@ def quality_gate(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, .
     return fig, ("ladder.gate.1024", "ladder.gate.2048")
 
 
+def cmp_pt(d: Summary, case: str, engine: str, field: str) -> Pt:
+    """One field of one system's row in compare.json, with the path it came from."""
+    return Pt(d["compare"]["cases"][case][engine][field], f"compare.cases[{case}][{engine}].{field}")
+
+
+def stacked_axes(fig: Figure, box: tuple[float, float, float, float], count: int, gap_in: float,
+                 cap_in: float) -> list[Axes]:
+    """Equal panels stacked top to bottom in a box, with a gap between them and a cap above the first for its title."""
+    x0, y0, w0, h0 = box
+    fh = fig.get_size_inches()[1]
+    gap, cap = gap_in / fh, cap_in / fh
+    half = (h0 - cap - (count - 1) * gap) / count
+    return [fig.add_axes((x0, y0 + h0 - cap - (i + 1) * half - i * gap, w0, half)) for i in range(count)]
+
+
+def case_panel(ax: Axes, th: Theme, sh: Shape, rows: Sequence[tuple[str, Pt, str]], fmt: Callable[[float], str],
+               title: str, xlim: int, step: int) -> None:
+    """One case on its own axis: one bar per system, the first row on top, each labelled with its value."""
+    n = len(rows)
+    for i, (name, p, color) in enumerate(rows):
+        y = n - 1 - i
+        bar(ax, th, y, 0, p.value, color, 0.5)
+        tag(ax, p.value, y, fmt(p.value), sh, th, size=11)
+        row_label(ax, th, sh, y, name)
+    clean(ax)
+    ax.set_xlim(0, xlim)
+    ax.set_ylim(-0.6, n - 0.4)
+    ticks = list(range(0, xlim + 1, step if sh.wide else 2 * step))
+    ax.set_xticks(ticks, [f"{t:,}" for t in ticks])
+    ax.set_title(title, loc="left", fontsize=12.5 * sh.k, color=th.ink, pad=4)
+    ax.tick_params(labelsize=10.5 * sh.k, labelcolor=th.muted)
+
+
+def vs_sglang(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Request milliseconds per case: magpie in-process against sglang's fp8 build (in-process and HTTP) and default (HTTP)."""
+    mag = [cmp_pt(d, c, "magpie", "total_ms") for c, *_ in CMP_PANELS]
+    fp8 = [cmp_pt(d, c, "sglang fp8 + sage", "stages_ms") for c, *_ in CMP_PANELS]
+    fp8_http = [cmp_pt(d, c, "sglang fp8 + sage", "http_ms") for c, *_ in CMP_PANELS]
+    default = [cmp_pt(d, c, "sglang default", "http_ms") for c, *_ in CMP_PANELS]
+    default_stages = cmp_pt(d, "edit 2048", "sglang default", "stages_ms")
+    gain = [pct(f.value - m.value, f.value) for m, f in zip(mag, fp8)]
+    ratio = [de.value / m.value for m, de in zip(mag, default)]
+    srcs = tuple(p.src for p in (*mag, *fp8, *fp8_http, *default, default_stages))
+    fig, ax = canvas(th, sh, sh.pick(12.0, 15.5),
+                     f"In-process, magpie takes {gain[0]:.0f} %, {gain[1]:.0f} % and {gain[2]:.0f} % less time than "
+                     f"sglang's fastest working setup; its default takes {min(ratio):.1f} to {max(ratio):.1f} x as long "
+                     "over HTTP",
+                     "Seconds per request, Turbo (8 steps), batch 1, median of 5 warm requests, one RTX PRO 6000 "
+                     "Blackwell on the same day. Lower is better.",
+                     "HTTP bars are curl totals and include PNG encoding and transfer. In-process bars are magpie's total "
+                     "and sglang's own encode, denoise and decode log, both with the text encoder. sglang's text stage "
+                     "was a conditioning-cache hit on a repeated prompt. Its default at 2048² in-process is "
+                     f"{default_stages.value / mag[2].value:.1f} x magpie.",
+                     left=sh.pick(2.5, 2.1), right=sh.pick(0.9, 0.9),
+                     key=[(th.hero, "magpie, in-process"), (th.peer, "sglang fp8 + sage, in-process"),
+                          (th.other, "sglang, HTTP")])
+    box = ax.get_position().bounds
+    ax.remove()
+    for pax, (_, title, xlim, step), m, f, h, de in zip(stacked_axes(fig, box, len(CMP_PANELS), 0.8, 0.4), CMP_PANELS,
+                                                        mag, fp8, fp8_http, default):
+        rows = (("magpie\nin-process", m, th.hero), ("sglang fp8 + sage\nin-process", f, th.peer),
+                ("sglang fp8 + sage\nHTTP", h, th.other), ("sglang default\nHTTP", de, th.other))
+        case_panel(pax, th, sh, rows, lambda v: f"{v:,.0f} ms", title, xlim, step)
+    return fig, srcs
+
+
+def vs_sglang_memory(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Peak GiB per case: sglang's default and fp8 build against magpie, and magpie with its nvfp4 encoder at 1024."""
+    systems = (("sglang default", "sglang default", th.other), ("sglang fp8 + sage", "sglang fp8 + sage", th.peer),
+               ("magpie", "magpie", th.hero), ("magpie\nnvfp4 encoder", "magpie, nvfp4 encoder", th.soft))
+    panels = [[(name, cmp_pt(d, c, engine, "peak_gib"), color) for name, engine, color in systems
+               if engine in d["compare"]["cases"][c]] for c, *_ in CMP_PANELS]
+    srcs = tuple(p.src for panel in panels for _, p, _ in panel)
+    fp8, mag, nv = (cmp_pt(d, "edit 1024", e, "peak_gib") for e in ("sglang fp8 + sage", "magpie", "magpie, nvfp4 encoder"))
+    fig, ax = canvas(th, sh, sh.pick(10.6, 13.5),
+                     f"Magpie peaks below sglang's default in all three cases; sglang's fp8 build is lower at 1024², "
+                     f"{fp8.value:.1f} against {mag.value:.1f} GiB",
+                     "Peak GPU memory in GiB, Turbo (8 steps), batch 1, one RTX PRO 6000 Blackwell, same day. Lower is "
+                     "better.",
+                     f"Magpie keeps a bf16 text encoder loaded; with its nvfp4 encoder it peaks at {nv.value:.1f} GiB, "
+                     f"{mag.value - nv.value:.1f} GiB lower. sglang's values are nvidia-smi memory used and magpie's are "
+                     "torch's peak allocated, so the two are not the same measure.",
+                     left=sh.pick(2.5, 2.1), right=sh.pick(0.9, 0.9),
+                     key=[(th.other, "sglang default"), (th.peer, "sglang fp8 + sage"), (th.hero, "magpie"),
+                          (th.soft, "magpie, nvfp4 encoder")])
+    box = ax.get_position().bounds
+    ax.remove()
+    for pax, (_, title, *_), rows in zip(stacked_axes(fig, box, len(CMP_PANELS), 0.8, 0.4), CMP_PANELS, panels):
+        case_panel(pax, th, sh, rows, gib, title, 60, 10)
+    return fig, srcs
+
+
 PLOTS: dict[str, Plot] = {
     "stage-split": stage_split, "request-latency": request_latency, "prefix-cache": prefix_cache,
     "utilisation": utilisation, "peak-memory": peak_memory, "op-groups": op_groups,
     "span-split": span_split, "kernel-classes": kernel_classes, "fit-32gb": fit_32gb,
     "floor": floor, "ladder": ladder, "stages-then-now": stages_then_now, "now-vs-baseline": now_vs_baseline,
-    "quality-gate": quality_gate,
+    "quality-gate": quality_gate, "vs-sglang": vs_sglang, "vs-sglang-memory": vs_sglang_memory,
 }
 
 
@@ -604,7 +702,7 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
     doc = {"generated": dt.date.today().isoformat(), "repo": {"root": str(ROOT), "head": head or None},
            **{name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
               for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE), ("roofline", FLOORS),
-                                 ("ladder", LADDER))},
+                                 ("ladder", LADDER), ("compare", COMPARE))},
            "charts": {**prev, **{k: list(dict.fromkeys(v)) for k, v in charts.items()}}}
     path.write_text(json.dumps(doc, indent=2) + "\n")
     print("wrote sources.json")
@@ -614,7 +712,7 @@ def main(names: list[str]) -> None:
     """Render the requested charts (all by default) in every theme and shape, then write their provenance."""
     d = {**json.loads(SUMMARY.read_text()), "kernels": json.loads(KERNELS.read_text()),
          "baseline": json.loads(BASELINE.read_text()), "roofline": json.loads(FLOORS.read_text()),
-         "ladder": json.loads(LADDER.read_text())}
+         "ladder": json.loads(LADDER.read_text()), "compare": json.loads(COMPARE.read_text())}
     charts: dict[str, tuple[str, ...]] = {}
     for name in names or list(PLOTS):
         for th in (LIGHT, DARK):
