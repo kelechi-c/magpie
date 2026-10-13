@@ -170,7 +170,7 @@ def gate_input(case: str, index: int) -> tuple[str, tuple[Any, ...]]:
 # the port's dit and vae on the card, and nothing else: no pipeline, no text encoder. the checkpoint's
 # safetensors are read directly and cast to bf16, so only torch and safetensors are needed. `slim` keeps the mlp
 # weights in fp8 only; pass False for anything that runs the baseline arithmetic (`unfused`).
-def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("k", "v")) -> tuple[Any, Any]:
+def load_port(variant: str, slim: bool = True, attention: tuple[str, ...] = ("q", "k", "v", "out")) -> tuple[Any, Any]:
     import torch
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
@@ -359,12 +359,12 @@ def verdict(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, An
 
 
 # one gate run on this machine. with `compare`, the baseline arithmetic is timed here first and judged against.
-def run(variant: str, tag: str, cases: list[str], compare: bool, sdpa: bool) -> dict[str, Any]:
+def run(variant: str, tag: str, cases: list[str], compare: bool, sdpa: bool, attention: str = "q,k,v,out") -> dict[str, Any]:
     import torch
 
     import magpie.dit as dit_module
 
-    dit, vae = load_port(variant, slim=not compare)
+    dit, vae = load_port(variant, not compare, tuple(filter(None, attention.split(","))))
     folder = pl.Path(OUT_ROOT) / "baseline" / variant
     result: dict[str, Any] = {"variant": variant, "tag": tag, "device": device_info(),
                               "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2)}
@@ -388,8 +388,9 @@ def main() -> None:
     parser.add_argument("--cases", default=TIMED_CASES)
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--sdpa", action="store_true")
+    parser.add_argument("--attention", default="q,k,v,out")  # the attention linears run in fp8
     args = parser.parse_args()
-    result = run(args.variant, args.tag, args.cases.split(","), args.compare, args.sdpa)
+    result = run(args.variant, args.tag, args.cases.split(","), args.compare, args.sdpa, args.attention)
     out = pl.Path(OUT_ROOT) / "gate" / f"{args.tag}-{args.variant}.json"
     out.write_text(json.dumps(result, indent=1))
     print(json.dumps(result["verdict"], indent=1))

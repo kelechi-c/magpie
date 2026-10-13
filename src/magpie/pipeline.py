@@ -28,10 +28,10 @@ class Models:
 # dicts) without copying them: the dit is created on the meta device so 7b parameters are never
 # initialised, then `assign=True` swaps the real tensors in. each block's logit bound is read off its weights,
 # and bf16 weights on the gpu also get fp8 copies of the mlp weights and of the attention linears named in
-# `attention` (any of q, k, v, out; q and out are what cost quality, so k and v are the default); `slim` then drops the bf16 originals (the caller's state dicts must be released too), which leaves
+# `attention` (any of q, k, v, out; all four by default); `slim` then drops the bf16 originals (the caller's state dicts must be released too), which leaves
 # those layers no bf16 path.
 def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list[float], std: list[float], slim: bool = False,
-          attention: tuple[str, ...] = ("k", "v")) -> tuple[Dit, Vae]:
+          attention: tuple[str, ...] = ("q", "k", "v", "out")) -> tuple[Dit, Vae]:
     with torch.device("meta"):
         dit = Dit()
     dit.load_state_dict(dit_state, assign=True)

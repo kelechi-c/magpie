@@ -1,4 +1,5 @@
 import math
+from importlib.util import find_spec
 from typing import NamedTuple
 
 import torch
@@ -14,6 +15,7 @@ FP8_TOP = 448.0  # largest fp8 (e4m3) value: 4 exponent bits, 3 mantissa bits
 TOP = tl.constexpr(FP8_TOP)
 SWIGLU_TILE, SWIGLU_WARPS = (64, 128, 64), 4  # (rows, columns, inner width) per program and warps of each fp8 matmul (swept on sm_120)
 PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
+SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 
 
 # bf16 bits (int16) -> the same number in fp32: bf16 is the top half of an fp32, so shift it into place.
@@ -73,6 +75,14 @@ def qk_prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float, out: Tensor | N
 # max|weight|, rope keeps lengths, and a dot product is at most the product of the two lengths.
 def logit_bound(weight_q: Tensor, weight_k: Tensor) -> float:
     return math.sqrt(weight_q.numel()) * float(weight_q.float().abs().max()) * float(weight_k.float().abs().max())
+
+
+# sageattention 2's hand-written cuda kernel on (batch, tokens, heads, dim) bf16 tensors: the mean key is subtracted
+# (softmax ignores a per-query constant), q and k go to int8 with one scale per 32 queries / 64 keys, v to fp8 with one
+# scale per channel, and the weights are kept in (0, 1] by a running max so they fit fp8. accumulators are fp32.
+def sage(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    from sageattention import sageattn_qk_int8_pv_fp8_cuda
+    return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout="NHD", qk_quant_gran="per_warp", pv_accum_dtype="fp32+fp32")
 
 
 # true when exp(logit) can be summed over `keys` keys without overflowing fp32, so no running max is needed.

@@ -525,7 +525,7 @@ def freeze_wide() -> str:
 # /out/gate/<tag>/<variant>; `verdict` judges them against STEP_ERROR_MAX and DINO_MIN.
 # tag "baseline" instead re-freezes the port half of the baseline against the existing references.
 @app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=3600, retries=0, volumes=VOLUMES)
-def gate(variant: str, tag: str, cases: list[str], slim: bool = True, attention: str = "k,v") -> str:
+def gate(variant: str, tag: str, cases: list[str], slim: bool = True, attention: str = "q,k,v,out") -> str:
     import torch
 
     dit, vae = load_port(variant, slim, tuple(filter(None, attention.split(","))))
@@ -724,7 +724,7 @@ def logits(variant: str, cases: list[str]) -> str:
 
 @app.local_entrypoint()
 def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants: str = "turbo,base", cases: str = TIMED_CASES, slim: bool = True,
-         attention: str = "k,v") -> None:
+         attention: str = "q,k,v,out") -> None:
     out = ROOT / "out" / "bench"
     out.mkdir(parents=True, exist_ok=True)
     frozen = ROOT / "baseline"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # drives the gate and the kernel benchmarks on a colab g4 (rtx pro 6000 blackwell), which costs a third of modal's.
-#   tools/colab.sh up                      start a session, install the baseline's torch, fetch weights, push code + baseline files
+#   tools/colab.sh up                      start a session, install the baseline's torch, push code, pull weights and the gate files
+#                                          (private dataset tensorkelechi/magpie-gate; tools/modal_prepare.py --publish-gate fills it)
 #   tools/colab.sh push                    re-upload src/ and tools/ after an edit
 #   tools/colab.sh run "<shell command>"   run in /content/magpie on the vm, e.g. "python tools/gate.py --tag x --compare"
 #   tools/colab.sh get <remote> <local>    download a result file
@@ -34,19 +35,14 @@ push() {
 case "$1" in
 up)
     colab new -s $SESSION --gpu G4
-    mkdir -p "$WORK/data/out/baseline/turbo" "$WORK/data/root/inputs"
-    for part in reference conditioning magpie steps; do
-        mkdir -p "$WORK/data/out/baseline/turbo/$part"
-        modal volume get magpie-out "baseline/turbo/$part/edit_1024" "$WORK/data/out/baseline/turbo/$part/"
-    done
-    cp /home/tensor/Shared/code/ml/flicker/out/article/images/{01,03,06,07,08}.png "$WORK/data/root/inputs/"
-    tar czf "$WORK/data.tar.gz" -C "$WORK/data" out root
     push
-    send "$WORK/data.tar.gz" /
-    remote "pip install -q -U torch==2.14.1 torchvision && python -c \"
+    remote "mkdir -p /hf /root/inputs"
+    colab upload -s $SESSION "$HOME/.cache/huggingface/token" /hf/token
+    remote "pip install -q -U torch==2.14.1 torchvision dreamsim ninja && pip uninstall -q -y torchao && python -c \"
 from huggingface_hub import snapshot_download
+snapshot_download('tensorkelechi/magpie-gate', repo_type='dataset', local_dir='/data')
 snapshot_download('Qwen/Qwen-Image-2.1-Turbo', allow_patterns=['model_index.json', 'transformer/*', 'vae/*'])
-snapshot_download('facebook/dinov2-base', revision='f9e44c814b77203eaa57a6bdbbd535f21ede1415', allow_patterns=['*.json', '*.safetensors'])\""
+snapshot_download('facebook/dinov2-base', revision='f9e44c814b77203eaa57a6bdbbd535f21ede1415', allow_patterns=['*.json', '*.safetensors'])\" && mkdir -p /out && cp -r /data/baseline /out/ && cp /data/inputs/*.png /root/inputs/"
     ;;
 push) push ;;
 run) remote "$2" ;;

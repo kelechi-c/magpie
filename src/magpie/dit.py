@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import Fp8Attention, Fp8Mlp, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep
+from magpie.kernels import SAGE, Fp8Attention, Fp8Mlp, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep, sage
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -127,12 +127,14 @@ def sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
     return out.transpose(1, 2)
 
 
-# attention as the model runs it. unmasked bf16 calls on the gpu take the max-free flash kernel where `bound`
-# (the block's largest possible logit) proves exp cannot overflow. everything else is `sdpa`: torch's flash
-# kernel beats our own running-max variant, so the blocks that need the max stay on it.
+# attention as the model runs it. unmasked bf16 calls on the gpu take sageattention 2's 8-bit kernel when the package
+# is installed. without it they take the max-free flash kernel where `bound` (the block's largest possible logit)
+# proves exp cannot overflow. everything else is `sdpa`: masked text runs, cpu, and the blocks that need the max.
 def attend(q: Tensor, k: Tensor, v: Tensor, bound: float, mask: Tensor | None = None) -> Tensor:
-    fused = mask is None and q.is_cuda and q.dtype == torch.bfloat16 and max_free(bound, k.shape[1])
-    return flash(q, k, v, stable=False) if fused else sdpa(q, k, v, mask)
+    fused = mask is None and q.is_cuda and q.dtype == torch.bfloat16
+    if fused and SAGE:
+        return sage(q, k, v)
+    return flash(q, k, v, stable=False) if fused and max_free(bound, k.shape[1]) else sdpa(q, k, v, mask)
 
 
 # block-causal attention over the whole joint sequence: a token sees every earlier token, plus all
