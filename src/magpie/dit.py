@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import SAGE, Fp8Attention, Fp8Mlp, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep, sage
+from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep,
+                            sage, sage_cached, sage_pack, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -139,8 +140,9 @@ def attend(q: Tensor, k: Tensor, v: Tensor, bound: float, mask: Tensor | None = 
 
 # block-causal attention over the whole joint sequence: a token sees every earlier token, plus all
 # of its own image block. done as one flash call per prefix run (text runs get a causal triangle
-# over their own keys) and one for the target image, which sees everything.
-def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float) -> Tensor:
+# over their own keys) and one for the target image, which sees everything; with `packed`, the whole sequence's
+# keys and values already in sage's 8-bit form, the target call reads those.
+def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float, packed: SageKV | None = None) -> Tensor:
     def run(start: int, end: int, is_text: bool) -> Tensor:
         size = end - start
         mask = (
@@ -150,7 +152,8 @@ def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float) -
         )
         return attend(q[:, start:end], k[:, :end], v[:, :end], bound, mask)
 
-    return torch.cat([run(*s) for s in lay.segments] + [attend(q[:, lay.prefix :], k, v, bound)], dim=1)
+    target = attend(q[:, lay.prefix :], k, v, bound) if packed is None else sage_cached(q[:, lay.prefix :], packed)
+    return torch.cat([run(*s) for s in lay.segments] + [target], dim=1)
 
 
 class Attention(nn.Module):
@@ -220,17 +223,23 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.img_mlp = SwiGLU(cfg)
 
-    # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache.
-    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV]:
+    # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache. on the sage
+    # path they are quantised once here and returned in that form.
+    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV | SageKV]:
         q, k, v = self.attn.qkv(x, mod[0], lay.rope)
-        x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound), x, mod[1])
-        return feed(self.img_mlp, x, mod[2], mod[3], self.eps), (k, v)
+        packed = sage_pack(k, v, lay.prefix) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
+        x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
+        return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
-    # keys and values are written into the tail of the cache's buffers, so nothing is concatenated.
-    def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV) -> Tensor:
-        q, _, _ = self.attn.qkv(x, mod[0], rope, (cache[0][:, -x.shape[1] :], cache[1][:, -x.shape[1] :]))
-        x = self.attn.out(attend(q, *cache, self.attn.bound), x, mod[1])
+    # keys and values are written into the tail of the cache's bf16 buffers, so nothing is concatenated; a SageKV
+    # then requantises just those rows next to its already quantised prefix.
+    def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV | SageKV) -> Tensor:
+        packed = isinstance(cache, SageKV)
+        k, v = cache.tail if packed else cache
+        q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -x.shape[1] :], v[:, -x.shape[1] :]))
+        attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
+        x = self.attn.out(attended, x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
 
@@ -290,7 +299,7 @@ class Dit(nn.Module):
 
     # first step: runs the whole joint sequence and returns (velocity for the target tokens, cache).
     # latents: (B, R + N, 64) condition-image latents then the noisy target; text: (B, T, 4096).
-    def prefill(self, latents: Tensor, text: Tensor, sigma: Tensor, lay: Layout) -> tuple[Tensor, list[KV]]:
+    def prefill(self, latents: Tensor, text: Tensor, sigma: Tensor, lay: Layout) -> tuple[Tensor, list[KV | SageKV]]:
         batch, target = latents.shape[0], lay.image.numel() - lay.prefix
         text = self.text_embed(text)
         x = torch.cat([text, text.new_zeros(batch, target // SLOT, text.shape[-1])], dim=1)
@@ -298,7 +307,7 @@ class Dit(nn.Module):
         x[:, lay.image] = self.img_in(latents)
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
         mod, final = self.modulate(temb, torch.arange(lay.image.numel(), device=x.device) >= lay.prefix)
-        cache: list[KV] = []
+        cache: list[KV | SageKV] = []
         for block in self.transformer_blocks:
             x, kv = block.prefill(x, mod, lay)
             cache = cache + [kv]
@@ -306,7 +315,7 @@ class Dit(nn.Module):
 
     # later steps: only the target tokens are recomputed, attending to the cached prefix. batch 1 only: the
     # kernels write the new keys and values into the buffers' tails, which are contiguous for a single sequence.
-    def decode(self, target: Tensor, sigma: Tensor, lay: Layout, cache: list[KV]) -> Tensor:
+    def decode(self, target: Tensor, sigma: Tensor, lay: Layout, cache: list[KV | SageKV]) -> Tensor:
         assert target.shape[0] == 1
         x = self.img_in(target)
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))

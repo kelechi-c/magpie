@@ -18,6 +18,9 @@ SWIGLU_TILE, SWIGLU_WARPS = (64, 128, 64), 4  # (rows, columns, inner width) per
 PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
 MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scaled matmuls, built by tools/build_native.sh
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
+SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
+QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
+HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 
 
 # bf16 bits (int16) -> the same number in fp32: bf16 is the top half of an fp32, so shift it into place.
@@ -85,6 +88,77 @@ def logit_bound(weight_q: Tensor, weight_k: Tensor) -> float:
 def sage(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     from sageattention import sageattn_qk_int8_pv_fp8_cuda
     return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout="NHD", qk_quant_gran="per_warp", pv_accum_dtype="fp32+fp32")
+
+
+# one layer's keys and values as sage's kernel reads them, quantised once and kept between steps:
+#   k (1, S, heads, dim) int8 with the mean key subtracted, k_scale (1, heads, ceil(S / 64)) one step per 64 keys
+#   v (1, dim, heads, S padded to 64) fp8 with the tokens shuffled in 16s, v_scale (1, heads, dim) one step per channel
+#   mean (1, heads, dim) bf16, the key mean of step 1, and v_scale are frozen so cached rows never need redoing
+#   tail: bf16 (keys, values) for the rows from `start` on, `start` being the last multiple of 64 inside the prefix.
+#   its last rows are the target, which every decode step overwrites; the few before them are prefix rows that share
+#   a 64-key scale group with the first target rows.
+class SageKV(NamedTuple):
+    k: Tensor
+    k_scale: Tensor
+    v: Tensor
+    v_scale: Tensor
+    mean: Tensor
+    tail: tuple[Tensor, Tensor]
+    start: int
+
+
+# bf16 values (tokens, heads, DIM) -> fp8 in sage's layout, for one head and TOKENS output slots: out[channel, head,
+# start + slot] = value[token, head, channel] / step[head, channel], where `token` is the slot's token after sage's
+# shuffle inside each group of 16. the tile is read a token row at a time and turned before it is written, so both the
+# loads and the stores run along memory; storing in token order instead scatters single bytes and is ten times slower.
+# rows past `tokens` (the padding up to the next 64) are written as zeros.
+@triton.jit
+def value_fp8_kernel(v_ptr, out_ptr, step_ptr, tokens, start, padded, heads, DIM: tl.constexpr, TOKENS: tl.constexpr):
+    head = tl.program_id(1)
+    slot = tl.program_id(0) * TOKENS + tl.arange(0, TOKENS)
+    place = slot % 16
+    token = slot - place + ((place // 2) % 2) * 8 + (place // 4) * 2 + place % 2
+    channel = tl.arange(0, DIM)
+    x = tl.load(v_ptr + (token[:, None] * heads + head) * DIM + channel[None, :], mask=(token < tokens)[:, None], other=0).to(tl.float32)
+    step = tl.load(step_ptr + head * DIM + channel)
+    turned = tl.trans(tl.clamp(x / step[None, :], -TOP, TOP).to(tl.float8e4nv))
+    tl.store(out_ptr + (channel[:, None] * heads + head) * padded + start + slot[None, :], turned)
+
+
+# quantises bf16 keys and values (1, rows, heads, dim) into `kv` from row `start` (a multiple of 64) to the end,
+# with kv's frozen key mean and value steps. the key scales come back in a fresh tensor because sage's quantiser
+# wants a contiguous one, then are copied into place.
+def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
+    from sageattention.quant import _fused
+    rows, heads, dim = k.shape[1:]
+    scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
+    _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
+    kv.k_scale[:, :, start // KEY_BLOCK :] = scale
+    value_fp8_kernel[(-(-rows // KEY_BLOCK), heads)](v, kv.v, kv.v_scale, rows, start, kv.v.shape[-1], heads, DIM=dim, TOKENS=KEY_BLOCK, num_warps=4)
+    return kv
+
+
+# a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
+# number of leading rows that will never change.
+def sage_pack(k: Tensor, v: Tensor, prefix: int) -> SageKV:
+    tokens, heads, dim = k.shape[1:]
+    padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
+    step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
+    kv = SageKV(torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK),
+                torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device), step, k.mean(dim=1),
+                (k[:, start:].clone(), v[:, start:].clone()), start)
+    return sage_write(kv, k, v, 0)
+
+
+# `sage` on keys and values that are already quantised: only the queries are quantised here.
+def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
+    from sageattention.core import sm89_compile
+    from sageattention.quant import _fused
+    q8, out = torch.empty_like(q, dtype=torch.int8), torch.empty_like(q)
+    scale = kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP))
+    _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
+    sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, 0, 0, 2, q.shape[-1] ** -0.5, 0)
+    return out
 
 
 # true when exp(logit) can be summed over `keys` keys without overflowing fp32, so no running max is needed.

@@ -279,6 +279,7 @@ def unfused(dit_module: Any, vae_module: Any = None) -> None:
 
     dit_module.prep = prep
     dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)
+    dit_module.SAGE_CACHE = False
     dit_module.fp8_ready = lambda packed, x: False
     dit_module.normed = lambda x, mod, eps: dit_module.F.layer_norm(x, x.shape[-1:], eps=eps) * mod
 
@@ -422,13 +423,14 @@ def run(variant: str, tag: str, cases: list[str], compare: bool, sdpa: bool, att
                               "resident_dit_vae_gib": round(torch.cuda.memory_allocated() / 2**30, 2)}
     baseline = json.loads((pl.Path(__file__).resolve().parent.parent / "baseline" / f"{variant}.json").read_text())
     if compare:
-        kernels = dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed
+        kernels = dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed, dit_module.SAGE_CACHE
         unfused(dit_module)
         baseline = {"magpie": gate_pass(dit, vae, variant, cases, folder, pl.Path(OUT_ROOT) / "gate" / f"{tag}-unfused" / variant, {})}
-        dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed = kernels
+        dit_module.prep, dit_module.attend, dit_module.fp8_ready, dit_module.normed, dit_module.SAGE_CACHE = kernels
         result["unfused_here"] = baseline["magpie"]
     if sdpa:  # torch's attention under the other kernels, to price the attention kernel alone
         dit_module.attend = lambda q, k, v, bound, mask=None: dit_module.sdpa(q, k, v, mask)
+        dit_module.SAGE_CACHE = False
     result["magpie"] = gate_pass(dit, vae, variant, cases, folder, pl.Path(OUT_ROOT) / "gate" / tag / variant, {})
     return {**result, "verdict": verdict(result, baseline)}
 
