@@ -22,6 +22,7 @@ SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-
 SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
 ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
 PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "16384")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
+QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "16384")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 
@@ -140,10 +141,16 @@ def hadamard(dim: int, device: torch.device) -> Tensor:
 
 # quantises bf16 keys and values (1, rows, heads, dim) into `kv` from row `start` (a multiple of 64) to the end,
 # with kv's frozen key mean and value steps. the key scales come back in a fresh tensor because sage's quantiser
-# wants a contiguous one, then are copied into place. nvfp4 values (a uint8 `kv.v`) go through the native kernel.
+# wants a contiguous one, then are copied into place. nvfp4 values (a uint8 `kv.v`) and nvfp4 keys (a uint8 `kv.k`)
+# go through the native kernels.
 def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
-    from sageattention.quant import _fused
     rows, heads, dim = k.shape[1:]
+    if kv.k.dtype == torch.uint8:
+        import magpie_attn4
+        magpie_attn4.rows(k, kv.mean, kv.k[:, start:], kv.k_scale, True, start)
+        magpie_attn4.values(v, kv.v_scale, kv.v, start // KEY_BLOCK)
+        return kv
+    from sageattention.quant import _fused
     scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
     _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
     kv.k_scale[:, :, start // KEY_BLOCK :] = scale
@@ -159,6 +166,8 @@ def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
 # number of leading rows that will never change. from PV4_KEYS keys up the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
+# from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
+# that basis) taken off, `k_scale` (1, heads, S padded to 64, 8) bytes, one e4m3 scale per 16 dimensions.
 def sage_pack(k: Tensor, v: Tensor, prefix: int) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
@@ -168,17 +177,29 @@ def sage_pack(k: Tensor, v: Tensor, prefix: int) -> SageKV:
     else:
         values = torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device)
         step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
-    kv = SageKV(torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), values, step, k.mean(dim=1),
-                (k[:, start:].clone(), v[:, start:].clone()), start)
+    if tokens >= max(PV4_KEYS, QK4_KEYS):
+        keys = torch.empty((1, tokens, heads, dim // 2), dtype=torch.uint8, device=k.device)
+        scales = torch.full((1, heads, padded, 8), 0x38, dtype=torch.uint8, device=k.device)  # e4m3 1.0 under the padding
+        mean = (k.mean(dim=1, dtype=torch.float32) @ hadamard(dim, k.device)).contiguous()
+    else:
+        keys, scales, mean = torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), k.mean(dim=1)
+    kv = SageKV(keys, scales, values, step, mean, (k[:, start:].clone(), v[:, start:].clone()), start)
     return sage_write(kv, k, v, 0)
 
 
 # `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
-# native kernel (int8 q x k as in sage, 4-bit weights x values).
+# native kernel (int8 q x k as in sage, 4-bit weights x values); nvfp4 keys the one with both matmuls 4-bit.
 def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
+    out = torch.empty_like(q)
+    if kv.k.dtype == torch.uint8:
+        import magpie_attn4
+        q4, scale = q.new_empty(*q.shape[:3], q.shape[3] // 2, dtype=torch.uint8), q.new_empty(*q.shape[:3], 8, dtype=torch.uint8)
+        magpie_attn4.rows(q, torch.zeros_like(kv.mean), q4, scale, False, 0)
+        magpie_attn4.attend(q4, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
+        return out
     from sageattention.core import sm89_compile
     from sageattention.quant import _fused
-    q8, out = torch.empty_like(q, dtype=torch.int8), torch.empty_like(q)
+    q8 = torch.empty_like(q, dtype=torch.int8)
     scale = kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP))
     _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
     if kv.v.dtype == torch.uint8:

@@ -19,7 +19,7 @@ FLAGS = ["-O3", "-std=c++20", "-DENABLE_BF16", "-U__CUDA_NO_HALF_OPERATORS__", "
          "-diag-suppress=174", "-gencode", "arch=compute_120a,code=sm_120a"]
 INCLUDES = ["/sage/csrc", "/sage/csrc/qattn"]
 SHAPES = [(4096, 8239), (16384, 32911)]  # (queries, keys): edit decode steps at 1024 and 2048
-BASE: Config = {"CTA_Q": 128, "CTA_K": 64, "WARP_Q": 32, "WARP_K": 64, "INST_BUF": 1, "LAZY": 0, "ABLATE": 0, "PV4": 0, "TRIES": 4}
+BASE: Config = {"CTA_Q": 128, "CTA_K": 64, "WARP_Q": 32, "WARP_K": 64, "INST_BUF": 1, "LAZY": 0, "ABLATE": 0, "PV4": 0, "QK4": 0, "TRIES": 4}
 TILES = [(128, 128, 32, 128), (128, 128, 32, 64), (128, 64, 16, 64), (64, 64, 32, 64), (64, 64, 16, 64), (64, 128, 32, 128), (64, 128, 16, 128), (64, 128, 32, 64)]
 WORKERS = 4
 
@@ -145,7 +145,7 @@ def main() -> None:
     torch.set_grad_enabled(False)
     torch.manual_seed(0)
     one = lambda **change: {**BASE, **change}
-    configs = [one(PV4=1), one(PV4=1, TRIES=2), one(PV4=1, TRIES=1)]
+    configs = [BASE, one(PV4=1), one(PV4=1, QK4=1)]
     built = build_all(configs)
     data = {shape: inputs(*shape) for shape in SHAPES}
     gap = lambda out, want: round(float((out.float() - want).norm() / want.norm()), 5)
@@ -158,24 +158,27 @@ def main() -> None:
         for shape in SHAPES:
             q, k, v, want = data[shape]
             operands = quantised(q, k, v, config)
-            fit = (1.0, 0.85, 0.7, 0.55)
-            for name in (("torch, centred, fitted", "native values") if config["PV4"] else ("",)):
-                v_operands = (operands[2], operands[5])
-                if name.startswith("torch"):
-                    v_operands = nvfp4_values(v, True, fit)
-                if name.startswith("native"):
-                    mean = (v.float().mean(1) @ hadamard(v.device)).contiguous()
-                    tiles = torch.empty(1, v.shape[2], -(-v.shape[1] // 64), 4608, dtype=torch.uint8, device=v.device)
-                    write = lambda: module.values(v, mean, tiles, 0)
-                    values_ms = timed(write)
-                    v_operands = (tiles, mean)
-                out = torch.empty_like(q)
-                call = lambda: module.attend(*operands[:2], v_operands[0], out, *operands[3:5], v_operands[1], q.shape[-1] ** -0.5)
-                ms = timed(call)
-                torch.cuda.synchronize()
-                rows.append({"config": label(config), "values": name, "shape": "x".join(map(str, shape)), "ms": round(ms, 3), "gap": gap(out, want),
-                             "tflops": round(4 * shape[0] * shape[1] * 4096 / ms / 1e9), **({"values_ms": round(values_ms, 3)} if name.startswith("native") else {})})
-                print("attn", json.dumps(rows[-1]), flush=True)
+            timings: dict[str, float] = {}
+            if config["PV4"]:  # values from the native kernel; the torch reference `nvfp4_values` agrees with it
+                mean = (v.float().mean(1) @ hadamard(v.device)).contiguous()
+                tiles = torch.empty(1, v.shape[2], -(-v.shape[1] // 64), 4608, dtype=torch.uint8, device=v.device)
+                timings["values_ms"] = round(timed(lambda: module.values(v, mean, tiles, 0)), 3)
+                operands = (*operands[:2], tiles, *operands[3:5], mean)
+            if config["QK4"]:  # queries and keys from the native row kernel, the keys with their mean taken off
+                q4, k4 = (torch.empty(*x.shape[:3], 64, dtype=torch.uint8, device=x.device) for x in (q, k))
+                q_bytes = torch.empty(*q.shape[:3], 8, dtype=torch.uint8, device=q.device)
+                k_bytes = torch.full((1, k.shape[2], -(-k.shape[1] // 64) * 64, 8), 0x38, dtype=torch.uint8, device=k.device)
+                k_mean, zero = (k.float().mean(1) @ hadamard(k.device)).contiguous(), torch.zeros(1, q.shape[2], 128, device=q.device)
+                timings["queries_ms"] = round(timed(lambda: module.rows(q, zero, q4, q_bytes, False, 0)), 3)
+                timings["keys_ms"] = round(timed(lambda: module.rows(k, k_mean, k4, k_bytes, True, 0)), 3)
+                operands = (q4, k4, operands[2], q_bytes, k_bytes, operands[5])
+            out = torch.empty_like(q)
+            call = lambda: module.attend(*operands[:3], out, *operands[3:], q.shape[-1] ** -0.5)
+            ms = timed(call)
+            torch.cuda.synchronize()
+            rows.append({"config": label(config), "shape": "x".join(map(str, shape)), "ms": round(ms, 3), "gap": gap(out, want),
+                         "tflops": round(4 * shape[0] * shape[1] * 4096 / ms / 1e9), **timings})
+            print("attn", json.dumps(rows[-1]), flush=True)
     pl.Path("/out/tune_attn.json").write_text(json.dumps(rows, indent=1))
 
 

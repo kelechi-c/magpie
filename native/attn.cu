@@ -1,7 +1,9 @@
 // magpie's attention for sm_120 as a torch extension: out = softmax(q k^T * scale) v for already quantised operands,
 // the kernel in attn_sm120.cuh (a fork of SageAttention 2's). all tensors are (batch, tokens, heads, 128) except the
 // values, which are (batch, 128, heads, keys padded to ATTN_CTA_K) fp8 with the tokens shuffled in 16s:
-//   q, k   int8, with one fp32 scale per ATTN_WARP_Q queries and per ATTN_WARP_K keys
+//   q, k   int8, with one fp32 scale per ATTN_WARP_Q queries and per ATTN_WARP_K keys. with ATTN_QK4=1: nvfp4 rows
+//          (batch, tokens, heads, 64) from `rows`, q_scale (batch, queries, heads, 8) and k_scale (batch, heads, keys
+//          padded to 64, 8) bytes
 //   v      fp8, one fp32 scale per (head, channel), applied to the output. with ATTN_PV4=1: nvfp4 instead, as
 //          (batch, heads, key tiles, 4608) bytes, and `v_scale` is the per (head, channel) mean added to the output
 //   out    bf16
@@ -29,6 +31,9 @@
 #ifndef ATTN_PV4
 #define ATTN_PV4 0
 #endif
+#ifndef ATTN_QK4
+#define ATTN_QK4 0
+#endif
 #include "attn_sm120.cuh"
 
 constexpr int HEAD_DIM = 128;
@@ -36,19 +41,25 @@ constexpr int HEAD_DIM = 128;
 void attend(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor out, torch::Tensor q_scale, torch::Tensor k_scale,
             torch::Tensor v_scale, float sm_scale) {
   const int batch = q.size(0), queries = q.size(1), heads = q.size(2), keys = k.size(1);
-  TORCH_CHECK(q.size(3) == HEAD_DIM && k.size(3) == HEAD_DIM && v.is_contiguous(), "attn: bad operand layout");
+  TORCH_CHECK(v.is_contiguous(), "attn: bad operand layout");
   TORCH_CHECK(ATTN_PV4 ? (v.size(2) >= div_ceil(keys, 64) && v.size(3) == 4608 && ATTN_CTA_K == 64)
                        : (v.size(1) == HEAD_DIM && v.size(3) >= div_ceil(keys, ATTN_CTA_K) * ATTN_CTA_K), "attn: values are not laid out for this build");
+  const int width = ATTN_QK4 ? HEAD_DIM / 2 : HEAD_DIM;
+  TORCH_CHECK(q.size(3) == width && k.size(3) == width && q.is_contiguous() && k.is_contiguous(), "attn: queries or keys are not laid out for this build");
+#if ATTN_QK4
+  TORCH_CHECK(q_scale.size(1) == queries && q_scale.size(3) == 8 && k_scale.size(2) == div_ceil(keys, 64) * 64 && k_scale.size(3) == 8, "attn: wrong scale layout");
+#else
   TORCH_CHECK(q_scale.size(2) == div_ceil(queries, ATTN_CTA_Q) * (ATTN_CTA_Q / ATTN_WARP_Q), "attn: wrong number of query scales");
   TORCH_CHECK(k_scale.size(2) == div_ceil(keys, ATTN_CTA_K) * (ATTN_CTA_K / ATTN_WARP_K), "attn: wrong number of key scales");
+#endif
   size_t smem = std::max(ATTN_CTA_Q * HEAD_DIM + 2 * ATTN_CTA_K * HEAD_DIM, ATTN_CTA_Q * HEAD_DIM * 2);
-  auto kernel = attn_sm120_kernel<ATTN_CTA_Q, ATTN_CTA_K, ATTN_WARP_Q, ATTN_WARP_K, HEAD_DIM, DataType::kInt8, QuantGranularity::kPerWarp,
+  auto kernel = attn_sm120_kernel<ATTN_CTA_Q, ATTN_CTA_K, ATTN_WARP_Q, ATTN_WARP_K, HEAD_DIM, ATTN_QK4 ? DataType::kInt4 : DataType::kInt8, QuantGranularity::kPerWarp,
                                   QuantGranularity::kPerWarp, float, ATTN_INST_BUF == 1, nv_bfloat16, ComputeUnit::kCudaCore, MaskMode::kNone, false, !ATTN_PV4, ATTN_PV4 == 1, false>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   dim3 grid(div_ceil(queries, ATTN_CTA_Q), heads, batch), block(32, (ATTN_CTA_Q / ATTN_WARP_Q) * (ATTN_CTA_K / ATTN_WARP_K));
   kernel<<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
-      q.data_ptr<int8_t>(), k.data_ptr<int8_t>(), reinterpret_cast<int8_t *>(v.data_ptr()), reinterpret_cast<nv_bfloat16 *>(out.data_ptr()), nullptr,
-      q_scale.data_ptr<float>(), k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), v_scale.data_ptr<float>(), queries, keys, 1,
+      reinterpret_cast<int8_t *>(q.data_ptr()), reinterpret_cast<int8_t *>(k.data_ptr()), reinterpret_cast<int8_t *>(v.data_ptr()), reinterpret_cast<nv_bfloat16 *>(out.data_ptr()), nullptr,
+      reinterpret_cast<float *>(q_scale.data_ptr()), reinterpret_cast<float *>(k_scale.data_ptr()), v_scale.data_ptr<float>(), v_scale.data_ptr<float>(), queries, keys, 1,
       q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(ATTN_PV4 ? 1 : 2), v.stride(1),
       out.stride(0), out.stride(1), out.stride(2), sm_scale);
 }
@@ -63,7 +74,21 @@ void values(torch::Tensor v, torch::Tensor mean, torch::Tensor out, int first_ti
       reinterpret_cast<const nv_bfloat16 *>(v.data_ptr()), mean.data_ptr<float>(), out.data_ptr<uint8_t>(), rows, heads, first_tile, tiles);
 }
 
+// bf16 queries or keys (1, rows, heads, 128) -> nvfp4 rows for an ATTN_QK4 build: `out` (1, rows, heads, 64) bytes and
+// 8 scale bytes per row, in a hadamard basis with `mean` (1, heads, 128, fp32, that basis) subtracted. `scales` is
+// (1, rows, heads, 8) for queries, or with `by_head` (1, heads, keys padded, 8) written from key `first` on.
+void rows(torch::Tensor x, torch::Tensor mean, torch::Tensor out, torch::Tensor scales, bool by_head, int first) {
+  const int count = x.size(1), heads = x.size(2);
+  TORCH_CHECK(x.size(3) == HEAD_DIM && x.is_contiguous() && out.is_contiguous() && scales.is_contiguous() && out.size(1) >= count, "rows: bad layout");
+  TORCH_CHECK(by_head ? scales.size(2) >= first + count : (scales.size(1) >= count && first == 0), "rows: scales too short");
+  uint8_t *target = scales.data_ptr<uint8_t>() + (by_head ? size_t(first) * 8 : 0);
+  rows_fp4_kernel<<<div_ceil(count * heads, 128), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const nv_bfloat16 *>(x.data_ptr()), mean.data_ptr<float>(), out.data_ptr<uint8_t>(), target, count, heads,
+      by_head ? 1 : heads, by_head ? scales.size(2) : 1);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("attend", &attend);
   module.def("values", &values);
+  module.def("rows", &rows);
 }

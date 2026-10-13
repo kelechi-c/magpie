@@ -8,14 +8,19 @@
 //                rounded to nvfp4 in registers (`weights_to_fp4`), and the denominator sums the rounded weights.
 //                the values are rounded in a hadamard basis of the 128 channels (`values_fp4_kernel`), which spreads
 //                a channel's outliers; the output is turned back before it is stored (`turn_back`).
+//   ATTN_QK4     1: the q x k matmul runs on the same 4-bit instruction (128 dimensions in 2 instructions instead of
+//                4). queries and keys arrive as nvfp4 rows in a hadamard basis (`rows_fp4_kernel`), 64 bytes of nibbles
+//                and 8 e4m3 scales per row; the logits come out in fp32 with the scales already applied.
 //   ATTN_ABLATE  profiling only: 1 skips the q x k matmul, 2 the softmax update, 3 the weights x values matmul,
-//                5 / 6 / 7 run the weights x values matmul / the q x k matmul / both at the 4-bit instruction's cost,
 //                4 the key and value loads, in the main loop. the output is then wrong by design.
 #ifndef ATTN_LAZY
 #define ATTN_LAZY 0
 #endif
 #ifndef ATTN_PV4
 #define ATTN_PV4 0
+#endif
+#ifndef ATTN_QK4
+#define ATTN_QK4 0
 #endif
 #ifndef ATTN_ABLATE
 #define ATTN_ABLATE 0
@@ -65,7 +70,6 @@ __device__ __forceinline__ void mma_fp4(float *C, const uint32_t *A, const uint3
 }
 
 constexpr uint32_t FP4_ONES = 0x38383838; // four e4m3 scales of 1.0
-
 constexpr uint32_t FP4_TILE_LINES = 288; // 16-byte lines per 64-key tile of nvfp4 values: 256 of nibbles, 32 of scales
 
 // one 64-key tile of nvfp4 values, global -> shared, asynchronously. a tile is 128 channel rows of 32 bytes (64 keys,
@@ -339,32 +343,22 @@ __global__ void values_fp4_kernel(const nv_bfloat16 *__restrict__ v, const float
   target[1024 + t] = scales;
 }
 
-// profiling only (ATTN_ABLATE 5, 7): the weights x values matmul at the 4-bit instruction's cost, half the
-// instructions and half the value loads of the 8-bit one, on whatever bytes are in the registers.
-template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode, uint32_t stride>
-__device__ __forceinline__ void mock_fp4_sv(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f8[][num_tiles_k / 2][4], float RO[][num_tiles_v][8])
+// one 64-key tile of key scales (8 bytes per key: an e4m3 scale per 16 dimensions), global -> shared, asynchronously.
+__device__ __forceinline__ void load_fp4_key_scales(const uint8_t *tile, b128_t *smem_scales)
 {
-  uint32_t offset_V = smem_V.get_permuted_offset(get_lane_id() % 8 + (get_lane_id() / 16) * 8, (get_lane_id() / 8) % 2);
-#pragma unroll
-  for (uint32_t fv = 0; fv < num_tiles_v; fv++)
-  {
-    uint32_t RV[4];
-    smem_V.ldmatrix_m8n8x4(offset_V, RV);
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-      mma_fp4(RO[fq][fv], RS_f8[fq][0], RV, FP4_ONES, FP4_ONES);
-      mma_fp4(RO[fq][fv] + 4, RS_f8[fq][0], RV + 2, FP4_ONES, FP4_ONES);
-    }
-    offset_V = smem_V.advance_offset_by_row<16>(offset_V);
-  }
+  const uint32_t line = threadIdx.y * 32 + threadIdx.x;
+  if (line < 32)
+    cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(smem_scales + line, reinterpret_cast<const b128_t *>(tile) + line);
 }
 
-// profiling only (ATTN_ABLATE 6, 7): the q x k matmul at the 4-bit instruction's cost, two passes over the head
-// dimension instead of four.
+// logits (32 queries x 64 keys per warp, fp32) = nvfp4 queries x nvfp4 keys, two instructions of 64 dimensions per
+// 16 x 8 tile. `q_scales[fq][pass]` is this lane's query row's 4 scales for that half of the dimensions;
+// `k_scales` is the warp's 64 keys' scales in shared memory, 2 words per key.
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, SwizzleMode swizzle_mode, uint32_t stride>
-__device__ __forceinline__ void mock_fp4_qk(const smem_t<swizzle_mode, stride> &smem_Q, const smem_t<swizzle_mode, stride> &smem_K, float RS[][num_tiles_k][8], uint32_t offset_Q, uint32_t offset_K)
+__device__ __forceinline__ void logits_fp4(const smem_t<swizzle_mode, stride> &smem_Q, const smem_t<swizzle_mode, stride> &smem_K, const uint32_t *k_scales,
+                                           uint32_t q_scales[][2], float RS[][num_tiles_k][8], uint32_t offset_Q, uint32_t offset_K)
 {
+  const uint32_t lane = get_lane_id();
   uint32_t RQ[num_tiles_q][4];
   uint32_t RK[4];
 #pragma unroll
@@ -375,28 +369,119 @@ __device__ __forceinline__ void mock_fp4_qk(const smem_t<swizzle_mode, stride> &
       for (uint32_t k = 0; k < 8; k++)
         RS[fq][fk][k] = 0.f;
 #pragma unroll
-  for (uint32_t iter = 0; iter < 2; iter++)
+  for (uint32_t pass = 0; pass < 2; pass++)
   {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++)
     {
       smem_Q.ldmatrix_m8n8x4(offset_Q, RQ[fq]);
-      offset_Q = smem_Q.advance_offset_by_row<16>(offset_Q);
+      offset_Q = smem_Q.template advance_offset_by_row<16>(offset_Q);
     }
-    offset_Q = smem_Q.template advance_offset_by_column<2>(offset_Q - (num_tiles_q * 16 * stride), iter);
+    offset_Q = smem_Q.template advance_offset_by_column<2>(offset_Q - (num_tiles_q * 16 * stride), pass);
 #pragma unroll
     for (uint32_t fk = 0; fk < num_tiles_k; fk++)
     {
       smem_K.ldmatrix_m8n8x4(offset_K, RK);
-      offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+      offset_K = smem_K.template advance_offset_by_row<16>(offset_K);
+      const uint32_t first = k_scales[(fk * 16 + lane / 4) * 2 + pass], second = k_scales[(fk * 16 + 8 + lane / 4) * 2 + pass];
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; fq++)
       {
-        mma_fp4(RS[fq][fk], RQ[fq], RK, FP4_ONES, FP4_ONES);
-        mma_fp4(RS[fq][fk] + 4, RQ[fq], RK + 2, FP4_ONES, FP4_ONES);
+        mma_fp4(RS[fq][fk], RQ[fq], RK, q_scales[fq][pass], first);
+        mma_fp4(RS[fq][fk] + 4, RQ[fq], RK + 2, q_scales[fq][pass], second);
       }
     }
-    offset_K = smem_K.template advance_offset_by_column<2>(offset_K - (num_tiles_k * 16 * stride), iter);
+    offset_K = smem_K.template advance_offset_by_column<2>(offset_K - (num_tiles_k * 16 * stride), pass);
+  }
+}
+
+// bf16 rows (rows, heads, 128) -> nvfp4 rows for the 4-bit q x k matmul, one thread per (row, head): the 128
+// dimensions are turned by the hadamard matrix over 128^0.5 (the same turn on queries and keys leaves q.k alone and
+// spreads a dimension's outliers), `mean` (heads, 128, that basis; zeros for queries) is subtracted, and each 16
+// dimensions get an error-fitted e4m3 scale as in `values_fp4_kernel`. `out` takes 64 bytes per (row, head) in the
+// input's order; a row's 8 scales go to scales[(row * scale_row + head * scale_head) * 8].
+__global__ void rows_fp4_kernel(const nv_bfloat16 *__restrict__ x, const float *__restrict__ mean, uint8_t *__restrict__ out, uint8_t *__restrict__ scales,
+                                const uint32_t rows, const uint32_t heads, const uint32_t scale_row, const uint32_t scale_head)
+{
+  constexpr float shrinks[4] = {1.f, 0.7f, 0.85f, 0.55f};
+  const size_t at = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (at >= size_t(rows) * heads)
+    return;
+  const uint32_t row = at / heads, head = at % heads;
+  const uint4 *source = reinterpret_cast<const uint4 *>(x + at * 128);
+  float r[128];
+#pragma unroll
+  for (uint32_t i = 0; i < 16; i++)
+  {
+    const uint4 w = source[i];
+    const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (uint32_t j = 0; j < 4; j++)
+    {
+      r[i * 8 + j * 2] = __uint_as_float(words[j] << 16);
+      r[i * 8 + j * 2 + 1] = __uint_as_float(words[j] & 0xFFFF0000);
+    }
+  }
+#pragma unroll
+  for (uint32_t span = 1; span < 128; span *= 2)
+#pragma unroll
+    for (uint32_t c = 0; c < 128; c++)
+      if ((c & span) == 0)
+      {
+        const float a = r[c], b = r[c + span];
+        r[c] = a + b;
+        r[c + span] = a - b;
+      }
+  uint32_t *target = reinterpret_cast<uint32_t *>(out + at * 64);
+  uint32_t *bytes = reinterpret_cast<uint32_t *>(scales + (size_t(row) * scale_row + size_t(head) * scale_head) * 8);
+#pragma unroll
+  for (uint32_t half = 0; half < 2; half++)
+  {
+    uint32_t word = 0;
+#pragma unroll
+    for (uint32_t block = half * 4; block < half * 4 + 4; block++)
+    {
+      float a[16];
+      float top = 0.f;
+#pragma unroll
+      for (uint32_t i = 0; i < 16; i++)
+      {
+        a[i] = r[block * 16 + i] * 0.08838834764831845f - mean[head * 128 + block * 16 + i];
+        top = max(top, fabsf(a[i]));
+      }
+      float best = 3.4e38f;
+      uint32_t words[2] = {0, 0}, byte = 0;
+#pragma unroll
+      for (uint32_t n = 0; n < ATTN_TRIES; n++)
+      {
+        const uint32_t bits = (__float_as_uint(min(max(top * shrinks[n] * (1.f / 6.f), 0.015625f), 448.f)) + 0xFFFFF) & 0xFFF00000;
+        const float scale = __uint_as_float(bits), inverse = 1.f / scale;
+        float scaled[16];
+#pragma unroll
+        for (uint32_t i = 0; i < 16; i++)
+          scaled[i] = a[i] * inverse;
+        const uint32_t tried[2] = {fp4_pack(scaled), fp4_pack(scaled + 8)};
+        float error = 0.f;
+#pragma unroll
+        for (uint32_t i = 0; i < 16; i++)
+        {
+          const float miss = fp4_value(tried[i / 8] >> (4 * (i % 8))) - scaled[i];
+          error += miss * miss;
+        }
+        error *= scale * scale;
+        if (error < best)
+        {
+          best = error;
+          words[0] = tried[0];
+          words[1] = tried[1];
+          byte = (bits >> 20) - 960;
+        }
+      }
+      target[block * 2] = words[0];
+      target[block * 2 + 1] = words[1];
+      word |= byte << (8 * (block % 4));
+    }
+    bytes[half] = word;
   }
 }
 
@@ -660,6 +745,21 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
   // for fp 16:
   // uint32_t V_smem_offset_mma = smem_V.get_permuted_offset(get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + lane_id % 16, lane_id / 16);
   b128_t *smem_V4 = reinterpret_cast<b128_t *>(smem + V_smem_idx_offset * QK_SMEM_STRIDE);
+#if ATTN_QK4
+  // key scales: (heads, keys padded to the tile, 8 bytes), one tile at a time into shared memory after the values
+  b128_t *smem_KS = smem_V4 + FP4_TILE_LINES;
+  const uint8_t *KS_tile = reinterpret_cast<const uint8_t *>(K_scale) + size_t(batch_id * (num_qo_heads / num_kv_groups) + head_id / num_kv_groups) * div_ceil(kv_len, CTA_K) * CTA_K * 8;
+  // query scales: (queries, heads, 8 bytes). an even lane feeds its first row of each 16, an odd lane the second
+  uint32_t RQ_sf[num_tiles_q][2];
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+    const uint32_t row = min(bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + fq * 16 + lane_id / 4 + 8 * (lane_id % 2), qo_len - 1);
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(Q_scale) + (size_t(batch_id * qo_len + row) * num_qo_heads + head_id) * 2;
+    RQ_sf[fq][0] = words[0];
+    RQ_sf[fq][1] = words[1];
+  }
+#endif
   const int8_t *V_tile = V + batch_id * stride_bz_v + (head_id / num_kv_groups) * stride_h_v; // nvfp4 values: (batch, heads, key tiles, 4608 bytes)
   uint32_t V_smem_offset_mma = smem_V.get_permuted_offset(lane_id % 8 + (lane_id / 16) * 8, get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K / PACK_SIZE_V + (lane_id / 8) % 2);
 
@@ -699,12 +799,24 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
   // load K with predicate
   load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+#if ATTN_QK4
+    load_fp4_key_scales(KS_tile, smem_KS);
+    KS_tile += 512;
+#endif
   cp_async::commit_group();
 
+#if ATTN_QK4
+  float q_scale = 1.f;
+#else
   float q_scale = Q_scale[q_scale_idx];
+#endif
 
   float original_sm_scale = sm_scale;
+#if ATTN_QK4
+  float dequant_scale = 1.f;
+#else
   float dequant_scale = q_scale * K_scale[k_scale_idx + 0 * k_scale_advance_offset];
+#endif
 
   sm_scale = original_sm_scale * dequant_scale;
 
@@ -730,9 +842,9 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     cp_async::wait_group<1>();
     __syncthreads();
 
-#if ATTN_ABLATE == 6 || ATTN_ABLATE == 7
+#if ATTN_QK4
     float RS_f32[num_tiles_q][num_tiles_k][8];
-    mock_fp4_qk<num_tiles_q, num_tiles_k, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK>(smem_Q, smem_K, RS_f32, Q_smem_offset_mma, K_smem_offset_mma);
+    logits_fp4<num_tiles_q, num_tiles_k, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK>(smem_Q, smem_K, reinterpret_cast<const uint32_t *>(smem_KS) + get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K * 2, RQ_sf, RS_f32, Q_smem_offset_mma, K_smem_offset_mma);
 #else
 #if ATTN_ABLATE != 1
     // compute QK^T
@@ -762,8 +874,8 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
         }
       }
     }
-
 #endif
+
     K_idx_lane_base += CTA_K;
 
 #if ATTN_ABLATE != 2
@@ -800,10 +912,18 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     // load K without predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+#if ATTN_QK4
+    load_fp4_key_scales(KS_tile, smem_KS);
+    KS_tile += 512;
+#endif
     cp_async::commit_group();
 #endif
 
+#if ATTN_QK4
+    dequant_scale = 1.f;
+#else
     dequant_scale = q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
+#endif
     sm_scale = original_sm_scale * dequant_scale;
     
     // ensure V is ready
@@ -813,9 +933,7 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     // for fp16:
     // compute_fp16_sv_permuted<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
     //   smem_V, RS_f16, RO, d, V_smem_offset_mma);
-#if ATTN_ABLATE == 5 || ATTN_ABLATE == 7
-    mock_fp4_sv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS_f8, RO);
-#elif ATTN_ABLATE != 3
+#if ATTN_ABLATE != 3
 #if ATTN_PV4
     values_fp4<num_tiles_q, num_tiles_v>(smem_V4, RS_f4, RS_sf, RO);
 #else
@@ -862,6 +980,10 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     cp_async::wait_group<1>();
     __syncthreads();
 
+#if ATTN_QK4
+    float RS_f32[num_tiles_q][num_tiles_k][8];
+    logits_fp4<num_tiles_q, num_tiles_k, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK>(smem_Q, smem_K, reinterpret_cast<const uint32_t *>(smem_KS) + get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K * 2, RQ_sf, RS_f32, Q_smem_offset_mma, K_smem_offset_mma);
+#else
     // compute QK^T
     if constexpr (num_tiles_qk_inner == 1)
     {
@@ -889,6 +1011,7 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
         }
       }
     }
+#endif
 
     if constexpr (mask_mode == MaskMode::kCausal)
     {
@@ -932,9 +1055,17 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+#if ATTN_QK4
+    load_fp4_key_scales(KS_tile, smem_KS);
+    KS_tile += 512;
+#endif
     cp_async::commit_group();
 
+#if ATTN_QK4
+    dequant_scale = 1.f;
+#else
     dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
+#endif
     sm_scale = original_sm_scale * dequant_scale;
 
     // ensure V is ready
@@ -986,6 +1117,10 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     cp_async::wait_group<1>();
     __syncthreads();
 
+#if ATTN_QK4
+    float RS_f32[num_tiles_q][num_tiles_k][8];
+    logits_fp4<num_tiles_q, num_tiles_k, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK>(smem_Q, smem_K, reinterpret_cast<const uint32_t *>(smem_KS) + get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K * 2, RQ_sf, RS_f32, Q_smem_offset_mma, K_smem_offset_mma);
+#else
     // compute QK^T
     if constexpr (num_tiles_qk_inner == 1)
     {
@@ -1013,6 +1148,7 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
         }
       }
     }
+#endif
 
     if constexpr (mask_mode == MaskMode::kCausal)
     {
