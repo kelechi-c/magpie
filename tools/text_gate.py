@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--attention", default="bf16")
     parser.add_argument("--case", default="edit16_1024")
     parser.add_argument("--copy", type=int, default=0)
+    parser.add_argument("--calibrated", default="")  # repo id of a calibrated nvfp4 checkpoint already in the hf cache
     args = parser.parse_args()
     torch.set_grad_enabled(False)
     out = pl.Path(OUT_ROOT) / "textgate" / args.case
@@ -57,8 +58,9 @@ def main() -> None:
     (out / args.tag).mkdir(parents=True, exist_ok=True)
     snapshot = pl.Path(hf_hub_download(REPOS["turbo"], "model_index.json", local_files_only=True)).parent
     (dit, vae), dit_s, dit_peak, dit_gib = measured(lambda: load_port("turbo"))
-    (encoder, processor), encoder_s, encoder_peak, encoder_gib = measured(lambda: load_encoder(snapshot, args.mlp, args.attention))
-    report: dict[str, Any] = {"mlp": args.mlp, "attention": args.attention, "case": args.case, "copy": args.copy, "device": torch.cuda.get_device_name(0),
+    theirs = pl.Path(hf_hub_download(args.calibrated, "config.json", local_files_only=True)).parent if args.calibrated else None
+    (encoder, processor), encoder_s, encoder_peak, encoder_gib = measured(lambda: load_encoder(snapshot, args.mlp, args.attention, theirs))
+    report: dict[str, Any] = {"mlp": args.mlp, "attention": args.attention, "calibrated": args.calibrated, "case": args.case, "copy": args.copy, "device": torch.cuda.get_device_name(0),
                               "dit_vae": {"load_s": round(dit_s, 1), "load_peak_gib": round(dit_peak, 2), "resident_gib": round(dit_gib, 2)},
                               "encoder": {"load_s": round(encoder_s, 1), "load_peak_gib": round(encoder_peak, 2), "resident_gib": round(encoder_gib, 2)}}
     for case, size in (("edit_1024", 1024), ("edit16_2048", 2048)):

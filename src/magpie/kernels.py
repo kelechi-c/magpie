@@ -570,6 +570,19 @@ def nv_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
     return out, sf
 
 
+# per-block scales (rows, blocks) in row order -> the slot order cutlass reads, as `store_nv` writes them: what an
+# nvfp4 weight quantised elsewhere needs before the native matmul can take it.
+def nv_slots(scales: Tensor) -> Tensor:
+    import magpie_gemm
+
+    rows, blocks = scales.shape
+    row, block = torch.arange(rows, device=scales.device)[:, None], torch.arange(blocks, device=scales.device)[None]
+    slot = ((row // 128) * -(-blocks // 4) + block // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + block % 4
+    out = torch.zeros(magpie_gemm.nvfp4_slots(rows, blocks * 16), dtype=torch.uint8, device=scales.device)
+    out[slot.flatten()] = scales.contiguous().view(torch.uint8).flatten()
+    return out.view(torch.float8_e4m3fn)
+
+
 # the mlp weights with the matmuls named in NV as nvfp4 (scaled up by NV_WEIGHT) and the rest as mxfp8.
 def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor, nv: set[str] | None = None) -> MxMlp:
     nv = NV if nv is None else nv
