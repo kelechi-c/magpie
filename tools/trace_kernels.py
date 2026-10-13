@@ -1,10 +1,11 @@
 # Break the labelled GPU spans of the turbo traces into kernel classes and write out/trace/kernels.json.
 # The profiler's own key_averages() double-counts nested labels and reports ~0 for outer spans, so span
 # time is rebuilt here from the trace events: a kernel belongs to a span when it starts inside it.
-#   uv run --no-project python tools/trace_kernels.py
+#   uv run --no-project python tools/trace_kernels.py [folder under out/trace, default turbo]
 import gzip
 import json
 import pathlib as pl
+import sys
 from bisect import bisect_left
 from collections import Counter
 from typing import Any
@@ -12,10 +13,11 @@ from typing import Any
 type Event = dict[str, Any]
 
 ROOT = pl.Path(__file__).resolve().parents[1]
-TRACES = ROOT / "out/trace/turbo"
-OUT = ROOT / "out/trace/kernels.json"
+NAME = sys.argv[1] if len(sys.argv) > 1 else "turbo"
+TRACES = ROOT / "out/trace" / NAME
+OUT = ROOT / "out/trace" / ("kernels.json" if NAME == "turbo" else f"kernels-{NAME}.json")
 CLASSES: tuple[tuple[str, str], ...] = (  # first matching substring wins
-    ("flash_fwd", "attention"), ("attend_kernel", "attention"), ("nchwToNhwc", "layout"), ("nhwcToNchw", "layout"), ("xmma", "conv"),
+    ("flash_fwd", "attention"), ("attend_kernel", "attention"), ("fp8_kernel", "gemm"), ("nchwToNhwc", "layout"), ("nhwcToNchw", "layout"), ("xmma", "conv"),
     ("cudnn", "conv"), ("gemm", "gemm"), ("copy_kernel", "copy"),
 )
 
@@ -40,8 +42,16 @@ def breakdown(events: list[Event]) -> dict[str, Any]:
             row["kernels"][kind(name)] += dur / 1e3
     busy = sum(k[1] for k in kernels)
     wall = kernels[-1][0] + kernels[-1][1] - kernels[0][0]
+    names: dict[str, list[float]] = {}
+    for _, dur, name in kernels:
+        names.setdefault(name.split("(")[0].split("<")[0][-60:], []).append(dur / 1e3)
+    gaps = sorted(max(0.0, b[0] - a[0] - a[1]) / 1e3 for a, b in zip(kernels, kernels[1:]))
     return {"kernel_ms": round(busy / 1e3, 1), "wall_ms": round(wall / 1e3, 1), "gpu_busy": round(busy / wall, 4),
             "launches": len(kernels),
+            "idle_ms": round(sum(gaps), 1), "idle_gap_us": {"median": round(gaps[len(gaps) // 2] * 1e3, 1), "p90": round(gaps[len(gaps) * 9 // 10] * 1e3, 1),
+                                                            "largest_ms": [round(gap, 2) for gap in gaps[-5:]]},
+            "by_kernel": {name: {"calls": len(row), "ms": round(sum(row), 1), "share": round(sum(row) * 1e3 / busy, 4)}
+                          for name, row in sorted(names.items(), key=lambda item: -sum(item[1]))[:25]},
             "spans": {name: {"calls": row["calls"], "gpu_ms": round(row["gpu_ms"], 1),
                              "kernels_ms": {k: round(v, 1) for k, v in row["kernels"].most_common()}}
                       for name, row in sorted(spans.items(), key=lambda item: -item[1]["gpu_ms"])}}

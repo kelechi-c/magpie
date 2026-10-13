@@ -10,7 +10,7 @@ sys.path.insert(0, str(pl.Path(__file__).resolve().parent))
 from gate import (CASES, GATE_CASES, INPUTS, OUT_ROOT, REPOS, SUITE, TIMED_CASES, Timings, collect, device_info, gate_input, gate_items, gate_pass, image_scores, load_port, psnr, reduce, staged, summary, unfused, verdict)
 from modal_common import ROOT, VOLUMES, hf_volume, image, out_volume
 
-app = modal.App("magpie-bench", image=image)
+app = modal.App("magpie-bench", image=image.add_local_python_source("vlm_judge"))
 
 
 # wraps a callable so each call appends its gpu-synchronised wall time to timings[name].
@@ -548,6 +548,22 @@ def rescore(variant: str, tag: str, cases: list[str]) -> str:
     return json.dumps(scores)
 
 
+# the vlm judge on chosen items of a gate run: {case: {index: its opinion of candidate against frozen baseline}}.
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=1800, retries=0, volumes=VOLUMES)
+def judge_flagged(variant: str, tag: str, flagged: dict[str, list[int]]) -> str:
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+
+    from vlm_judge import judge, load_judge
+
+    model, processor = load_judge(pl.Path(hf_hub_download(REPOS[variant], "model_index.json", local_files_only=True)).parent)
+    ours, frozen = pl.Path(OUT_ROOT) / "gate" / tag / variant, pl.Path(OUT_ROOT) / "baseline" / variant / "magpie"
+    opinions = {case: {index: judge(model, processor, gate_input(case, index)[0], gate_input(case, index)[1][0],
+                                    Image.open(frozen / case / f"{index:02d}.png"), Image.open(ours / case / f"{index:02d}.png")) for index in items}
+                for case, items in flagged.items()}
+    return json.dumps(opinions)
+
+
 # wraps `owner.attr` so every call shows up in the profiler trace as a named span.
 def label(owner: Any, attr: str, name: str) -> None:
     from torch.profiler import record_function
@@ -570,13 +586,12 @@ def label_port(dit: Any, vae: Any) -> None:
     for attr, name in (("time_embed", "time embed"), ("text_embed", "text embed"), ("modulate", "modulation"), ("head", "head")):
         label(dit, attr, name)
     label(dit_module, "attend", "attention (sdpa)")
+    label(dit_module, "feed", "mlp (swiglu)")
     for index, block in enumerate(dit.transformer_blocks):
         label(block, "prefill", f"block {index:02d}")
         label(block, "decode", f"block {index:02d}")
-        label(block, "norm", "layer norm")
         label(block.attn, "qkv", "qkv + qk-norm + rope")
         label(block.attn, "out", "attention out")
-        label(block.img_mlp, "forward", "mlp (swiglu)")
     label(vae, "encode", "vae encode")
     label(vae, "decode", "vae decode")
     label(vae.encoder.mid_block, "forward", "vae encoder mid")
@@ -591,7 +606,7 @@ def label_port(dit: Any, vae: Any) -> None:
 # to /out/trace/<variant>/ (open in perfetto) and returns gpu time per aten op. span times come from the
 # trace files (tools/trace_kernels.py): key_averages() double-counts nested labels.
 @app.function(gpu="RTX-PRO-6000", cpu=8, memory=65536, timeout=1800, retries=0, volumes=VOLUMES)
-def trace(variant: str, cases: list[str]) -> str:
+def trace(variant: str, cases: list[str], tag: str = "") -> str:
     import gzip
 
     import torch
@@ -603,7 +618,7 @@ def trace(variant: str, cases: list[str]) -> str:
     dit, vae = load_port(variant)
     label_port(dit, vae)
     sampler = TURBO if variant == "turbo" else BASE
-    folder, out = pl.Path(OUT_ROOT) / "baseline" / variant, pl.Path(OUT_ROOT) / "trace" / variant
+    folder, out = pl.Path(OUT_ROOT) / "baseline" / variant, pl.Path(OUT_ROOT) / "trace" / (tag or variant)
     out.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {"device": device_info()}
     for case in cases:
@@ -725,7 +740,9 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
         return
     if mode == "trace":
         (ROOT / "out" / "trace").mkdir(parents=True, exist_ok=True)
-        (ROOT / "out" / "trace" / "ops.json").write_text(json.dumps(json.loads(trace.remote("turbo", ["edit_1024", "edit_2048"])), indent=1))
+        named = "" if tag == "candidate" else tag  # a tag keeps this build's traces apart: /out/trace/<tag>/ and ops-<tag>.json
+        payload = trace.remote("turbo", cases.split(",") if named else ["edit_1024", "edit_2048"], named)
+        (ROOT / "out" / "trace" / (f"ops-{named}.json" if named else "ops.json")).write_text(json.dumps(json.loads(payload), indent=1))
         return
     if mode == "steps":
         print(steps.remote("turbo"))
@@ -766,6 +783,15 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
             result["verdict"] = verdict(result, json.loads((frozen / f"{variant}.json").read_text()))
             path.write_text(json.dumps(result, indent=1))
             print(variant, json.dumps(result["verdict"], indent=1))
+        return
+    if mode == "judge":  # the vlm's opinion on the items an earlier gate run flagged, added to its json
+        for variant in variants.split(","):
+            path = ROOT / "out" / "gate" / f"{tag}-{variant}.json"
+            result = json.loads(path.read_text())
+            flagged = {case: row["flagged"] for case, row in result["verdict"]["cases"].items() if row["flagged"]}
+            result["judge"] = json.loads(judge_flagged.remote(variant, tag, flagged)) if flagged else {}
+            path.write_text(json.dumps(result, indent=1))
+            print(variant, json.dumps(result["judge"], indent=1))
         return
     if mode == "parity":
         (out / "parity.json").write_text(json.dumps(json.loads(parity.remote()), indent=2))
