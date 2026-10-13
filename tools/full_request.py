@@ -4,6 +4,8 @@
 #                                           an edit at 2048 to see whether it fits
 #   python tools/full_request.py staged     2048 edits with the dit and vae resident and the encoder parked in pinned
 #                                           host memory: copied to the gpu for the encode, dropped before the denoise
+#   python tools/full_request.py cold <tag> a new process up to its first and second 1024 edit: imports, both loads,
+#                                           the first request (run it after dropping the page cache, and again)
 import json
 import pathlib as pl
 import sys
@@ -15,11 +17,13 @@ import torch
 import magpie.pipeline as lean
 from gate import REPOS, gate_input, load_port
 from magpie.sampling import TURBO
-from magpie.text import encode
+from magpie.text import encode, load_encoder as port_encoder, reslot
 
 OUT = pl.Path("/out/full")
 RUNS = 5
 GIB = 2**30
+LOOK = 1024  # the encoder reads condition images no larger than this, as pipeline.generate does
+TFLOP = {1024: 685.8, 2048: 4537.5}  # arithmetic in one edit's dit + vae (tools/roofline.py), for the achieved rate
 
 
 def snapshot() -> pl.Path:
@@ -28,12 +32,16 @@ def snapshot() -> pl.Path:
     return pl.Path(hf_hub_download(REPOS["turbo"], "model_index.json", local_files_only=True)).parent
 
 
-# the checkpoint's qwen3-vl in bf16 on the gpu, and its processor.
+# the checkpoint's qwen3-vl in bf16 on the gpu (language head dropped), and its processor.
 def load_encoder() -> tuple[Any, Any]:
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    return port_encoder(snapshot())
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(snapshot() / "text_encoder", dtype=torch.bfloat16).to("cuda").eval()
-    return model, AutoProcessor.from_pretrained(snapshot() / "processor")
+
+# `encode` as pipeline.generate does it: above LOOK the encoder reads a LOOK^2 copy and the slots are resized.
+def conditioning(encoder: Any, processor: Any, prompt: str, images: tuple[Any, ...], sized: list[Any], size: int) -> tuple[Any, Any]:
+    if size <= LOOK or not sized:
+        return encode(encoder, processor, prompt, sized)
+    return reslot(*encode(encoder, processor, prompt, lean.resized(images, LOOK)), [image.width * image.height // 1024 for image in sized])
 
 
 # fn() with the gpu drained before and after -> (its result, ms, peak allocated gib during it).
@@ -57,11 +65,12 @@ def request(encoder: Any, processor: Any, dit: Any, vae: Any, case: str, size: i
     prompt, images = gate_input(case, 0)
     sized = lean.resized(images, size)
     _, load_ms, _ = stage(before)
-    (text, slots), text_ms, text_peak = stage(lambda: encode(encoder, processor, prompt, sized))
+    (text, slots), text_ms, text_peak = stage(lambda: conditioning(encoder, processor, prompt, images, sized, size))
     _, free_ms, _ = stage(between)
     image, render_ms, render_peak = stage(lambda: lean.render(dit, vae, text, slots, TURBO, sized, None if sized else (size, size), size, 0))
     return image, {"load_encoder_ms": load_ms, "text_ms": text_ms, "free_encoder_ms": free_ms, "dit_vae_ms": render_ms,
-                   "total_ms": load_ms + text_ms + free_ms + render_ms, "text_peak_gib": text_peak, "dit_vae_peak_gib": render_peak}
+                   "total_ms": load_ms + text_ms + free_ms + render_ms, "dit_vae_tflops": TFLOP[size] / render_ms * 1e3,
+                   "text_peak_gib": text_peak, "dit_vae_peak_gib": render_peak}
 
 
 # one warm-up request, then RUNS timed ones -> medians of every time, the highest peaks, and the image saved.
@@ -72,6 +81,29 @@ def timed(name: str, run: Callable[[], tuple[Any, dict[str, float]]]) -> dict[st
     keys = rows[0][1]
     report = {key: (round(max(row[1][key] for row in rows), 2) if key.endswith("gib") else median([row[1][key] for row in rows])) for key in keys}
     print(name, json.dumps(report), flush=True)
+    return report
+
+
+# seconds since this process started.
+def alive() -> float:
+    return time.time() - pl.Path("/proc/self").stat().st_ctime
+
+
+# a new process up to its first image: seconds at each milestone, then the first and second 1024 edit.
+def cold() -> dict[str, Any]:
+    marks = {"imports_s": alive()}
+    dit, vae = load_port("turbo")
+    torch.cuda.synchronize()
+    marks["dit_vae_loaded_s"] = alive()
+    encoder, processor = load_encoder()
+    torch.cuda.synchronize()
+    marks["encoder_loaded_s"] = alive()
+    first = request(encoder, processor, dit, vae, "edit_1024", 1024)[1]["total_ms"]
+    marks["first_image_s"] = alive()
+    second = request(encoder, processor, dit, vae, "edit_1024", 1024)[1]["total_ms"]
+    report = {**{name: round(value, 1) for name, value in marks.items()}, "first_request_ms": round(first), "second_request_ms": round(second),
+              "resident_gib": round(torch.cuda.memory_allocated() / GIB, 2)}
+    print("cold", json.dumps(report), flush=True)
     return report
 
 
@@ -119,5 +151,5 @@ if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     mode = sys.argv[1]
     result = {"device": torch.cuda.get_device_name(0), "total_gib": round(torch.cuda.get_device_properties(0).total_memory / GIB, 2),
-              **(resident() if mode == "resident" else staged())}
-    (OUT / f"{mode}.json").write_text(json.dumps(result, indent=1))
+              **{"resident": resident, "staged": staged, "cold": cold}[mode]()}
+    (OUT / f"{'-'.join(sys.argv[1:])}.json").write_text(json.dumps(result, indent=1))
