@@ -1,7 +1,7 @@
 {
  "measured": "2026-10-13, one RTX PRO 6000 Blackwell (colab), Qwen-Image 2.1 Turbo, 8 steps, batch 1, median of 5 warm requests",
  "sglang": "sglang[diffusion] 0.5.21, sglang serve; http_ms is curl total time (png encode and transfer included), stages_ms is the server's own encode + denoise + decode log for the last request; peak_gib is nvidia-smi memory.used",
- "magpie": "in-process, text encoder included; peak_gib is torch's peak allocated; magpie rows re-measured 2026-10-13 with the quantised kv cache (median of two runs of 5 warm requests); the nvfp4-encoder rows are from before it",
+ "magpie": "in-process, text encoder included; peak_gib is torch's peak allocated; magpie rows re-measured 2026-10-13 with the quantised kv cache (median of two runs of 5 warm requests); the nvfp4-encoder rows are from before it; the edit 2048 row re-measured later that day with both attention matmuls on the 4-bit instruction (two runs of 5 warm requests: 5,802 and 5,803 ms; the 8-bit kernel in the same session: 6,606 and 6,639 ms)",
  "cases": {
   "edit 1024": {
    "magpie": {
@@ -59,10 +59,10 @@
   },
   "edit 2048": {
    "magpie": {
-    "total_ms": 6642,
+    "total_ms": 5802,
     "text_ms": 103,
-    "dit_vae_ms": 6538,
-    "peak_gib": 41.5
+    "dit_vae_ms": 5699,
+    "peak_gib": 38.0
    },
    "sglang default": {
     "http_ms": 13724,
