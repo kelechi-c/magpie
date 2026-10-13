@@ -26,7 +26,28 @@ def prepare(repo: str) -> str:
     return path
 
 
+GATE_DATA = "tensorkelechi/magpie-gate"  # private dataset: the frozen gate files, so another machine can pull them
+out_volume = modal.Volume.from_name("magpie-out")
+
+
+# copies the turbo baseline (inputs, references, conditioning, port images, step recordings) from the out volume
+# to the private dataset. generated images and activations only: no weights leave the volume.
+@app.function(cpu=4, memory=8192, timeout=3600, volumes={"/out": out_volume}, secrets=[modal.Secret.from_name("huggingface")])
+def publish() -> str:
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.create_repo(GATE_DATA, repo_type="dataset", private=True, exist_ok=True)
+    api.upload_folder(folder_path="/out/baseline/turbo", path_in_repo="baseline/turbo", repo_id=GATE_DATA, repo_type="dataset",
+                      allow_patterns=["*/edit_1024/*", "*/edit16_1024/*", "*/edit16_2048/*", "inputs16/*"])
+    return GATE_DATA
+
+
+# modal run tools/modal_prepare.py [--repos a,b]; --publish copies the gate files to the private dataset instead.
 @app.local_entrypoint()
-def main(repos: str = ",".join(REPOS)) -> None:
+def main(repos: str = ",".join(REPOS), publish_gate: bool = False) -> None:
+    if publish_gate:
+        print(publish.remote())
+        return
     for path in prepare.map(repos.split(",")):
         print(path)
