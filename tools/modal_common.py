@@ -14,7 +14,7 @@ image = (
     modal.Image.debian_slim("3.12")
     .apt_install("git")
     .uv_pip_install("torch", "torchvision", "transformers>=5.17", DIFFUSERS, "accelerate", "pillow", "safetensors",
-                    "huggingface_hub", "numpy")
+                    "huggingface_hub", "numpy", "dreamsim")
     .env({"HF_HOME": HF_ROOT, "HF_HUB_OFFLINE": "1", "PYTHONUNBUFFERED": "1", "PYTHONPATH": f"{REMOTE}/src"})
     .add_local_dir(FLICKER_IMAGES, remote_path=INPUTS, copy=True, ignore=["grid*", "*.txt"])
     .add_local_dir(str(ROOT / "src"), remote_path=f"{REMOTE}/src", ignore=["__pycache__"])

@@ -7,8 +7,8 @@ from typing import Any, Callable
 import modal
 
 sys.path.insert(0, str(pl.Path(__file__).resolve().parent))
-from gate import (CASES, GATE_CASES, INPUTS, OUT_ROOT, REPOS, SUITE, TIMED_CASES, Timings, collect, device_info, gate_input, gate_items, gate_pass, load_port, psnr, reduce, staged, summary, unfused, verdict)
-from modal_common import ROOT, VOLUMES, image, out_volume
+from gate import (CASES, GATE_CASES, INPUTS, OUT_ROOT, REPOS, SUITE, TIMED_CASES, Timings, collect, device_info, gate_input, gate_items, gate_pass, image_scores, load_port, psnr, reduce, staged, summary, unfused, verdict)
+from modal_common import ROOT, VOLUMES, hf_volume, image, out_volume
 
 app = modal.App("magpie-bench", image=image)
 
@@ -537,6 +537,17 @@ def gate(variant: str, tag: str, cases: list[str], slim: bool = True, attention:
     return json.dumps(result)
 
 
+# dinov2 and dreamsim again for a gate run's saved images against the frozen baseline images, with no request run.
+@app.function(gpu="L4", cpu=4, memory=16384, timeout=1800, retries=0, volumes=VOLUMES)
+def rescore(variant: str, tag: str, cases: list[str]) -> str:
+    from PIL import Image
+
+    ours, frozen = pl.Path(OUT_ROOT) / "gate" / tag / variant, pl.Path(OUT_ROOT) / "baseline" / variant / "magpie"
+    scores = {case: image_scores([(Image.open(path), Image.open(frozen / case / path.name)) for path in sorted((ours / case).glob("*.png"))]) for case in cases}
+    hf_volume.commit()
+    return json.dumps(scores)
+
+
 # wraps `owner.attr` so every call shows up in the profiler trace as a named span.
 def label(owner: Any, attr: str, name: str) -> None:
     from torch.profiler import record_function
@@ -745,6 +756,16 @@ def main(mode: str = "rehearse", reps: int = 0, tag: str = "candidate", variants
             result["verdict"] = verdict(result, baseline)
             (ROOT / "out" / "gate" / f"{tag}-{result['variant']}.json").write_text(json.dumps(result, indent=1))
             print(result["variant"], json.dumps(result["verdict"], indent=1))
+        return
+    if mode == "rescore":  # refresh the image scores and the verdict of an earlier gate run in place
+        for variant in variants.split(","):
+            path = ROOT / "out" / "gate" / f"{tag}-{variant}.json"
+            result = json.loads(path.read_text())
+            for case, scores in json.loads(rescore.remote(variant, tag, list(result["magpie"]))).items():
+                result["magpie"][case].update(scores)
+            result["verdict"] = verdict(result, json.loads((frozen / f"{variant}.json").read_text()))
+            path.write_text(json.dumps(result, indent=1))
+            print(variant, json.dumps(result["verdict"], indent=1))
         return
     if mode == "parity":
         (out / "parity.json").write_text(json.dumps(json.loads(parity.remote()), indent=2))

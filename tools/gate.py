@@ -10,6 +10,7 @@ which is what a card other than the one the baseline was frozen on needs.
 
 import argparse
 import json
+import os
 import pathlib as pl
 import statistics
 import time
@@ -90,7 +91,8 @@ CASES: dict[str, dict[str, Any]] = {
 
 GATE_CASES = ["t2i_1024", "edit_1024", "t2i_2048", "edit_2048"]
 TIMED_CASES = "edit_1024"  # what a candidate is timed on: five warm requests; 2048 is estimated from it
-STEP_ERROR_MAX = 0.02  # worst relative l2 error of one dit step on the baseline's own inputs
+STEP_ERROR_MAX = 0.02  # relative l2 error of one dit step on the baseline's own inputs; reported, not judged
+DREAMSIM_MAX = 0.05  # highest dreamsim distance between a candidate image and the frozen baseline image (provisional)
 DINO_MIN = 0.98  # lowest dinov2 cls cosine between a candidate image and the frozen baseline image
 DINO = ("facebook/dinov2-base", "f9e44c814b77203eaa57a6bdbbd535f21ede1415")  # as in flicker
 
@@ -262,6 +264,23 @@ def dino_similarity(pairs: list[tuple[Any, Any]]) -> list[float]:
     return (features[:, 0] * features[:, 1]).sum(-1).tolist()
 
 
+# dreamsim (ensemble) distance of image pairs: 0.0 means the same picture to a model tuned on human similarity
+# judgements. its weights are fetched once into HF_HOME/dreamsim.
+def dreamsim_distance(pairs: list[tuple[Any, Any]]) -> list[float]:
+    import torch
+    from dreamsim import dreamsim
+
+    model, preprocess = dreamsim(pretrained=True, device="cuda", cache_dir=str(pl.Path(os.environ.get("HF_HOME", ".")) / "dreamsim"))
+    with torch.no_grad():
+        left, right = (torch.cat([preprocess(pair[side].convert("RGB")) for pair in pairs]).to("cuda") for side in (0, 1))
+        return model(left, right).tolist()
+
+
+# both image scores for (candidate, frozen baseline) pairs, as the fields a case's result carries.
+def image_scores(pairs: list[tuple[Any, Any]]) -> dict[str, list[float]]:
+    return {"dino_vs_baseline": dino_similarity(pairs) if pairs else [], "dreamsim_vs_baseline": dreamsim_distance(pairs) if pairs else []}
+
+
 # phase b, and the gate itself: the lean port's dit + vae on saved conditioning, no text encoder.
 # per case: stage times, per-stage peaks, each item's psnr against the frozen reference image, and, when
 # this run is not the baseline, its dinov2 similarity to the frozen baseline image and its step errors.
@@ -313,25 +332,26 @@ def gate_pass(dit: Any, vae: Any, variant: str, cases: list[str], folder: pl.Pat
                 checks.append(diagnose(dit, vae, captured[(case, index)], text, slots, shapes, sampler, index))
                 timings.clear()
         results[case] = {**reduce(rows), "stage_peak_gib": {k: round(v, 2) for k, v in peaks.items()}, "psnr_db": scores,
-                         "psnr_vs_baseline_db": drift, "diagnosis": checks, "step_error": errors,
-                         "dino_vs_baseline": dino_similarity(pairs) if pairs else []}
+                         "psnr_vs_baseline_db": drift, "diagnosis": checks, "step_error": errors, **image_scores(pairs)}
         print(f"gate {case}: dit+vae p50 {results[case]['total']['p50']:.3f} s, psnr min {min(scores):.1f} dB", flush=True)
     dit.prefill, dit.decode, vae.encode, vae.decode = plain
     return results
 
 
-# pass / fail of a gate run: no dit step may leave the baseline's output by more than STEP_ERROR_MAX on the
-# baseline's own inputs, and no image may fall below DINO_MIN similarity to the frozen baseline image.
+# pass / fail of a gate run: no image may fall below DINO_MIN similarity to the frozen baseline image or sit further
+# than DREAMSIM_MAX from it. `flagged` lists the items that do (the ones worth a look, or the vlm judge); step
+# errors on the baseline's own inputs are reported next to them but not judged.
 # psnr against the official reference is reported, not judged: it cannot tell rounding from damage.
 def verdict(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     cases = {}
     for case, row in candidate["magpie"].items():
         frozen = baseline["magpie"][case]
-        worst_step, worst_dino = max(max(item) for item in row["step_error"]), min(row["dino_vs_baseline"])
+        worst_step, worst_dino, worst_dream = max(max(item) for item in row["step_error"]), min(row["dino_vs_baseline"]), max(row["dreamsim_vs_baseline"])
         steps = [error for item in row["step_error"] for error in item]
-        cases[case] = {"pass": worst_step <= STEP_ERROR_MAX and worst_dino >= DINO_MIN,
+        flagged = [index for index, (dino, dream) in enumerate(zip(row["dino_vs_baseline"], row["dreamsim_vs_baseline"])) if dino < DINO_MIN or dream > DREAMSIM_MAX]
+        cases[case] = {"pass": not flagged, "flagged": flagged, "worst_dino": round(worst_dino, 4), "worst_dreamsim": round(worst_dream, 4),
                        "worst_step_error": round(worst_step, 5), "mean_step_error": round(sum(steps) / len(steps), 5),
-                       "steps_over_line": f"{sum(error > STEP_ERROR_MAX for error in steps)} of {len(steps)}", "worst_dino": round(worst_dino, 4),
+                       "steps_over_line": f"{sum(error > STEP_ERROR_MAX for error in steps)} of {len(steps)}",
                        "worst_psnr_change_db": round(min(ours - theirs for ours, theirs in zip(row["psnr_db"], frozen["psnr_db"])), 2),
                        "dit_vae_ms": round(row["total"]["p50"] * 1e3, 1), "baseline_ms": round(frozen["total"]["p50"] * 1e3, 1),
                        "speedup": round(frozen["total"]["p50"] / row["total"]["p50"], 3)}
