@@ -56,10 +56,10 @@ def render(tag: str, mlp: str, attention: str, baseline: bool) -> None:
 
 
 # the judge's transcription of one image.
-def transcribe(model: Any, processor: Any, image: Image.Image) -> str:
+def transcribe(model: Any, processor: Any, image: Image.Image, limit: int = 80) -> str:
     content = [{"type": "image", "image": image.convert("RGB")}, {"type": "text", "text": "Transcribe every word and number written in this image, exactly as written. Reply with the text only."}]
     inputs = processor.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt").to("cuda")
-    tokens = model.generate(**inputs, max_new_tokens=80, do_sample=False)
+    tokens = model.generate(**inputs, max_new_tokens=limit, do_sample=False)
     return processor.decode(tokens[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True).strip()
 
 

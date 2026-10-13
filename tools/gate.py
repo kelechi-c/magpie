@@ -71,9 +71,19 @@ WIDE = [
      "Turn the season to autumn: add orange and brown watercolour washes to the grass and a few falling leaves, keep the ink lines unchanged"),
     ("Detailed pen drawing of a snail on a mossy branch, spiral shell with fine concentric lines, moss as dense stippling, a pale green wash, white paper, no text",
      "Redraw this as a soft watercolour painting with no ink lines, loose washes and blurred edges, keep the composition"),
-    ("Graphite and white chalk drawing of a row of glass bottles on a shelf, highlights in chalk, soft grey reflections, mid-grey paper, no text",
-     "Fill three of the bottles with coloured liquid, one amber, one teal, one crimson, using transparent watercolour, keep the graphite and chalk unchanged"),
+    # the lettering item (2026-10-13; it replaced a row of bottles whose fill level was the model's free choice)
+    ('Black and white letterpress poster for a village fair, printed in black ink on white paper, no colour anywhere. Across the top in large bold condensed '
+     'capitals: "MIDSUMMER FAIR". Directly beneath, in smaller italic capitals: "SATURDAY 21 JUNE - GATES OPEN 10 AM". In the centre, an engraved illustration of '
+     'a carousel horse on a striped pole, drawn with fine cross-hatching, with one five-pointed star on each side. Below the illustration, three stacked lines in '
+     'clean sans-serif capitals: "LIVE BRASS BAND", "CIDER AND PIES", "FIREWORKS AT DUSK". Along the bottom, inside a ruled box, in small capitals: '
+     '"ADMISSION 2 SHILLINGS - CHILDREN FREE". A double-line frame runs around the whole sheet, with a small ornament in each corner.',
+     'Recolour the poster as a two-colour print: make the title "MIDSUMMER FAIR" and the two stars deep red, and give the carousel horse a mustard-yellow wash, '
+     'keeping all other ink black on white paper. Change the line "FIREWORKS AT DUSK" to "FIREWORKS AT NINE" and change "2 SHILLINGS" to "3 SHILLINGS". '
+     'Keep every other word, the layout and the engraving unchanged.'),
 ]
+# what the lettering item's input and its edit must say, line by line.
+LETTERING = (["MIDSUMMER FAIR", "SATURDAY 21 JUNE - GATES OPEN 10 AM", "LIVE BRASS BAND", "CIDER AND PIES", "FIREWORKS AT DUSK", "ADMISSION 2 SHILLINGS - CHILDREN FREE"],
+             ["MIDSUMMER FAIR", "SATURDAY 21 JUNE - GATES OPEN 10 AM", "LIVE BRASS BAND", "CIDER AND PIES", "FIREWORKS AT NINE", "ADMISSION 3 SHILLINGS - CHILDREN FREE"])
 
 
 CASES: dict[str, dict[str, Any]] = {
