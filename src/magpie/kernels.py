@@ -15,6 +15,7 @@ FP8_TOP = 448.0  # largest fp8 (e4m3) value: 4 exponent bits, 3 mantissa bits
 TOP = tl.constexpr(FP8_TOP)
 SWIGLU_TILE, SWIGLU_WARPS = (64, 128, 64), 4  # (rows, columns, inner width) per program and warps of each fp8 matmul (swept on sm_120)
 PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
+MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scaled matmuls, built by tools/build_native.sh
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 
 
@@ -393,3 +394,106 @@ def grow_add(y: Tensor, x: Tensor, temporal: bool) -> Tensor:
     grow_add_kernel[(triton.cdiv(pixels, per),)](rows, x.permute(0, 2, 3, 1), rows, y.shape[2], y.shape[3], channels, x.shape[1], frames,
                                                  channels * frames * 4 // x.shape[1], pixels, CPAD=padded, P=per, num_warps=8)
     return y
+
+
+# ---- mxfp8: fp8 values with one power-of-two scale per 32 elements, multiplied by the native cutlass kernel ----
+
+class MxMlp(NamedTuple):
+    hidden: Fp8Linear  # gate_layer and proj stacked: (2 * hidden, width) mxfp8 and its scales
+    out: Fp8Linear
+
+
+MX_TILE = 1024  # columns one program quantises; a multiple of 128, so its scale slots fall in whole groups of four
+
+
+# writes y, WIDTH fp32 values of row `row` starting at column `first`, as mxfp8: each block of 32 is divided by the
+# power of two that puts its largest value just under TOP and stored as fp8, and the power goes to the scale
+# tensor as a biased exponent byte. scales live where cutlass reads them: 512-byte cells of (128 rows x 4 blocks),
+# `cells` of them per 128 rows, ordered inside a cell as (row % 32, row // 32, block).
+@triton.jit
+def store_mx(y, out_ptr, sf_ptr, row, first, width, cells, WIDTH: tl.constexpr):
+    blocks = tl.reshape(y, (WIDTH // 32, 32))
+    power = tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(blocks), axis=1), 1e-30) / TOP))
+    scaled = tl.reshape(blocks * tl.exp2(-power)[:, None], (WIDTH,))
+    tl.store(out_ptr + row * width + first + tl.arange(0, WIDTH), tl.clamp(scaled, -TOP, TOP).to(tl.float8e4nv))
+    block = first // 32 + tl.arange(0, WIDTH // 32)
+    slot = ((row // 128) * cells + block // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + block % 4
+    tl.store(sf_ptr + slot, (power + 127).to(tl.uint8))
+
+
+# layer norm and modulation of one row, as `norm_kernel`, written as mxfp8.
+@triton.jit
+def norm_mx_kernel(x_ptr, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr):
+    row = tl.program_id(0)
+    at = tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + row * WIDTH + at).to(tl.float32)
+    x = x - tl.sum(x, axis=0) / WIDTH
+    y = x * tl.rsqrt(tl.sum(x * x, axis=0) / WIDTH + eps) * tl.load(mod_ptr + (row % mod_rows) * WIDTH + at).to(tl.float32)
+    store_mx(y, out_ptr, sf_ptr, row, 0, WIDTH, cells, WIDTH)
+
+
+# TILE columns of one bf16 row to mxfp8. with SWIGLU the row is (gate | proj), each `width` wide, and what is
+# written is silu(gate) * proj.
+@triton.jit
+def rows_mx_kernel(x_ptr, out_ptr, sf_ptr, width, cells, TILE: tl.constexpr, SWIGLU: tl.constexpr):
+    row, first = tl.program_id(0), tl.program_id(1) * TILE
+    at = first + tl.arange(0, TILE)
+    if SWIGLU:
+        gate = tl.load(x_ptr + row * 2 * width + at).to(tl.float32)
+        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + row * 2 * width + width + at).to(tl.float32)
+    else:
+        y = tl.load(x_ptr + row * width + at).to(tl.float32)
+    store_mx(y, out_ptr, sf_ptr, row, first, width, cells, TILE)
+
+
+# empty mxfp8 storage for (rows, width): the fp8 values and the scale bytes in cutlass's layout.
+def mx_empty(like: Tensor, rows: int, width: int) -> tuple[Tensor, Tensor]:
+    import magpie_gemm
+
+    return like.new_empty(rows, width, dtype=torch.float8_e4m3fn), like.new_empty(magpie_gemm.mxfp8_slots(rows, width), dtype=torch.uint8)
+
+
+# (rows, width) bf16 -> mxfp8; `swiglu` reads (rows, 2 * width) as (gate | proj) and writes silu(gate) * proj.
+def mx_rows(x: Tensor, swiglu: bool = False) -> tuple[Tensor, Tensor]:
+    width = x.shape[1] // 2 if swiglu else x.shape[1]
+    out, sf = mx_empty(x, x.shape[0], width)
+    rows_mx_kernel[(x.shape[0], width // MX_TILE)](x, out, sf, width, -(-width // 128), TILE=MX_TILE, SWIGLU=swiglu, num_warps=4)
+    return out, sf
+
+
+# layer_norm(x) * mod as mxfp8. x is (rows, width) bf16, mod (1 or rows, width) bf16.
+def mx_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    out, sf = mx_empty(x, *x.shape)
+    norm_mx_kernel[(x.shape[0],)](x, mod, out, sf, mod.shape[0], eps, -(-x.shape[1] // 128), WIDTH=x.shape[1], num_warps=8)
+    return out, sf
+
+
+# a linear's weight (out, in) bf16 as mxfp8, scales along the input axis.
+def mx_columns(weight: Tensor) -> Fp8Linear:
+    return mx_rows(weight.contiguous())
+
+
+def pack_mlp_mx(gate: Tensor, proj: Tensor, out: Tensor) -> MxMlp:
+    return MxMlp(mx_columns(torch.cat([gate, proj])), mx_columns(out))
+
+
+# x @ w^T in bf16 for mxfp8 x (rows, in) and weight (out, in), written into `out` when given; with `skip` and
+# `gate` the result is skip + gate * (x @ w^T).
+def mx_project(x: Tensor, sf: Tensor, linear: Fp8Linear, out: Tensor | None = None, skip: Tensor | None = None, gate: Tensor | None = None) -> Tensor:
+    import magpie_gemm
+
+    raw = x.new_empty(x.shape[0], linear[0].shape[0], dtype=torch.bfloat16) if out is None else out
+    magpie_gemm.mxfp8(x, sf, *linear, raw)
+    return raw if skip is None else torch.addcmul(skip, gate, raw)
+
+
+# a block's mlp branch and residual as `mlp_fp8`, on the native matmul: norm to mxfp8, one matmul for gate and proj
+# together, the swiglu and requantisation in one pass, the output matmul, the residual.
+def mlp_mx(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
+    flat = x.flatten(0, 1)
+    hidden = mx_rows(mx_project(*mx_norm(flat, mod.flatten(0, 1).contiguous(), eps), packed.hidden), swiglu=True)
+    return mx_project(*hidden, packed.out, skip=flat, gate=gate.flatten(0, 1).contiguous()).view_as(x)
+
+
+if MX:  # the native matmul takes over every fp8 linear: same call shapes, block scales instead of row and column steps
+    fp8_norm, fp8_rows, fp8_columns, fp8_project, pack_mlp, mlp_fp8 = mx_norm, mx_rows, mx_columns, mx_project, pack_mlp_mx, mlp_mx

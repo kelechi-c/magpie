@@ -136,7 +136,17 @@ def nvfp4_rounded(x: Any) -> Any:
     return (grid(blocks / scale, 1, 0, 6.0) * scale).flatten(-2).to(x.dtype)
 
 
-FORMATS = {"fp8": fp8_rounded, "nvfp4": nvfp4_rounded}
+# mxfp8: e4m3 values in blocks of 32 along the last axis, one power-of-two scale per block (what the block-scaled
+# tensor-core instruction applies itself).
+def mxfp8_rounded(x: Any) -> Any:
+    import torch
+
+    blocks = x.float().unflatten(-1, (-1, 32))
+    scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 448.0)))
+    return (grid(blocks / scale, 3, -6, 448.0) * scale).flatten(-2).to(x.dtype)
+
+
+FORMATS = {"fp8": fp8_rounded, "nvfp4": nvfp4_rounded, "mxfp8": mxfp8_rounded}
 
 
 # step errors of `dit` on the first `items` gate items of `case`, each step fed the baseline's own inputs.
@@ -246,6 +256,41 @@ def ablate(case: str = "edit_1024") -> str:
     return json.dumps(report)
 
 
+# the gate (dinov2, dreamsim, step error) with block linears emulated in a block-scaled format, weights and inputs
+# both rounded, everything else as the current build runs it: nvfp4 or mxfp8 on the mlp alone, the attention
+# linears alone, and all of them. the emulated layers run as bf16 matmuls, so only the quality means anything.
+def lowbits(case: str = "edit16_1024") -> str:
+    from torch import nn
+
+    import magpie.dit as dit_module
+    from gate import OUT_ROOT, gate_pass, load_port
+
+    dit, vae = load_port("turbo", slim=False, attention=())
+    dit_module.fp8_ready = lambda packed, x: False
+    folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
+    linears = {name: module for name, module in dit.transformer_blocks.named_modules() if isinstance(module, nn.Linear)}
+    report: dict[str, Any] = {}
+    for form, label, groups in ((form, label, groups) for form in ("nvfp4", "mxfp8")
+                                for label, groups in (("mlp", ("mlp_in", "mlp_out")), ("attention linears", ("qkv", "attn_out")), ("all linears", ("all",)))):
+        rounded = FORMATS[form]
+        chosen = [name for name in linears if any(name.endswith(end) for group in groups for end in GROUPS[group])]
+        plain = {name: linears[name].weight.data for name in chosen}
+        hooks = [linears[name].register_forward_pre_hook(lambda _, args: (rounded(args[0]),)) for name in chosen]
+        for name in chosen:
+            linears[name].weight.data = rounded(plain[name])
+        row = gate_pass(dit, vae, "turbo", [case], folder, pl.Path(OUT_ROOT) / "gate" / f"lowbits-{len(report)}" / "turbo", {})[case]
+        for name in chosen:
+            linears[name].weight.data = plain[name]
+        for hook in hooks:
+            hook.remove()
+        steps = [e for item in row["step_error"] for e in item]
+        report[f"{form}, {label}"] = {"layers": len(chosen), "worst_step_error": max(steps), "mean_step_error": sum(steps) / len(steps),
+                                      "dino": row["dino_vs_baseline"], "dreamsim": row["dreamsim_vs_baseline"]}
+        print(form, label, json.dumps(report[f"{form}, {label}"]), flush=True)
+    (pl.Path(OUT_ROOT) / "lowbits.json").write_text(json.dumps(report, indent=1))
+    return json.dumps(report)
+
+
 # the gate on the current build with one change inside attention at a time, all emulated in torch so only the
 # quality is measured: q and k rounded to fp8 per (token, head) (what an fp8 score matmul would see), v rounded
 # the same way, and the reference image's keys and values averaged over 2x2 token groups with ln 4 added to
@@ -314,4 +359,4 @@ def inside(pick: str = "", case: str = "edit_1024") -> str:
 
 
 if __name__ == "__main__":
-    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate, "inside": inside}[sys.argv[1]](*sys.argv[2:]))
+    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate, "inside": inside, "lowbits": lowbits}[sys.argv[1]](*sys.argv[2:]))

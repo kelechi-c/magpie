@@ -27,7 +27,7 @@ send() {
 }
 
 push() {
-    tar czf "$WORK/code.tar.gz" -C "$ROOT" --exclude __pycache__ src tools baseline
+    tar czf "$WORK/code.tar.gz" -C "$ROOT" --exclude __pycache__ src tools baseline native
     remote "mkdir -p /content/magpie /out/gate"
     send "$WORK/code.tar.gz" /content/magpie
 }
