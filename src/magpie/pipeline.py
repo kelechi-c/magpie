@@ -158,16 +158,18 @@ def render(
     return to_image(vae.decode(unpack(latents, shapes[-1])))
 
 
-# prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. with `look`, the encoder reads
-# look^2-pixel copies of the condition images while the vae still reads them at `resolution` (a 2048 edit with
-# look=1024 encodes three times faster); the slots are then resized to what the real images need.
+# prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. above `look`, the encoder reads
+# look^2-pixel copies of the condition images while the vae still reads them at `resolution` (a 2048 edit encodes
+# three times faster and the gate does not see it); the slots are then resized to what the real images need.
+# look=None always shows the encoder the full-size images.
 @torch.no_grad()
 def generate(
     models: Models, prompt: str, sampler: SamplerConfig, images: tuple[Image.Image, ...] = (),
-    size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = None,
+    size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = 1024,
 ) -> Image.Image:
     sized = resized(images, resolution)
-    text, slots = encode(models.encoder, models.processor, prompt, sized if look is None else resized(images, look))
-    if look is not None:
+    small = look is not None and resolution > look
+    text, slots = encode(models.encoder, models.processor, prompt, resized(images, look) if small else sized)
+    if small:
         text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
     return render(models.dit, models.vae, text, slots, sampler, sized, size, resolution, seed)
