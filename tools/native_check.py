@@ -1,14 +1,15 @@
 # the native block-scaled matmul against torch on the card: `python tools/native_check.py`.
 # x gets a different magnitude in every block of 32 and every row, so a scale read from the wrong slot shows as a
 # large error; a correct layout leaves only fp8 rounding (around 1-2 %). then ms and tflop/s at the dit's shapes,
-# and the whole mlp branch against its bf16 reference.
+# and the whole mlp branch against its bf16 reference; then the same in nvfp4 (4-bit values, around 10-15 % per matmul).
 import json
 import time
 
 import torch
 import torch.nn.functional as F
 
-from magpie.kernels import mlp_mx, mx_columns, mx_norm, mx_project, mx_rows, pack_mlp_mx
+from magpie import kernels
+from magpie.kernels import mlp_mx, mlp_nv, mx_columns, mx_norm, mx_project, mx_rows, nv_norm, nv_rows, pack_mlp_mx, pack_mlp_nv
 
 
 def bench(fn, iters: int = 20) -> float:
@@ -53,6 +54,22 @@ def main() -> None:
                      "norm_ms": bench(lambda: mx_norm(flat, flat_mod, 1e-6)), "hidden_matmul_ms": bench(lambda: mx_project(*rows, packed.hidden)),
                      "swiglu_ms": bench(lambda: mx_rows(raw, swiglu=True)), "out_matmul_ms": bench(lambda: mx_project(*hidden_rows, packed.out))}
     print("mlp", json.dumps(report["mlp"]), flush=True)
+    m, n, k = 4096, 4096, 4096
+    spread = torch.exp2(torch.randint(-4, 5, (m, k // 16, 1), device="cuda").float())
+    a = (torch.randn(m, k // 16, 16, device="cuda") * spread).flatten(1).bfloat16()
+    w = (torch.randn(n, k, device="cuda") * 0.02).bfloat16()
+    ref = a.float() @ w.float().t()
+    rows, linear = nv_rows(a), nv_rows(w, scale=64.0)
+    report["nvfp4"] = {"gap": float((mx_project(*rows, linear, alpha=1 / 64).float() - ref).norm() / ref.norm()), "ms": bench(lambda: mx_project(*rows, linear)),
+                       "quantise_ms": bench(lambda: nv_rows(a)), "norm_ms": bench(lambda: nv_norm(flat, flat_mod, 1e-6)), "swiglu_ms": bench(lambda: nv_rows(raw, True, 0.25))}
+    report["nvfp4"]["tflops"] = 2 * m * n * k / report["nvfp4"]["ms"] / 1e9
+    print("nvfp4", json.dumps(report["nvfp4"]), flush=True)
+    for names in ("hidden", "out", "hidden,out"):
+        kernels.NV.clear()
+        kernels.NV.update(names.split(","))
+        mixed = pack_mlp_nv(g, p, o)
+        got = mlp_nv(x, mod, gate, mixed, 1e-6).float()
+        print("mlp nvfp4", names, json.dumps({"branch_gap": float((got - want).norm() / (want - x.float()).norm()), "ms": bench(lambda: mlp_nv(x, mod, gate, mixed, 1e-6))}), flush=True)
 
 
 if __name__ == "__main__":

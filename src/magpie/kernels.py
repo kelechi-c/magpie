@@ -1,4 +1,5 @@
 import math
+import os
 from importlib.util import find_spec
 from typing import NamedTuple
 
@@ -477,13 +478,14 @@ def pack_mlp_mx(gate: Tensor, proj: Tensor, out: Tensor) -> MxMlp:
     return MxMlp(mx_columns(torch.cat([gate, proj])), mx_columns(out))
 
 
-# x @ w^T in bf16 for mxfp8 x (rows, in) and weight (out, in), written into `out` when given; with `skip` and
-# `gate` the result is skip + gate * (x @ w^T).
-def mx_project(x: Tensor, sf: Tensor, linear: Fp8Linear, out: Tensor | None = None, skip: Tensor | None = None, gate: Tensor | None = None) -> Tensor:
+# x @ w^T * alpha in bf16 for block-scaled x (rows, in) and weight (out, in), written into `out` when given; with
+# `skip` and `gate` the result is skip + gate * that. uint8 values are nvfp4 nibbles, fp8 values are mxfp8.
+def mx_project(x: Tensor, sf: Tensor, linear: Fp8Linear, out: Tensor | None = None, skip: Tensor | None = None, gate: Tensor | None = None,
+               alpha: float = 1.0) -> Tensor:
     import magpie_gemm
 
     raw = x.new_empty(x.shape[0], linear[0].shape[0], dtype=torch.bfloat16) if out is None else out
-    magpie_gemm.mxfp8(x, sf, *linear, raw)
+    (magpie_gemm.nvfp4 if x.dtype == torch.uint8 else magpie_gemm.mxfp8)(x, sf, *linear, raw, alpha)
     return raw if skip is None else torch.addcmul(skip, gate, raw)
 
 
@@ -495,5 +497,93 @@ def mlp_mx(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> T
     return mx_project(*hidden, packed.out, skip=flat, gate=gate.flatten(0, 1).contiguous()).view_as(x)
 
 
+# ---- nvfp4: 4-bit values (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and a sign) two per byte, one fp8 scale per 16 elements ----
+
+NV = set(filter(None, os.environ.get("MAGPIE_NVFP4", "out").split(",")))  # mlp matmuls in nvfp4 (hidden, out); the gate passes `out` only
+NV_WEIGHT, NV_HIDDEN = 64.0, 0.25  # powers of two that bring weights and swiglu outputs into the fp8 scale's range
+
+
+# the e2m1 code (0..7) of the nearest representable magnitude to s in [0, 6].
+@triton.jit
+def e2m1(s):
+    return tl.where(s < 2, tl.floor(2 * s + 0.5), tl.where(s < 4, 4 + tl.floor(s - 1.5), tl.minimum(6 + tl.floor(s / 2 - 1.5), 7))).to(tl.int32)
+
+
+# writes 2 * HALF fp32 values of row `row` starting at column `first`, given as their even and odd elements, as
+# nvfp4: each block of 16 gets the fp8 scale nearest max / 6, and each value the nearest e2m1 multiple of it; even
+# elements take the low nibble. scales sit in cutlass's cells as in `store_mx`, with 16-element blocks.
+@triton.jit
+def store_nv(even, odd, out_ptr, sf_ptr, row, first, width, cells, HALF: tl.constexpr):
+    top = tl.maximum(tl.max(tl.reshape(tl.abs(even), (HALF // 8, 8)), axis=1), tl.max(tl.reshape(tl.abs(odd), (HALF // 8, 8)), axis=1))
+    stored = tl.maximum(top / 6, 0.002).to(tl.float8e4nv)
+    step = tl.reshape(tl.broadcast_to(stored.to(tl.float32)[:, None], (HALF // 8, 8)), (HALF,))
+    low = e2m1(tl.abs(even) / step) + tl.where(even < 0, 8, 0)
+    high = e2m1(tl.abs(odd) / step) + tl.where(odd < 0, 8, 0)
+    tl.store(out_ptr + row * (width // 2) + first // 2 + tl.arange(0, HALF), (low + high * 16).to(tl.uint8))
+    block = first // 16 + tl.arange(0, HALF // 8)
+    tl.store(sf_ptr + ((row // 128) * cells + block // 4) * 512 + (row % 32) * 16 + ((row // 32) % 4) * 4 + block % 4, stored)
+
+
+# layer norm and modulation of one row, as `norm_kernel`, written as nvfp4.
+@triton.jit
+def norm_nv_kernel(x_ptr, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr):
+    row = tl.program_id(0)
+    at = tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + row * WIDTH + at).to(tl.float32)
+    x = x - tl.sum(x, axis=0) / WIDTH
+    y = tl.reshape(x * tl.rsqrt(tl.sum(x * x, axis=0) / WIDTH + eps) * tl.load(mod_ptr + (row % mod_rows) * WIDTH + at).to(tl.float32), (WIDTH // 2, 2))
+    even, odd = tl.split(y)
+    store_nv(even, odd, out_ptr, sf_ptr, row, 0, WIDTH, cells, WIDTH // 2)
+
+
+# TILE columns of one bf16 row, times `scale`, to nvfp4; SWIGLU as in `rows_mx_kernel`.
+@triton.jit
+def rows_nv_kernel(x_ptr, out_ptr, sf_ptr, width, cells, scale, TILE: tl.constexpr, SWIGLU: tl.constexpr):
+    row, first = tl.program_id(0), tl.program_id(1) * TILE
+    at = first + tl.arange(0, TILE)
+    if SWIGLU:
+        gate = tl.load(x_ptr + row * 2 * width + at).to(tl.float32)
+        y = gate * tl.sigmoid(gate) * tl.load(x_ptr + row * 2 * width + width + at).to(tl.float32)
+    else:
+        y = tl.load(x_ptr + row * width + at).to(tl.float32)
+    even, odd = tl.split(tl.reshape(y * scale, (TILE // 2, 2)))
+    store_nv(even, odd, out_ptr, sf_ptr, row, first, width, cells, TILE // 2)
+
+
+def nv_empty(like: Tensor, rows: int, width: int) -> tuple[Tensor, Tensor]:
+    import magpie_gemm
+
+    return like.new_empty(rows, width // 2, dtype=torch.uint8), like.new_empty(magpie_gemm.nvfp4_slots(rows, width), dtype=torch.float8_e4m3fn)
+
+
+# (rows, width) bf16 times `scale` -> nvfp4; `swiglu` as in `mx_rows`.
+def nv_rows(x: Tensor, swiglu: bool = False, scale: float = 1.0) -> tuple[Tensor, Tensor]:
+    width = x.shape[1] // 2 if swiglu else x.shape[1]
+    out, sf = nv_empty(x, x.shape[0], width)
+    rows_nv_kernel[(x.shape[0], width // MX_TILE)](x, out, sf, width, -(-width // 64), scale, TILE=MX_TILE, SWIGLU=swiglu, num_warps=4)
+    return out, sf
+
+
+def nv_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    out, sf = nv_empty(x, *x.shape)
+    norm_nv_kernel[(x.shape[0],)](x, mod, out, sf, mod.shape[0], eps, -(-x.shape[1] // 64), WIDTH=x.shape[1], num_warps=8)
+    return out, sf
+
+
+# the mlp weights with the matmuls named in NV as nvfp4 (scaled up by NV_WEIGHT) and the rest as mxfp8.
+def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor) -> MxMlp:
+    hidden = torch.cat([gate, proj])
+    return MxMlp(nv_rows(hidden, scale=NV_WEIGHT) if "hidden" in NV else mx_columns(hidden), nv_rows(out.contiguous(), scale=NV_WEIGHT) if "out" in NV else mx_columns(out))
+
+
+# `mlp_mx` with the matmuls named in NV in nvfp4; `alpha` undoes the scaling of weights and swiglu outputs.
+def mlp_nv(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
+    flat, mod = x.flatten(0, 1), mod.flatten(0, 1).contiguous()
+    first = mx_project(*nv_norm(flat, mod, eps), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in NV else mx_project(*mx_norm(flat, mod, eps), packed.hidden)
+    hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in NV else (mx_rows(first, True), 1.0)
+    return mx_project(*hidden, packed.out, skip=flat, gate=gate.flatten(0, 1).contiguous(), alpha=alpha).view_as(x)
+
+
 if MX:  # the native matmul takes over every fp8 linear: same call shapes, block scales instead of row and column steps
-    fp8_norm, fp8_rows, fp8_columns, fp8_project, pack_mlp, mlp_fp8 = mx_norm, mx_rows, mx_columns, mx_project, pack_mlp_mx, mlp_mx
+    fp8_norm, fp8_rows, fp8_columns, fp8_project = mx_norm, mx_rows, mx_columns, mx_project
+    pack_mlp, mlp_fp8 = (pack_mlp_nv, mlp_nv) if NV else (pack_mlp_mx, mlp_mx)

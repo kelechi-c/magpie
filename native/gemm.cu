@@ -39,8 +39,8 @@ struct BlockScaled {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
   using Config = typename Mainloop::Sm1xxBlkScaledConfig;
 
-  // one matmul on the current torch stream; the workspace is kept between calls and only ever grows.
-  static void run(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, int k) {
+  // one matmul on the current torch stream, its result multiplied by `alpha`; the workspace is kept between calls and only ever grows.
+  static void run(torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, int k, float alpha) {
     static torch::Tensor workspace;
     int m = d.size(0), n = d.size(1);
     auto shape = make_shape(m, n, k, 1);
@@ -50,7 +50,7 @@ struct BlockScaled {
          reinterpret_cast<typename Element::DataType *>(b.data_ptr()), cutlass::make_cute_packed_stride(typename Kernel::StrideB{}, {n, k, 1}),
          reinterpret_cast<typename Element::ScaleFactorType *>(sfa.data_ptr()), Config::tile_atom_to_shape_SFA(shape),
          reinterpret_cast<typename Element::ScaleFactorType *>(sfb.data_ptr()), Config::tile_atom_to_shape_SFB(shape)},
-        {{1.0f, 0.0f},
+        {{alpha, 0.0f},
          reinterpret_cast<ElementD *>(d.data_ptr()), cutlass::make_cute_packed_stride(typename Kernel::StrideC{}, {m, n, 1}),
          reinterpret_cast<ElementD *>(d.data_ptr()), cutlass::make_cute_packed_stride(typename Kernel::StrideD{}, {m, n, 1})}};
     int64_t need = static_cast<int64_t>(Gemm::get_workspace_size(args));
@@ -75,11 +75,11 @@ using Mxfp8 = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
 using Nvfp4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-  module.def("mxfp8", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d) {
-    BlockScaled<Mxfp8, 16>::run(a, sfa, b, sfb, d, a.size(1));
+  module.def("mxfp8", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, float alpha) {
+    BlockScaled<Mxfp8, 16>::run(a, sfa, b, sfb, d, a.size(1), alpha);
   });
-  module.def("nvfp4", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d) {
-    BlockScaled<Nvfp4, 32>::run(a, sfa, b, sfb, d, a.size(1) * 2);
+  module.def("nvfp4", [](torch::Tensor a, torch::Tensor sfa, torch::Tensor b, torch::Tensor sfb, torch::Tensor d, float alpha) {
+    BlockScaled<Nvfp4, 32>::run(a, sfa, b, sfb, d, a.size(1) * 2, alpha);
   });
   module.def("mxfp8_slots", [](int rows, int k) { return slots<Mxfp8, 16>(rows, k); });
   module.def("nvfp4_slots", [](int rows, int k) { return slots<Nvfp4, 32>(rows, k); });
