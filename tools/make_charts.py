@@ -2,7 +2,8 @@
 
     cd /home/tensor/Shared/code/ml/magpie && uv run --no-project --with matplotlib python tools/make_charts.py [chart ...]
 
-Numbers come from out/bench/summary.json, out/trace/kernels.json, out/roofline.json and baseline/turbo.json. Writes
+Numbers come from out/bench/summary.json, out/trace/kernels.json, out/roofline.json, baseline/turbo.json and
+baseline/ladder.json. Writes
 qwen21_<chart>[_mobile][_dark].png and sources.json into assets/charts at 200 dpi.
 """
 
@@ -12,7 +13,7 @@ import json
 import pathlib as pl
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
 import matplotlib.pyplot as plt
@@ -20,12 +21,13 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
 sys.path.insert(0, "/home/tensor/.claude/skills/chart-craft")
-from chartkit import DARK, LIGHT, TALL, WIDE, Shape, Theme, bar, canvas, clean, ms, row_label, style, tag  # noqa: E402
+from chartkit import DARK, LIGHT, TALL, WIDE, Shape, Theme, bar, canvas, clean, fit, ms, row_label, style, tag  # noqa: E402
 
 ROOT = pl.Path("/home/tensor/Shared/code/ml/magpie")
 SUMMARY = ROOT / "out/bench/summary.json"
 KERNELS = ROOT / "out/trace/kernels.json"
 BASELINE = ROOT / "baseline/turbo.json"
+LADDER = ROOT / "baseline/ladder.json"
 FLOORS = ROOT / "out/roofline.json"
 OUT = ROOT / "assets/charts"
 PREFIX = "qwen21"
@@ -34,6 +36,7 @@ RTX_5090_GB = 32.0
 ROOFLINE: tuple[str, ...] = ("gemm_8192_bf16_tflops", "mlp_4096x4096x12288_bf16_tflops", "sdpa_16384_bf16_tflops")
 STAGE_FIELDS: tuple[str, ...] = ("total_ms", "text_ms", "dit_ms", "vae_encode_ms", "vae_decode_ms")
 CaseRow = tuple[str, str, str]  # (variant, case, label)
+StageRow = tuple[str, float, float]  # (stage, port ms, now ms)
 CASE_ROWS: tuple[CaseRow, ...] = (  # edits only: the project follows image editing
     (TURBO, "edit_1024", "Turbo (8 steps)\nedit 1024"), (TURBO, "edit_2048", "Turbo (8 steps)\nedit 2048"),
     (BASE, "edit_1024", "base (40 steps)\nedit 1024"), (BASE, "edit_2048", "base (40 steps)\nedit 2048"),
@@ -425,11 +428,158 @@ def floor(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
     return fig, srcs
 
 
+def ladder(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """One bar per change: milliseconds of a 1024 Turbo edit after each step, labelled with the saving over the step before."""
+    steps = [(s["step"], s["ms"]) for s in d["ladder"]["steps"]]
+    first, last = steps[0][1], steps[-1][1]
+    fig, ax = canvas(th, sh, sh.pick(7.0, 9.8),
+                     f"Ten changes took a 1024² edit from {first / 1000:.2f} s to {last / 1000:.2f} s, "
+                     f"{first / last:.1f} x faster",
+                     "Milliseconds per Turbo (8 steps) edit at 1024², DiT + VAE, median of 5 warm requests, RTX PRO 6000 "
+                     "Blackwell. Lower is better.",
+                     "One change per row, in the order they were made. The last step misses the DINOv2 0.98 line on one "
+                     "image; the current default measures 1,054 ms.",
+                     left=sh.pick(2.5, 3.0), right=sh.pick(1.6, 0.5),
+                     key=[(th.other, "port baseline"), (th.soft, "earlier steps"), (th.hero, "last step")])
+    n = len(steps)
+    for i, (name, v) in enumerate(steps):
+        y = n - 1 - i
+        saved = steps[i - 1][1] - v if i else None
+        bar(ax, th, y, 0, v, th.other if i == 0 else th.hero if i == n - 1 else th.soft)
+        tag(ax, v, y, f"{v:,} ms" if saved is None else f"{v:,} ms, -{saved:,} ms", sh, th,
+            size=12 if i in (0, n - 1) else 11.5)
+        row_label(ax, th, sh, y, fit(name, 12 * sh.k, sh.pick(2.3, 2.7)))
+    clean(ax)
+    ax.set_xlim(0, sh.pick(3300, 5000))
+    ax.set_ylim(-0.6, n - 0.4)
+    ticks = [0, 500, 1000, 1500, 2000, 2500] if sh.wide else [0, 2000, 4000]
+    ax.set_xticks(ticks, [f"{t:,} ms" for t in ticks])
+    return fig, ("ladder.steps",)
+
+
+def stage_panel(ax: Axes, th: Theme, sh: Shape, rows: Sequence[StageRow], xlim: float, ticks: Sequence[float],
+                title: str) -> None:
+    """One request size of the stage breakdown: a now bar over a port bar for each stage, the total on the last row."""
+    n = len(rows)
+    for i, (name, port, now) in enumerate(rows):
+        y = n - 1 - i
+        bar(ax, th, y + 0.2, 0, now, th.hero, 0.36)
+        bar(ax, th, y - 0.2, 0, port, th.other, 0.36)
+        tag(ax, now, y + 0.2, f"{now:,} ms", sh, th, size=11)
+        tag(ax, port, y - 0.2, f"{port:,} ms", sh, th, color=th.muted, size=11)
+        row_label(ax, th, sh, y, name)
+    clean(ax)
+    ax.set_xlim(0, xlim)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.set_xticks(ticks, [f"{t:,}" for t in ticks])
+    ax.set_title(title, loc="left", fontsize=12.5 * sh.k, color=th.ink, pad=4)
+    ax.tick_params(labelsize=10.5 * sh.k, labelcolor=th.muted)
+
+
+def stages_then_now(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Stage times of one traced edit, port against now, at 1024 and 2048 as two stacked panels on one canvas."""
+    rows = {size: [(s, p, n) for s, p, n in stage] for size, stage in d["ladder"]["stages"].items()}
+    (_, p1, n1), (_, p2, n2) = rows["1024"][-1], rows["2048"][-1]
+    fig, ax = canvas(th, sh, sh.pick(10.6, 13.0),
+                     f"The traced request drops {p1 / n1:.1f} x at 1024² and {p2 / n2:.1f} x at 2048²",
+                     "Milliseconds per Turbo (8 steps) edit request, by stage, DiT + VAE, one traced request per size. "
+                     "Lower is better.",
+                     "RTX PRO 6000 Blackwell. Stages do not add to the total; the rest is overhead. Glue reads 0 ms "
+                     "in the current build.",
+                     left=sh.pick(2.4, 2.2), right=sh.pick(0.3, 0.3),
+                     key=[(th.other, "port, the starting point"), (th.hero, "now")])
+    x0, y0, w0, h0 = ax.get_position().bounds
+    ax.remove()
+    fh = fig.get_size_inches()[1]
+    gap, cap = 0.9 / fh, 0.42 / fh
+    half = (h0 - gap - cap) / 2
+    top = fig.add_axes((x0, y0 + half + gap, w0, half))
+    bottom = fig.add_axes((x0, y0, w0, half))
+    stage_panel(top, th, sh, rows["1024"], sh.pick(2800, 3400), [0, 500, 1000, 1500, 2000, 2500] if sh.wide
+                else [0, 1000, 2000], "1024² edit")
+    stage_panel(bottom, th, sh, rows["2048"], sh.pick(19000, 21000), [0, 4000, 8000, 12000, 16000] if sh.wide
+                else [0, 8000, 16000], "2048² edit")
+    return fig, ("ladder.stages.1024", "ladder.stages.2048")
+
+
+def verdict(base: float, now: float, lower: bool) -> str:
+    """How the current build compares: the ratio when it is better, the percent it is worse by otherwise."""
+    better = base / now if lower else now / base
+    return f"{better:.1f} x better" if better >= 1 else f"{100 / better - 100:.0f} % worse"
+
+
+def now_vs_baseline(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """Each metric of the current build as a share of the port baseline (100 %), labelled with its real values."""
+    pairs = d["ladder"]["pairs"]
+    speed = [p["base"] / p["now"] for p in pairs[:2]]
+    fig, ax = canvas(th, sh, sh.pick(7.6, 10.6),
+                     f"Edits run {min(speed):.1f} to {max(speed):.1f} x faster than the port baseline; peak memory at "
+                     "2048² is the one regression",
+                     "Current build as a share of the port baseline, which is 100 %. Turbo (8 steps). Lower is better, "
+                     "except compute rate.",
+                     "RTX PRO 6000 Blackwell, edit, DiT + VAE unless the row says otherwise. The compute rate was "
+                     "measured on the 1,218 ms build, not the current default. The text encoder reads a 1024² copy of "
+                     "the input.",
+                     left=sh.pick(3.0, 2.2), right=sh.pick(2.4, 1.0),
+                     key=[(th.other, "port baseline"), (th.hero, "current build")])
+    n = len(pairs)
+    for i, p in enumerate(pairs):
+        y = n - 1 - i
+        share = 100 * p["now"] / p["base"]
+        bar(ax, th, y - 0.2, 0, 100, th.other, 0.36)
+        bar(ax, th, y + 0.2, 0, share, th.hero, 0.36)
+        tag(ax, 100, y - 0.2, f"{p['base']:,} {p['unit']}", sh, th, color=th.muted, size=11)
+        text = f"{p['now']:,} {p['unit']}" + (f", {verdict(p['base'], p['now'], p['lower'])}" if sh.wide else "")
+        tag(ax, share, y + 0.2, text, sh, th, size=11.5)
+        row_label(ax, th, sh, y, fit(p["metric"], 12 * sh.k, sh.pick(2.7, 2.0)))
+    ref_line(ax, th, 100)
+    ref_text(ax, th, sh, 100, n + 0.1, "port baseline, 100 %", "center")
+    clean(ax)
+    ax.set_xlim(0, 240)
+    ax.set_ylim(-0.6, n + 0.5)
+    ticks = [0, 50, 100, 150, 200] if sh.wide else [0, 100, 200]
+    ax.set_xticks(ticks, [f"{t} %" for t in ticks])
+    return fig, ("ladder.pairs",)
+
+
+def quality_gate(th: Theme, sh: Shape, d: Summary) -> tuple[Figure, tuple[str, ...]]:
+    """DINOv2 similarity of each frozen-set edit to its baseline image, at 1024 and 2048, zoomed on the pass line."""
+    gate = d["ladder"]["gate"]
+    line, g1, g2 = gate["floor"], gate["1024"], gate["2048"]
+    n = len(g1)
+    fig, ax = canvas(th, sh, sh.pick(8.4, 11.2),
+                     f"{sum(v >= line for v in g1)} of {n} 1024² edits clear the {line} DINOv2 gate, and "
+                     f"{sum(v >= line for v in g2)} of {n} at 2048²",
+                     "DINOv2 similarity of each edit to its frozen baseline image, per item. Higher is better. Axis "
+                     "zoomed to 0.97 to 1.00.",
+                     "Frozen set of 16 edits, RTX PRO 6000 Blackwell, Turbo (8 steps), edit, DiT + VAE. A VLM judge "
+                     "called item 0 identical. Item 15 is the lettering poster.",
+                     left=sh.pick(2.0, 1.8), right=sh.pick(0.6, 0.9),
+                     key=[(th.hero, "1024²"), (th.peer, "2048²"), (th.soft, "under the line")])
+    for i, (a, b) in enumerate(zip(g1, g2)):
+        y = n - 1 - i
+        ax.scatter([a], [y + 0.2], s=130 * sh.k, color=th.soft if a < line else th.hero, edgecolor=th.bg,
+                   linewidth=2, zorder=3, clip_on=False)
+        ax.scatter([b], [y - 0.2], s=130 * sh.k, color=th.peer, edgecolor=th.bg, linewidth=2, zorder=3, clip_on=False)
+        if a < line:
+            tag(ax, a, y + 0.2, f"{a:.4f}", sh, th, ha="right", dx=10, size=11.5)
+        row_label(ax, th, sh, y, f"item {i}" + (", poster" if i == n - 1 else ""))
+    ref_line(ax, th, line)
+    ref_text(ax, th, sh, line, n + 0.1, f"gate {line}", "center")
+    clean(ax)
+    ax.set_xlim(0.968, 1.002)
+    ax.set_ylim(-0.6, n + 0.5)
+    ticks = [0.97, 0.98, 0.99, 1.0]
+    ax.set_xticks(ticks, [f"{t:.2f}" for t in ticks])
+    return fig, ("ladder.gate.1024", "ladder.gate.2048")
+
+
 PLOTS: dict[str, Plot] = {
     "stage-split": stage_split, "request-latency": request_latency, "prefix-cache": prefix_cache,
     "utilisation": utilisation, "peak-memory": peak_memory, "op-groups": op_groups,
     "span-split": span_split, "kernel-classes": kernel_classes, "fit-32gb": fit_32gb,
-    "floor": floor,
+    "floor": floor, "ladder": ladder, "stages-then-now": stages_then_now, "now-vs-baseline": now_vs_baseline,
+    "quality-gate": quality_gate,
 }
 
 
@@ -453,7 +603,8 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
                           capture_output=True, text=True).stdout.strip()
     doc = {"generated": dt.date.today().isoformat(), "repo": {"root": str(ROOT), "head": head or None},
            **{name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-              for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE), ("roofline", FLOORS))},
+              for name, path in (("summary", SUMMARY), ("kernels", KERNELS), ("baseline", BASELINE), ("roofline", FLOORS),
+                                 ("ladder", LADDER))},
            "charts": {**prev, **{k: list(dict.fromkeys(v)) for k, v in charts.items()}}}
     path.write_text(json.dumps(doc, indent=2) + "\n")
     print("wrote sources.json")
@@ -462,7 +613,8 @@ def write_sources(charts: dict[str, tuple[str, ...]]) -> None:
 def main(names: list[str]) -> None:
     """Render the requested charts (all by default) in every theme and shape, then write their provenance."""
     d = {**json.loads(SUMMARY.read_text()), "kernels": json.loads(KERNELS.read_text()),
-         "baseline": json.loads(BASELINE.read_text()), "roofline": json.loads(FLOORS.read_text())}
+         "baseline": json.loads(BASELINE.read_text()), "roofline": json.loads(FLOORS.read_text()),
+         "ladder": json.loads(LADDER.read_text())}
     charts: dict[str, tuple[str, ...]] = {}
     for name in names or list(PLOTS):
         for th in (LIGHT, DARK):

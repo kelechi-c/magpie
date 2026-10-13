@@ -1,0 +1,41 @@
+{
+  "source": "figures as supplied for the article charts, 2026-10-13: Turbo (8 steps), edit, RTX PRO 6000 Blackwell",
+  "steps": [
+    {"step": "port baseline", "ms": 2484},
+    {"step": "fused QK-norm + RoPE prep", "ms": 2279},
+    {"step": "max-free flash attention", "ms": 2245},
+    {"step": "FP8 MLP", "ms": 2023},
+    {"step": "fused VAE + K/V buffer + glue", "ms": 1832},
+    {"step": "FP8 row alignment + FP8 k,v", "ms": 1711},
+    {"step": "SageAttention 2 + FP8 q,k,v,out", "ms": 1508},
+    {"step": "block-scaled FP8 (MXFP8) CUTLASS matmul", "ms": 1316},
+    {"step": "NVFP4 on MLP output matmul", "ms": 1218},
+    {"step": "NVFP4 on both MLP matmuls + ping-pong schedule", "ms": 1048}
+  ],
+  "stages": {
+    "1024": [
+      ["MLP", 1005, 321], ["QKV linears", 542, 194], ["attention", 467, 316], ["attention out", 103, 79],
+      ["VAE decode", 149, 76], ["VAE encode", 39, 22], ["glue", 102, 0], ["total", 2440, 1023]
+    ],
+    "2048": [
+      ["MLP", 4531, 1289], ["QKV linears", 2846, 798], ["attention", 7341, 3717], ["attention out", 449, 337],
+      ["VAE decode", 645, 319], ["VAE encode", 170, 103], ["glue", 677, 15], ["total", 16720, 6608]
+    ]
+  },
+  "pairs": [
+    {"metric": "request, 1024² edit", "unit": "ms", "lower": true, "base": 2484, "now": 1054},
+    {"metric": "request, 2048² edit", "unit": "ms", "lower": true, "base": 14872, "now": 6786},
+    {"metric": "text encoder, 2048²", "unit": "ms", "lower": true, "base": 471, "now": 158},
+    {"metric": "DiT + VAE resident memory", "unit": "GiB", "lower": true, "base": 13.9, "now": 5.48},
+    {"metric": "peak memory, 1024²", "unit": "GiB", "lower": true, "base": 17.2, "now": 10.6},
+    {"metric": "peak memory, 2048²", "unit": "GiB", "lower": true, "base": 26.8, "now": 27.9},
+    {"metric": "DiT load time", "unit": "s", "lower": true, "base": 10.0, "now": 1.6},
+    {"metric": "DiT load peak memory", "unit": "GiB", "lower": true, "base": 19.1, "now": 6.1},
+    {"metric": "achieved compute, higher is better", "unit": "TFLOP/s", "lower": false, "base": 276, "now": 563}
+  ],
+  "gate": {
+    "floor": 0.98,
+    "1024": [0.9765, 1.0, 0.999, 0.999, 0.991, 1.0, 0.998, 0.998, 0.994, 0.999, 0.996, 1.0, 0.999, 0.998, 0.998, 0.999],
+    "2048": [0.998, 0.999, 0.999, 1.0, 0.996, 1.0, 0.997, 0.999, 0.997, 0.999, 0.998, 1.0, 0.999, 0.991, 0.999, 0.999]
+  }
+}

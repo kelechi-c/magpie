@@ -1,8 +1,8 @@
 {
-  "generated": "2026-10-12",
+  "generated": "2026-10-13",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "9ef5a67e1f08fb9bdf66cc5ec5e544b063806442"
+    "head": "888072ae9b0151e70d3353b5ae63826b6ef2fa46"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -14,11 +14,15 @@
   },
   "baseline": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/turbo.json",
-    "sha256": "f665718837dd304e2ecb8584de1446e6ca2439b777811bfec04c56f95363ccf6"
+    "sha256": "20fafe68e21d0cd90217badc71590497e1405351b08f090fbdc2334506c4f7f1"
   },
   "roofline": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/roofline.json",
     "sha256": "d6afb71698118b1cba2002634e55530585674a5bb4b810250b4a3412569facba"
+  },
+  "ladder": {
+    "path": "/home/tensor/Shared/code/ml/magpie/baseline/ladder.json",
+    "sha256": "112657c27356498ca43db201d9ac5e5893d4c4a4245a719ae90f6fcd51c8ef12"
   },
   "charts": {
     "stage-split": [
@@ -137,6 +141,20 @@
       "roofline.cases[edit_1024].spans[vae encode].floor_ms",
       "roofline.cases[edit_1024].request_ms",
       "roofline.cases[edit_1024].floor_request_ms"
+    ],
+    "ladder": [
+      "ladder.steps"
+    ],
+    "stages-then-now": [
+      "ladder.stages.1024",
+      "ladder.stages.2048"
+    ],
+    "now-vs-baseline": [
+      "ladder.pairs"
+    ],
+    "quality-gate": [
+      "ladder.gate.1024",
+      "ladder.gate.2048"
     ]
   }
 }
