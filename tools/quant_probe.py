@@ -8,6 +8,7 @@ linears see fp8- or nvfp4-rounded weights and activations (arithmetic still bf16
 `ranges`: the largest hidden value of every block's mlp over the gate items, which decides how its fp8 scale must be chosen.
 `ablate`: the current build through the gate (images, step error, dinov2), then again with the attention linears fp8-rounded.
 `inside`: the same gate with changes inside attention: fp8 q and k, fp8 v, reference keys merged 2x2.
+`formats`: step error with attention's operands rounded to int8 / fp8 / nvfp4, one half at a time.
 """
 
 import itertools
@@ -358,5 +359,143 @@ def inside(pick: str = "", case: str = "edit_1024") -> str:
     return json.dumps(report)
 
 
+# int8 with one scale per `block` rows of axis 1 (tokens), as sageattention's score matmul sees q and k.
+def int8_rounded(x: Any, block: int) -> Any:
+    import torch
+    import torch.nn.functional as F
+
+    padded = F.pad(x.float(), (0, 0, 0, 0, 0, -x.shape[1] % block)).unflatten(1, (-1, block))
+    scale = padded.abs().amax((2, 4), keepdim=True).clamp_min(1e-12) / 127
+    return (torch.round(padded / scale) * scale).flatten(1, 2)[:, : x.shape[1]]
+
+
+# nvfp4 along the last axis where each block of 16 picks, among its largest value over 6 shrunk by `shrinks`, the
+# scale with the least squared error (clipping the block's outliers can beat covering them).
+def nvfp4_fitted(x: Any, shrinks: tuple[float, ...] = (1.0, 0.85, 0.7, 0.55)) -> Any:
+    import torch
+
+    blocks = x.float().unflatten(-1, (-1, 16))
+    top = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 6
+    tries = torch.stack([grid(blocks / scale, 1, 0, 6.0) * scale for scale in (grid(top * shrink, 3, -100, float("inf")) for shrink in shrinks)])
+    best = (tries - blocks).square().sum(-1, keepdim=True).argmin(0, keepdim=True)
+    return tries.gather(0, best.expand(1, *blocks.shape))[0].flatten(-2).to(x.dtype)
+
+
+# attention with exact fp32 arithmetic on rounded operands, to price a number format before a kernel exists.
+# q, k, v are (1, tokens, heads, dim). `qk`: "int8" (q per 32 tokens, k per 64, mean key subtracted: sageattention 2)
+# or "nvfp4" (blocks of 16 along the head dimension, mean key subtracted). `pv` is a set of flags: "p4" / "v4" put
+# the weights / the values in nvfp4 in blocks of 16 keys (what blackwell's 4-bit instruction contracts over), fp8
+# otherwise (weights on the e4m3 grid below 1, values with one scale per channel); "centre" subtracts each channel's
+# mean value first and adds it back to the output (exact, the weights sum to 1); "fit" picks each block's scale by
+# squared error; "renorm" divides the rounded weights by their sum, as a kernel that sums what it multiplied does.
+def rounded_attention(q: Any, k: Any, v: Any, qk: str, pv: tuple[str, ...]) -> Any:
+    import torch
+
+    centred = k.float() - k.float().mean(1, keepdim=True)
+    q, centred = (int8_rounded(q, 32), int8_rounded(centred, 64)) if qk == "int8" else (nvfp4_rounded(q), nvfp4_rounded(centred))
+    weights = (q.transpose(1, 2).float() @ centred.permute(0, 2, 3, 1) * q.shape[-1] ** -0.5).softmax(-1)  # (1, heads, queries, keys)
+    values = v.float().permute(0, 2, 3, 1)  # (1, heads, dim, keys)
+    mean = values.mean(-1, keepdim=True) if "centre" in pv else 0.0
+    pad = -weights.shape[-1] % 16
+    block4 = lambda x, rounded: rounded(torch.nn.functional.pad(x, (0, pad)))[..., : x.shape[-1]]
+    weights = block4(weights, nvfp4_rounded) if "p4" in pv else grid(weights * 448, 3, -6, 448.0) / 448
+    weights = weights / weights.sum(-1, keepdim=True) if "renorm" in pv else weights
+    values = block4(values - mean, nvfp4_fitted if "fit" in pv else nvfp4_rounded) if "v4" in pv else fp8_rounded(values - mean)
+    return (weights @ (values + mean).transpose(-1, -2)).transpose(1, 2).to(v.dtype)
+
+
+# step error of the current build with every unmasked attention call replaced by `rounded_attention` in one format
+# at a time: which half of attention can take blackwell's 4-bit instruction. 5 gate items, same inputs per step.
+def attention_formats(case: str = "edit_1024", items: str = "5") -> str:
+    import magpie.dit as dit_module
+    from gate import load_port
+
+    dit, _ = load_port("turbo")
+    plain = dit_module.attend
+    dit_module.SAGE_CACHE = False
+    probes = {"sageattention 2 (the real kernel)": None, "int8 qk, fp8 pv": ("int8", ()), "int8 qk, nvfp4 p": ("int8", ("p4",)),
+              "int8 qk, nvfp4 pv": ("int8", ("p4", "v4")), "int8 qk, nvfp4 pv, v centred and fitted": ("int8", ("p4", "v4", "centre", "fit")),
+              "int8 qk, nvfp4 pv, v centred and fitted, renormalised": ("int8", ("p4", "v4", "centre", "fit", "renorm")),
+              "nvfp4 qk, fp8 pv": ("nvfp4", ())}
+    report: dict[str, Any] = {}
+    for label, formats in probes.items():
+        dit_module.attend = plain if formats is None else (
+            lambda q, k, v, bound, mask=None, formats=formats: plain(q, k, v, bound, mask) if mask is not None else rounded_attention(q, k, v, *formats))
+        steps = [e for item in step_pass(dit, case, int(items)) for e in item]
+        report[label] = {"mean_step_error": round(sum(steps) / len(steps), 4), "worst_step_error": round(max(steps), 4)}
+        print("formats", label, json.dumps(report[label]), flush=True)
+    return json.dumps(report)
+
+
+FIT = (1.0, 0.85, 0.7, 0.55)
+
+
+# a stand-in for `dit.attend` that sends unmasked calls to the native sm_120 kernel (native/attn.cu). `values` is None
+# for the 8-bit build, else (centre, shrinks, rotate) for the build whose weights x values matmul is 4-bit: see
+# `tune_attn.nvfp4_values`; rotated values are rounded in a hadamard basis of each head's channels and the output is
+# turned back, which a build would fold into the to_v and to_out weights. operands are rounded per call in torch:
+# this prices the arithmetic, not the speed.
+def native_attend(values: tuple | None) -> Any:
+    import torch
+
+    import magpie.dit as dit_module
+    from tune_attn import BASE, compiled, nvfp4_values, quantised
+
+    plain, config = dit_module.attend, {**BASE, "PV4": int(values is not None)}
+    rotate = values is not None and values[2]
+    hadamard = torch.ones(1, 1, device="cuda")
+    for _ in range(7):
+        hadamard = torch.cat([torch.cat([hadamard, hadamard], 1), torch.cat([hadamard, -hadamard], 1)], 0)
+    hadamard = hadamard / 128**0.5  # symmetric and orthogonal: its own inverse
+
+    def attend(q: Any, k: Any, v: Any, bound: float, mask: Any = None) -> Any:
+        if mask is not None:
+            return plain(q, k, v, bound, mask)
+        v = (v.float() @ hadamard).to(v.dtype) if rotate else v
+        q8, k8, v8, q_scale, k_scale, v_scale = quantised(q.contiguous(), k.contiguous(), v, config)
+        v8, v_scale = nvfp4_values(v, *values[:2]) if values else (v8, v_scale)
+        out = torch.empty_like(q)
+        compiled(config).attend(q8, k8, v8, out, q_scale, k_scale, v_scale, q.shape[-1] ** -0.5)
+        return (out.float() @ hadamard).to(out.dtype) if rotate else out
+
+    return attend
+
+
+# step error of the current build on the native kernel, for the 8-bit build and each way of rounding the values in
+# the 4-bit one. 5 gate items, each step fed the baseline's own inputs.
+def native_formats(case: str = "edit_1024", items: str = "5") -> str:
+    import magpie.dit as dit_module
+    from gate import load_port
+
+    dit, _ = load_port("turbo")
+    plain = dit_module.attend
+    dit_module.SAGE_CACHE = False
+    probes = {"8-bit fork": None, "4-bit pv": (False, (1.0,), False), "4-bit pv, centred": (True, (1.0,), False), "4-bit pv, centred, fitted": (True, FIT, False),
+              "4-bit pv, centred, rotated": (True, (1.0,), True), "4-bit pv, centred, fitted, rotated": (True, FIT, True)}
+    report: dict[str, Any] = {}
+    for label, values in probes.items():
+        dit_module.attend = plain
+        dit_module.attend = native_attend(values)
+        steps = [e for item in step_pass(dit, case, int(items)) for e in item]
+        report[label] = {"mean_step_error": round(sum(steps) / len(steps), 4), "worst_step_error": round(max(steps), 4)}
+        print("native", label, json.dumps(report[label]), flush=True)
+    return json.dumps(report)
+
+
+# the image gate with attention on the native kernel's 4-bit weights x values matmul (values centred, fitted, rotated).
+def native_gate(cases: str = "edit16_2048,edit16_1024", tag: str = "pv4") -> str:
+    import magpie.dit as dit_module
+    from gate import OUT_ROOT, gate_pass, load_port, verdict
+
+    dit, vae = load_port("turbo")
+    dit_module.SAGE_CACHE = False
+    dit_module.attend = native_attend((True, FIT, True))
+    folder = pl.Path(OUT_ROOT) / "baseline" / "turbo"
+    result = {"magpie": gate_pass(dit, vae, "turbo", cases.split(","), folder, pl.Path(OUT_ROOT) / "gate" / tag / "turbo", {})}
+    result["verdict"] = verdict(result, json.loads((pl.Path(__file__).resolve().parent.parent / "baseline" / "turbo.json").read_text()))
+    (pl.Path(OUT_ROOT) / "gate" / f"{tag}-turbo.json").write_text(json.dumps(result, indent=1))
+    return json.dumps(result["verdict"], indent=1)
+
+
 if __name__ == "__main__":
-    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate, "inside": inside, "lowbits": lowbits}[sys.argv[1]](*sys.argv[2:]))
+    print({"speed": speed, "quality": quality, "ranges": ranges, "ablate": ablate, "inside": inside, "lowbits": lowbits, "formats": attention_formats, "native": native_formats, "native-gate": native_gate}[sys.argv[1]](*sys.argv[2:]))
