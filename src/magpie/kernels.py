@@ -396,13 +396,53 @@ def pack_mlp(gate: Tensor, proj: Tensor, out: Tensor) -> Fp8Mlp:
     return Fp8Mlp(g, p, o, g_step, p_step, o_step)
 
 
-# layer norm and modulation of one row. x is (rows, WIDTH) bf16; mod is (mod_rows, WIDTH) bf16 with mod_rows 1 or
-# the token count. FP8 writes the row as fp8 with its own step (row = fp8 * step); otherwise it is written as bf16.
+# the residual stream between two norms: `branch`, or skip + gate * branch when `skip` is set. a block leaves that sum
+# for the next norm, which forms it as it reads the rows and writes it over `branch`: the sum is never written by one
+# kernel only to be read back by the next.
+class Stream(NamedTuple):
+    branch: Tensor
+    skip: Tensor | None = None
+    gate: Tensor | None = None
+
+
+# the stream's sum, formed in place over `branch`; what every reader but a fused norm takes.
+def formed(x: Stream) -> Tensor:
+    return x.branch if x.skip is None else torch.addcmul(x.skip, x.gate, x.branch, out=x.branch)
+
+
+# a (B, S, width) stream as (B * S, width) rows, the gate (B, 1 or S, width) as (1 or B * S, width).
+def flat(x: Stream) -> Stream:
+    return Stream(x.branch.flatten(0, 1), *(None if part is None else part.flatten(0, 1).contiguous() for part in x[1:]))
+
+
+# what a norm kernel takes for a flat stream's residual: skip, gate, gate rows, and whether there is one.
+def residual(x: Stream) -> tuple[Tensor, Tensor, int, bool]:
+    return (x.branch, x.branch, 1, False) if x.skip is None else (x.skip, x.gate, x.gate.shape[0], True)
+
+
+# row `row` of a stream in fp32. with RESIDUAL it is skip + gate * x, rounded to bf16 as torch.addcmul leaves it and
+# written over x, so the caller's branch tensor holds the stream afterwards.
 @triton.jit
-def norm_kernel(x_ptr, mod_ptr, out_ptr, step_ptr, mod_rows, eps, WIDTH: tl.constexpr, FP8: tl.constexpr):
+def stream_row(x_ptr, skip_ptr, gate_ptr, gate_rows, row, WIDTH: tl.constexpr, RESIDUAL: tl.constexpr):
+    at = row * WIDTH + tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + at).to(tl.float32)
+    if RESIDUAL:
+        gate = tl.load(gate_ptr + (row % gate_rows) * WIDTH + tl.arange(0, WIDTH)).to(tl.float32)
+        x = (tl.load(skip_ptr + at).to(tl.float32) + gate * x).to(tl.bfloat16)
+        tl.store(x_ptr + at, x)
+        x = x.to(tl.float32)
+    return x
+
+
+# layer norm and modulation of one row of a stream (`stream_row`). x is (rows, WIDTH) bf16; mod is (mod_rows, WIDTH) bf16
+# with mod_rows 1 or the token count. FP8 writes the row as fp8 with its own step (row = fp8 * step); otherwise it is
+# written as bf16.
+@triton.jit
+def norm_kernel(x_ptr, skip_ptr, gate_ptr, gate_rows, mod_ptr, out_ptr, step_ptr, mod_rows, eps, WIDTH: tl.constexpr, FP8: tl.constexpr,
+                RESIDUAL: tl.constexpr):
     row = tl.program_id(0)
     at = tl.arange(0, WIDTH)
-    x = tl.load(x_ptr + row * WIDTH + at).to(tl.float32)
+    x = stream_row(x_ptr, skip_ptr, gate_ptr, gate_rows, row, WIDTH, RESIDUAL)
     x = x - tl.sum(x, axis=0) / WIDTH
     y = x * tl.rsqrt(tl.sum(x * x, axis=0) / WIDTH + eps) * tl.load(mod_ptr + (row % mod_rows) * WIDTH + at).to(tl.float32)
     if FP8:
@@ -492,17 +532,19 @@ def project_fp8_kernel(x_ptr, x_step_ptr, w_ptr, w_step_ptr, skip_ptr, gate_ptr,
     tl.store(out_ptr + at, out.to(tl.bfloat16), mask=live[:, None])
 
 
-# layer_norm(x) * mod as fp8 rows and their steps. x is (rows, width) bf16, mod is (1 or tokens, width) bf16.
-def fp8_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
-    out, step = torch.empty_like(x, dtype=torch.float8_e4m3fn), x.new_empty(x.shape[0], dtype=torch.float32)
-    norm_kernel[(x.shape[0],)](x, mod, out, step, mod.shape[0], eps, WIDTH=x.shape[1], FP8=True, num_warps=8)
+# layer_norm(x) * mod as fp8 rows and their steps. x is a flat stream (rows, width) bf16, formed in place; mod is
+# (1 or tokens, width) bf16.
+def fp8_norm(x: Stream, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    out, step = torch.empty_like(x.branch, dtype=torch.float8_e4m3fn), x.branch.new_empty(x.branch.shape[0], dtype=torch.float32)
+    skip, gate, gate_rows, fused = residual(x)
+    norm_kernel[(x.branch.shape[0],)](x.branch, skip, gate, gate_rows, mod, out, step, mod.shape[0], eps, WIDTH=x.branch.shape[1], FP8=True, RESIDUAL=fused, num_warps=8)
     return out, step
 
 
 # layer_norm(x) * mod in bf16, one read and one write. x is (B, S, width) bf16, mod is (B, 1 or S, width) bf16.
 def norm_mod(x: Tensor, mod: Tensor, eps: float) -> Tensor:
     out, mod = torch.empty_like(x), mod.flatten(0, 1).contiguous()
-    norm_kernel[(x.shape[0] * x.shape[1],)](x, mod, out, out, mod.shape[0], eps, WIDTH=x.shape[2], FP8=False, num_warps=8)
+    norm_kernel[(x.shape[0] * x.shape[1],)](x, x, x, 1, mod, out, out, mod.shape[0], eps, WIDTH=x.shape[2], FP8=False, RESIDUAL=False, num_warps=8)
     return out
 
 
@@ -545,15 +587,14 @@ def fp8_project(x: Tensor, x_step: Tensor, linear: Fp8Linear, out: Tensor | None
     return out
 
 
-# a block's whole mlp branch and its residual, `x + gate * out(silu(gate_layer(n)) * proj(n))` with
-# n = layer_norm(x) * mod, in four launches: norm to fp8, both input matmuls with the swiglu in their tail, the
-# hidden tensor moved onto one step per row, the output matmul with the residual in its tail.
-# x is (B, S, width) bf16; mod and gate are (B, 1 or S, width).
-def mlp_fp8(x: Tensor, mod: Tensor, gate: Tensor, packed: Fp8Mlp, eps: float) -> Tensor:
-    flat = x.flatten(0, 1)
-    rows, step = fp8_norm(flat, mod.flatten(0, 1).contiguous(), eps)
+# a block's whole mlp branch, `out(silu(gate_layer(n)) * proj(n))` with n = layer_norm(x) * mod, in four launches: norm
+# to fp8 (forming the stream x), both input matmuls with the swiglu in their tail, the hidden tensor moved onto one step
+# per row, the output matmul. returns the stream x + gate * branch, the sum left to the next norm.
+# x is a (B, S, width) bf16 stream; mod and gate are (B, 1 or S, width).
+def mlp_fp8(x: Stream, mod: Tensor, gate: Tensor, packed: Fp8Mlp, eps: float) -> Stream:
+    rows, step = fp8_norm(flat(x), mod.flatten(0, 1).contiguous(), eps)
     hidden, steps = fp8_swiglu(rows, step, packed)
-    return fp8_project(hidden, fp8_align(hidden, steps), (packed.out, packed.out_step), skip=flat, gate=gate.flatten(0, 1).contiguous()).view_as(x)
+    return Stream(fp8_project(hidden, fp8_align(hidden, steps), (packed.out, packed.out_step)).view_as(x.branch), x.branch, gate)
 
 
 # the vae's norm for P pixels of a channels-last image: each pixel's channel vector is scaled to length
@@ -641,10 +682,10 @@ def store_mx(y, out_ptr, sf_ptr, row, first, width, cells, WIDTH: tl.constexpr):
 
 # layer norm and modulation of one row, as `norm_kernel`, written as mxfp8.
 @triton.jit
-def norm_mx_kernel(x_ptr, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr):
+def norm_mx_kernel(x_ptr, skip_ptr, gate_ptr, gate_rows, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr, RESIDUAL: tl.constexpr):
     row = tl.program_id(0)
     at = tl.arange(0, WIDTH)
-    x = tl.load(x_ptr + row * WIDTH + at).to(tl.float32)
+    x = stream_row(x_ptr, skip_ptr, gate_ptr, gate_rows, row, WIDTH, RESIDUAL)
     x = x - tl.sum(x, axis=0) / WIDTH
     y = x * tl.rsqrt(tl.sum(x * x, axis=0) / WIDTH + eps) * tl.load(mod_ptr + (row % mod_rows) * WIDTH + at).to(tl.float32)
     store_mx(y, out_ptr, sf_ptr, row, 0, WIDTH, cells, WIDTH)
@@ -680,10 +721,12 @@ def mx_rows(x: Tensor, swiglu: bool = False) -> tuple[Tensor, Tensor]:
     return out, sf
 
 
-# layer_norm(x) * mod as mxfp8. x is (rows, width) bf16, mod (1 or rows, width) bf16.
-def mx_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
-    out, sf = mx_empty(x, *x.shape)
-    norm_mx_kernel[(x.shape[0],)](x, mod, out, sf, mod.shape[0], eps, -(-x.shape[1] // 128), WIDTH=x.shape[1], num_warps=8)
+# layer_norm(x) * mod as mxfp8. x is a flat stream (rows, width) bf16, formed in place; mod (1 or rows, width) bf16.
+def mx_norm(x: Stream, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    rows, width = x.branch.shape
+    out, sf = mx_empty(x.branch, rows, width)
+    skip, gate, gate_rows, fused = residual(x)
+    norm_mx_kernel[(rows,)](x.branch, skip, gate, gate_rows, mod, out, sf, mod.shape[0], eps, -(-width // 128), WIDTH=width, RESIDUAL=fused, num_warps=8)
     return out, sf
 
 
@@ -712,22 +755,23 @@ def block_rows(x: Tensor, first: int) -> Tensor:
     return x if x.shape[0] == 1 else x[first : first + MLP_ROWS]
 
 
-# `branch(rows, mod, gate, out)` over MLP_ROWS rows at a time of x (B, S, width) and its (B, 1 or S, width) mod and gate,
+# `branch(rows, mod, out)` over MLP_ROWS rows at a time of the stream x (B, S, width) and its (B, 1 or S, width) mod,
 # each block written into its rows of one output: the mlp's wide hidden tensors then exist for one block at a time.
-def by_blocks(branch: Callable[[Tensor, Tensor, Tensor, Tensor], Tensor], x: Tensor, mod: Tensor, gate: Tensor) -> Tensor:
-    flat, mod, gate = x.flatten(0, 1), mod.flatten(0, 1).contiguous(), gate.flatten(0, 1).contiguous()
-    out = torch.empty_like(flat)
-    for first in range(0, flat.shape[0], MLP_ROWS):
-        branch(*(block_rows(part, first) for part in (flat, mod, gate, out)))
-    return out.view_as(x)
+# returns the stream x + gate * output, the sum left to the next norm.
+def by_blocks(branch: Callable[[Stream, Tensor, Tensor], Tensor], x: Stream, mod: Tensor, gate: Tensor) -> Stream:
+    rows, mod = flat(x), mod.flatten(0, 1).contiguous()
+    out = torch.empty_like(rows.branch)
+    for first in range(0, out.shape[0], MLP_ROWS):
+        branch(Stream(*(None if part is None else block_rows(part, first) for part in rows)), block_rows(mod, first), block_rows(out, first))
+    return Stream(out.view_as(x.branch), x.branch, gate)
 
 
-# a block's mlp branch and residual as `mlp_fp8`, on the native matmul: norm to mxfp8, one matmul for gate and proj
-# together, the swiglu and requantisation in one pass, the output matmul, the residual; MLP_ROWS rows at a time.
-def mlp_mx(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
-    def branch(rows: Tensor, mod: Tensor, gate: Tensor, out: Tensor) -> Tensor:
+# a block's mlp branch as `mlp_fp8`, on the native matmul: norm to mxfp8, one matmul for gate and proj together, the
+# swiglu and requantisation in one pass, the output matmul; MLP_ROWS rows at a time.
+def mlp_mx(x: Stream, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Stream:
+    def branch(rows: Stream, mod: Tensor, out: Tensor) -> Tensor:
         hidden = mx_rows(mx_project(*mx_norm(rows, mod, eps), packed.hidden), swiglu=True)
-        return mx_project(*hidden, packed.out, out, rows, gate)
+        return mx_project(*hidden, packed.out, out)
 
     return by_blocks(branch, x, mod, gate)
 
@@ -761,10 +805,10 @@ def store_nv(even, odd, out_ptr, sf_ptr, row, first, width, cells, HALF: tl.cons
 
 # layer norm and modulation of one row, as `norm_kernel`, written as nvfp4.
 @triton.jit
-def norm_nv_kernel(x_ptr, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr):
+def norm_nv_kernel(x_ptr, skip_ptr, gate_ptr, gate_rows, mod_ptr, out_ptr, sf_ptr, mod_rows, eps, cells, WIDTH: tl.constexpr, RESIDUAL: tl.constexpr):
     row = tl.program_id(0)
     at = tl.arange(0, WIDTH)
-    x = tl.load(x_ptr + row * WIDTH + at).to(tl.float32)
+    x = stream_row(x_ptr, skip_ptr, gate_ptr, gate_rows, row, WIDTH, RESIDUAL)
     x = x - tl.sum(x, axis=0) / WIDTH
     y = tl.reshape(x * tl.rsqrt(tl.sum(x * x, axis=0) / WIDTH + eps) * tl.load(mod_ptr + (row % mod_rows) * WIDTH + at).to(tl.float32), (WIDTH // 2, 2))
     even, odd = tl.split(y)
@@ -800,9 +844,12 @@ def nv_rows(x: Tensor, swiglu: bool = False, scale: float = 1.0) -> tuple[Tensor
     return out, sf
 
 
-def nv_norm(x: Tensor, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
-    out, sf = nv_empty(x, *x.shape)
-    norm_nv_kernel[(x.shape[0],)](x, mod, out, sf, mod.shape[0], eps, -(-x.shape[1] // 64), WIDTH=x.shape[1], num_warps=8)
+# layer_norm(x) * mod as nvfp4, as `mx_norm`.
+def nv_norm(x: Stream, mod: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    rows, width = x.branch.shape
+    out, sf = nv_empty(x.branch, rows, width)
+    skip, gate, gate_rows, fused = residual(x)
+    norm_nv_kernel[(rows,)](x.branch, skip, gate, gate_rows, mod, out, sf, mod.shape[0], eps, -(-width // 64), WIDTH=width, RESIDUAL=fused, num_warps=8)
     return out, sf
 
 
@@ -835,11 +882,11 @@ def swiglu_block(x: Tensor, packed: MxMlp, nv: set[str]) -> Tensor:
 
 
 # `mlp_mx` with the matmuls named in NV in nvfp4; `alpha` undoes the scaling of weights and swiglu outputs.
-def mlp_nv(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
-    def branch(rows: Tensor, mod: Tensor, gate: Tensor, out: Tensor) -> Tensor:
+def mlp_nv(x: Stream, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Stream:
+    def branch(rows: Stream, mod: Tensor, out: Tensor) -> Tensor:
         first = mx_project(*nv_norm(rows, mod, eps), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in NV else mx_project(*mx_norm(rows, mod, eps), packed.hidden)
         hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in NV else (mx_rows(first, True), 1.0)
-        return mx_project(*hidden, packed.out, out, rows, gate, alpha)
+        return mx_project(*hidden, packed.out, out, alpha=alpha)
 
     return by_blocks(branch, x, mod, gate)
 

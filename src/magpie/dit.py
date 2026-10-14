@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep,
-                            sage, sage_cached, sage_pack, sage_refit, sage_tail, sage_unpack, sage_write)
+from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
+                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_tail, sage_unpack, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -179,10 +179,12 @@ class Attention(nn.Module):
 
     # layer_norm(x) * mod projected to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
     # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. a projection with
-    # fp8 weights is an fp8 matmul on the norm's fp8 rows; the others read the norm's bf16 output.
-    def qkv(self, x: Tensor, mod: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor]:
-        packed = self.packed if fp8_ready(self.packed, x) else Fp8Attention(None, None, None, None)
-        rows = fp8_norm(x.flatten(0, 1), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
+    # fp8 weights is an fp8 matmul on the norm's fp8 rows, whose kernel also forms the stream x; the others read
+    # the norm's bf16 output. returns (x formed, q, k, v).
+    def qkv(self, x: Stream, mod: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        packed = self.packed if fp8_ready(self.packed, x.branch) else Fp8Attention(None, None, None, None)
+        rows = fp8_norm(flat(x), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
+        x = formed(x) if rows is None else x.branch
         n = normed(x, mod, self.eps) if not all(packed[:3]) else None
 
         def project(linear: nn.Linear, fp8: tuple[Tensor, Tensor] | None, out: Tensor | None = None) -> Tensor:
@@ -193,14 +195,13 @@ class Attention(nn.Module):
 
         q = prep(project(self.to_q, packed.q), self.norm_q.weight, rope, self.eps)
         k = prep(project(self.to_k, packed.k), self.norm_k.weight, rope, self.eps, None if into is None else into[0])
-        return q, k, project(self.to_v, packed.v, None if into is None else into[1])
+        return x, q, k, project(self.to_v, packed.v, None if into is None else into[1])
 
-    # the attention branch's residual: skip + gate * to_out(attended).
-    def out(self, attended: Tensor, skip: Tensor, gate: Tensor) -> Tensor:
+    # the attention branch's residual: the stream skip + gate * to_out(attended), the sum left to the next norm.
+    def out(self, attended: Tensor, skip: Tensor, gate: Tensor) -> Stream:
         if fp8_ready(self.packed, skip) and self.packed.out is not None:
-            rows = fp8_rows(attended.reshape(-1, skip.shape[-1]))
-            return fp8_project(*rows, self.packed.out, skip=skip.flatten(0, 1), gate=gate.flatten(0, 1).contiguous()).view_as(skip)
-        return torch.addcmul(skip, gate, self.to_out[0](attended.flatten(2, 3)))
+            return Stream(fp8_project(*fp8_rows(attended.reshape(-1, skip.shape[-1])), self.packed.out).view_as(skip), skip, gate)
+        return Stream(self.to_out[0](attended.flatten(2, 3)), skip, gate)
 
 
 class SwiGLU(nn.Module):
@@ -216,10 +217,13 @@ class SwiGLU(nn.Module):
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 
-# a block's mlp branch with its residual: `x + gate * mlp(layer_norm(x) * mod)` defines it; bf16 tensors on
-# the gpu take the fp8 kernels when the mlp carries packed fp8 weights.
-def feed(mlp: SwiGLU, x: Tensor, mod: Tensor, gate: Tensor, eps: float) -> Tensor:
-    return mlp_fp8(x, mod, gate, mlp.packed, eps) if fp8_ready(mlp.packed, x) else x + gate * mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod)
+# a block's mlp branch with its residual: the stream `x + gate * mlp(layer_norm(x) * mod)`, the sum left to the next
+# norm; bf16 tensors on the gpu take the fp8 kernels when the mlp carries packed fp8 weights.
+def feed(mlp: SwiGLU, x: Stream, mod: Tensor, gate: Tensor, eps: float) -> Stream:
+    if fp8_ready(mlp.packed, x.branch):
+        return mlp_fp8(x, mod, gate, mlp.packed, eps)
+    x = formed(x)
+    return Stream(mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod), x, gate)
 
 
 # one single-stream block. it owns no modulation: `mod` = (scale1, gate1, scale2, gate2) is computed
@@ -234,8 +238,8 @@ class Block(nn.Module):
     # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache. on the sage
     # path they are quantised once here and returned in that form, sharing `tail` (an earlier layer's) when given;
     # `keep` (row numbers) also keeps those rows in bf16.
-    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout, keep: Tensor | None = None, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Tensor, KV | SageKV]:
-        q, k, v = self.attn.qkv(x, mod[0], lay.rope)
+    def prefill(self, x: Stream, mod: tuple[Tensor, ...], lay: Layout, keep: Tensor | None = None, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Stream, KV | SageKV]:
+        x, q, k, v = self.attn.qkv(x, mod[0], lay.rope)
         packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
         x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
@@ -243,10 +247,10 @@ class Block(nn.Module):
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
     # keys and values are written into the end of the cache's bf16 buffers, so nothing is concatenated; a SageKV
     # then requantises just its tail (held rows and target) next to its already quantised prefix.
-    def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV | SageKV) -> Tensor:
-        packed = isinstance(cache, SageKV)
+    def decode(self, x: Stream, mod: tuple[Tensor, ...], rope: Tensor, cache: KV | SageKV) -> Stream:
+        packed, rows = isinstance(cache, SageKV), x.branch.shape[1]
         k, v = sage_tail(cache) if packed else cache
-        q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -x.shape[1] :], v[:, -x.shape[1] :]))
+        x, q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
         attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
         x = self.attn.out(attended, x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
@@ -256,15 +260,15 @@ class Block(nn.Module):
     # triangle, as in `prefill`, but the condition images' rows come dequantised from the cache (only the text rows
     # are kept in bf16); the target reads the quantised cache, as in `decode`. returns the cache holding this
     # request's text rows.
-    def resume(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> tuple[Tensor, SageKV]:
+    def resume(self, x: Stream, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> tuple[Stream, SageKV]:
         k, v = sage_tail(cache)
-        rows = x.shape[1]
-        q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
+        rows = x.branch.shape[1]
+        x, q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
         keys, values = (torch.cat([old, new[:, : new.shape[1] - rows + texts]], dim=1) for old, new in zip(sage_unpack(cache), (k, v)))
         mask = torch.cat([q.new_ones(texts, keys.shape[1] - texts, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
         attended = torch.cat([attend(q[:, :texts], keys, values, self.attn.bound, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
         x = self.attn.out(attended, x, mod[1])
-        held = tuple(rows[:, : rows.shape[1] - x.shape[1] + texts].clone() for rows in (k, v))
+        held = tuple(part[:, : part.shape[1] - rows + texts].clone() for part in (k, v))
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), cache._replace(held=held)
 
 
@@ -334,10 +338,11 @@ class Dit(nn.Module):
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
         mod, final = self.modulate(temb, torch.arange(lay.image.numel(), device=x.device) >= lay.prefix)
         cache: list[KV | SageKV] = []
+        x = Stream(x)
         for block in self.transformer_blocks:
             x, kv = block.prefill(x, mod, lay, early_text(lay) if keep else None, getattr(cache[-1], "tail", None) if cache else None)
             cache = cache + [kv]
-        return self.head(x[:, lay.prefix :], final[:, lay.prefix :]), cache
+        return self.head(formed(x)[:, lay.prefix :], final[:, lay.prefix :]), cache
 
     # first step when `cache` was kept from an earlier request on the same condition images (`prefill` with `keep`):
     # the rows up to the last image's end are prompt-independent (the prompt follows the images, and both the text
@@ -345,23 +350,23 @@ class Dit(nn.Module):
     # back refitted to this request's sequence length.
     def resume(self, target: Tensor, text: Tensor, sigma: Tensor, lay: Layout, cache: list[SageKV]) -> tuple[Tensor, list[SageKV]]:
         texts = lay.prefix - lay.head
-        x = torch.cat([self.text_embed(text[:, text.shape[1] - texts :]), self.img_in(target)], dim=1)
+        x = Stream(torch.cat([self.text_embed(text[:, text.shape[1] - texts :]), self.img_in(target)], dim=1))
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
-        mod, final = self.modulate(temb, torch.arange(x.shape[1], device=x.device) >= texts)
+        mod, final = self.modulate(temb, torch.arange(x.branch.shape[1], device=target.device) >= texts)
         resumed: list[SageKV] = []
         for block, kv in zip(self.transformer_blocks, cache):
             x, kv = block.resume(x, mod, lay.rope[lay.head :], sage_refit(kv, lay.image.numel(), lay.head, resumed[-1].tail if resumed else None), texts)
             resumed = resumed + [kv]
-        return self.head(x[:, texts:], final[:, texts:]), resumed
+        return self.head(formed(x)[:, texts:], final[:, texts:]), resumed
 
     # later steps: only the target tokens are recomputed, attending to the cached prefix. batch 1 only: the
     # kernels write the new keys and values into the buffers' tails, which are contiguous for a single sequence.
     def decode(self, target: Tensor, sigma: Tensor, lay: Layout, cache: list[KV | SageKV]) -> Tensor:
         assert target.shape[0] == 1
-        x = self.img_in(target)
+        x = Stream(self.img_in(target))
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
         mod, final = self.modulate(temb, None)
         rope = lay.rope[lay.prefix :]
         for block, kv in zip(self.transformer_blocks, cache):
             x = block.decode(x, mod, rope, kv)
-        return self.head(x, final)
+        return self.head(formed(x), final)
