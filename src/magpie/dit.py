@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
-                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_unpack, sage_write)
+                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -90,12 +90,6 @@ def layout(slots: Tensor, shapes: list[tuple[int, int]], cfg: DitConfig) -> Layo
     rope = torch.cat([table[torch.tensor(axis)] for table, axis in zip(tables, axes)], dim=-1)
     head = max([end for _, end, is_text in runs if not is_text], default=0)
     return Layout(repeats, image, prefix, head, runs, rope.to(image.device))
-
-
-# row numbers of the text runs before the last condition image's end: the rows a kept cache holds in bf16.
-def early_text(lay: Layout) -> Tensor:
-    rows = [row for start, end, is_text in lay.segments if is_text and end <= lay.head for row in range(start, end)]
-    return torch.tensor(rows, dtype=torch.long, device=lay.rope.device)
 
 
 # rms norm over the last axis, statistics in fp32, as diffusers.RMSNorm does.
@@ -239,8 +233,8 @@ class Block(nn.Module):
 
     # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache. on the sage
     # path they are quantised once here and returned in that form, sharing `tail` (an earlier layer's) when given;
-    # `keep` (row numbers) also keeps those rows in bf16.
-    def prefill(self, x: Stream, mod: tuple[Tensor, ...], lay: Layout, keep: Tensor | None = None, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Stream, KV | SageKV]:
+    # `keep` also keeps the rows before `lay.head` in bf16.
+    def prefill(self, x: Stream, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Stream, KV | SageKV]:
         x, q, k, v = self.attn.qkv(x, mod[0], lay.rope)
         packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
         x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
@@ -263,16 +257,15 @@ class Block(nn.Module):
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
     # first step of a later request on the same condition images: only the rows after the kept head are computed,
-    # the closing text run (`texts` rows) then the target. the text run reads every earlier row under its causal
-    # triangle, as in `prefill`, but the condition images' rows come dequantised from the cache (only the text rows
-    # are kept in bf16); the target reads the quantised cache, as in `decode`. returns the cache holding this
-    # request's text rows.
+    # the closing text run (`texts` rows) then the target. the text run reads the head's kept bf16 keys and values
+    # under its causal triangle, as in `prefill`; the target reads the quantised cache, as in `decode`. returns the
+    # cache holding this request's text rows.
     def resume(self, x: Stream, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> tuple[Stream, SageKV]:
         k, v = sage_tail(cache)
-        rows = x.branch.shape[1]
+        rows, held = x.branch.shape[1], cache.head[0].shape[1]
         x, q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
-        keys, values = (torch.cat([old, new[:, : new.shape[1] - rows + texts]], dim=1) for old, new in zip(sage_unpack(cache), (k, v)))
-        mask = torch.cat([q.new_ones(texts, keys.shape[1] - texts, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
+        keys, values = (torch.cat([old, new[:, -rows : texts - rows]], dim=1) for old, new in zip(cache.head, (k, v)))
+        mask = torch.cat([q.new_ones(texts, held, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
         attended = torch.cat([attend(q[:, :texts], keys, values, self.attn.bound, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
         x = self.attn.out(attended, x, mod[1])
         held = tuple(part[:, : part.shape[1] - rows + texts].clone() for part in (k, v))
@@ -335,7 +328,7 @@ class Dit(nn.Module):
 
     # first step: runs the whole joint sequence and returns (velocity for the target tokens, cache).
     # latents: (B, R + N, 64) condition-image latents then the noisy target; text: (B, T, 4096).
-    # `keep` also keeps each layer's bf16 keys and values of the text rows before `lay.head`, which `resume` needs.
+    # `keep` also keeps each layer's bf16 keys and values before `lay.head`, which is what `resume` needs.
     def prefill(self, latents: Tensor, text: Tensor, sigma: Tensor, lay: Layout, keep: bool = False) -> tuple[Tensor, list[KV | SageKV]]:
         batch, target = latents.shape[0], lay.image.numel() - lay.prefix
         text = self.text_embed(text)
@@ -347,7 +340,7 @@ class Dit(nn.Module):
         cache: list[KV | SageKV] = []
         x = Stream(x)
         for block in self.transformer_blocks:
-            x, kv = block.prefill(x, mod, lay, early_text(lay) if keep else None, getattr(cache[-1], "tail", None) if cache else None)
+            x, kv = block.prefill(x, mod, lay, keep, getattr(cache[-1], "tail", None) if cache else None)
             cache = cache + [kv]
         return self.head(formed(x)[:, lay.prefix :], final[:, lay.prefix :]), cache
 
