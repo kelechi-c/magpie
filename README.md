@@ -91,7 +91,9 @@ curl -s https://api.runpod.ai/v2/<endpoint>/runsync -H "Authorization: Bearer <r
 ```
 
 When a worker has to start first, `/runsync` can return `IN_QUEUE` with an `id` before the job finishes. Poll
-`/status/<id>` until it reads `COMPLETED`. A worker loads the model in about a minute.
+`/status/<id>` until it reads `COMPLETED`. A cold start is slow: reading the weights from a network volume took
+about four minutes, plus any wait for a free GPU (another four on one try), plus a 14 s first job. Warm jobs take
+1 s (text-to-image) to 6 s (2048² edit) of execution.
 
 ## from python
 
