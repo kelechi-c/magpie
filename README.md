@@ -76,8 +76,10 @@ curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-
 | `seed` | 0 | |
 | `format` | `png` | `png`, `jpeg` or `webp` |
 
-The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib` and `ms` (`fetch`, `text`,
-`dit_vae`, `encode_image`). Out of memory comes back as status 507. `GET /health` reports the card.
+The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib`, `remembered` and `ms` (`fetch`, `text`,
+`dit_vae`, `encode_image`). The server keeps the text encoder's output for its last eight prompt and image pairs, so a
+repeat with another seed or size skips the encoder (`remembered` is then true). Out of memory comes back as status 507.
+`GET /health` reports the card.
 
 On a card under 40 GiB the text encoder steps aside to host memory when a request is too large to share
 the card with it (any 2048² request, or more than three 1024² references), which costs about 0.4 s on
@@ -88,6 +90,8 @@ that request and the next. It needs about 16 GiB of free host memory.
 | `MAGPIE_TOKEN` | when set, requests must carry `Authorization: Bearer <token>` |
 | `MAGPIE_ENCODER=nvfp4` | a calibrated 4-bit text encoder: 9 GiB less on the card, slightly different images |
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
+| `MAGPIE_PROMPTS` | how many prompt and image pairs to remember (8; 0 turns it off) |
+| `MAGPIE_COMPILE_VAE=0` | leave the VAE decoder uncompiled (compiling costs the first decode of each size) |
 | `HF_HOME` | where weights are cached |
 
 ## from python
