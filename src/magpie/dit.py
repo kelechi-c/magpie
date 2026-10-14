@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep,
-                            sage, sage_cached, sage_pack, sage_refit, sage_write)
+                            sage, sage_cached, sage_pack, sage_refit, sage_tail, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -226,19 +226,19 @@ class Block(nn.Module):
         self.img_mlp = SwiGLU(cfg)
 
     # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache. on the sage
-    # path they are quantised once here and returned in that form.
-    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False) -> tuple[Tensor, KV | SageKV]:
+    # path they are quantised once here and returned in that form, sharing `tail` (an earlier layer's) when given.
+    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Tensor, KV | SageKV]:
         q, k, v = self.attn.qkv(x, mod[0], lay.rope)
-        packed = sage_pack(k, v, lay.head, keep) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
+        packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
         x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
-    # keys and values are written into the tail of the cache's bf16 buffers, so nothing is concatenated; a SageKV
-    # then requantises just those rows next to its already quantised prefix.
+    # keys and values are written into the end of the cache's bf16 buffers, so nothing is concatenated; a SageKV
+    # then requantises just its tail (held rows and target) next to its already quantised prefix.
     def decode(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: KV | SageKV) -> Tensor:
         packed = isinstance(cache, SageKV)
-        k, v = cache.tail if packed else cache
+        k, v = sage_tail(cache) if packed else cache
         q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -x.shape[1] :], v[:, -x.shape[1] :]))
         attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
         x = self.attn.out(attended, x, mod[1])
@@ -246,16 +246,18 @@ class Block(nn.Module):
 
     # first step of a later request on the same condition images: only the rows after the kept head are computed,
     # the closing text run (`texts` rows) then the target. the text run reads the head's kept bf16 keys and values
-    # under its causal triangle, as in `prefill`; the target reads the quantised cache, as in `decode`.
-    def resume(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> Tensor:
-        k, v = cache.tail
+    # under its causal triangle, as in `prefill`; the target reads the quantised cache, as in `decode`. returns the
+    # cache holding this request's text rows.
+    def resume(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> tuple[Tensor, SageKV]:
+        k, v = sage_tail(cache)
         rows, held = x.shape[1], cache.head[0].shape[1]
         q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
         keys, values = (torch.cat([old, new[:, -rows : texts - rows]], dim=1) for old, new in zip(cache.head, (k, v)))
         mask = torch.cat([q.new_ones(texts, held, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
         attended = torch.cat([attend(q[:, :texts], keys, values, self.attn.bound, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
         x = self.attn.out(attended, x, mod[1])
-        return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
+        held = tuple(rows[:, : rows.shape[1] - x.shape[1] + texts].clone() for rows in (k, v))
+        return feed(self.img_mlp, x, mod[2], mod[3], self.eps), cache._replace(held=held)
 
 
 # qwen-image 2.1 single-stream dit. parameter names match the diffusers checkpoint, so
@@ -325,7 +327,7 @@ class Dit(nn.Module):
         mod, final = self.modulate(temb, torch.arange(lay.image.numel(), device=x.device) >= lay.prefix)
         cache: list[KV | SageKV] = []
         for block in self.transformer_blocks:
-            x, kv = block.prefill(x, mod, lay, keep)
+            x, kv = block.prefill(x, mod, lay, keep, getattr(cache[-1], "tail", None) if cache else None)
             cache = cache + [kv]
         return self.head(x[:, lay.prefix :], final[:, lay.prefix :]), cache
 
@@ -338,10 +340,11 @@ class Dit(nn.Module):
         x = torch.cat([self.text_embed(text[:, text.shape[1] - texts :]), self.img_in(target)], dim=1)
         temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
         mod, final = self.modulate(temb, torch.arange(x.shape[1], device=x.device) >= texts)
-        cache = [sage_refit(kv, lay.image.numel()) for kv in cache]
+        resumed: list[SageKV] = []
         for block, kv in zip(self.transformer_blocks, cache):
-            x = block.resume(x, mod, lay.rope[lay.head :], kv, texts)
-        return self.head(x[:, texts:], final[:, texts:]), cache
+            x, kv = block.resume(x, mod, lay.rope[lay.head :], sage_refit(kv, lay.image.numel(), lay.head, resumed[-1].tail if resumed else None), texts)
+            resumed = resumed + [kv]
+        return self.head(x[:, texts:], final[:, texts:]), resumed
 
     # later steps: only the target tokens are recomputed, attending to the cached prefix. batch 1 only: the
     # kernels write the new keys and values into the buffers' tails, which are contiguous for a single sequence.

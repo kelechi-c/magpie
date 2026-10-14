@@ -101,9 +101,11 @@ def sage(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 #   v (1, dim, heads, S padded to 64) fp8 with the tokens shuffled in 16s, v_scale (1, heads, dim) one step per channel
 #     (or nvfp4 tiles and their mean: see `sage_pack`)
 #   mean (1, heads, dim) bf16, the key mean of step 1, and v_scale are frozen so cached rows never need redoing
-#   tail: bf16 (keys, values) for the rows from `start` on, `start` being the last multiple of 64 inside the prefix.
-#   its last rows are the target, which every decode step overwrites; the few before them are prefix rows that share
-#   a 64-key scale group with the first target rows.
+#   tail: bf16 (keys, values) scratch for the rows from `start` on, `start` being the last multiple of 64 before the
+#   last condition image's end. one buffer serves every layer: a step writes a layer's target rows at its end and
+#   requantises the whole tail from it, so only the rows before the target differ between layers, and those are `held`.
+#   held: this layer's bf16 rows of the tail before the target (a few image rows sharing a 64-key scale group with
+#   what follows, and the closing text run), copied into the tail before each write (`sage_tail`).
 class SageKV(NamedTuple):
     k: Tensor
     k_scale: Tensor
@@ -112,6 +114,7 @@ class SageKV(NamedTuple):
     mean: Tensor
     tail: tuple[Tensor, Tensor]
     start: int
+    held: tuple[Tensor, Tensor]
     head: tuple[Tensor, Tensor] | None = None  # bf16 (keys, values) of the rows before the last condition image's end, when kept for a later request
 
 
@@ -165,13 +168,21 @@ def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
     return kv
 
 
+# this layer's tail, its held rows copied back in: what a step writes its target rows into and requantises.
+def sage_tail(kv: SageKV) -> tuple[Tensor, Tensor]:
+    for tail, held in zip(kv.tail, kv.held):
+        tail[:, : held.shape[1]].copy_(held)
+    return kv.tail
+
+
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
-# number of leading rows that will never change. from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
+# number of leading rows that will never change, `rows` the number before the target; `tail` is another layer's to
+# share (a fresh one when None). from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 # from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
 # that basis) taken off, `k_scale` (1, heads, S padded to 64, 8) bytes, one e4m3 scale per 16 dimensions.
-def sage_pack(k: Tensor, v: Tensor, prefix: int, keep: bool = False) -> SageKV:
+def sage_pack(k: Tensor, v: Tensor, prefix: int, rows: int, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
     wide = tokens - prefix >= FP4_QUERIES
@@ -187,17 +198,21 @@ def sage_pack(k: Tensor, v: Tensor, prefix: int, keep: bool = False) -> SageKV:
         mean = (k.mean(dim=1, dtype=torch.float32) @ hadamard(dim, k.device)).contiguous()
     else:
         keys, scales, mean = torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), k.mean(dim=1)
-    kv = SageKV(keys, scales, values, step, mean, (k[:, start:].clone(), v[:, start:].clone()), start, (k[:, :prefix].clone(), v[:, :prefix].clone()) if keep else None)
+    tail = tail or (torch.empty_like(k[:, start:]), torch.empty_like(v[:, start:]))
+    held = (k[:, start:rows].clone(), v[:, start:rows].clone())
+    kv = SageKV(keys, scales, values, step, mean, tail, start, held, (k[:, :prefix].clone(), v[:, :prefix].clone()) if keep else None)
     return sage_write(kv, k, v, 0)
 
 
 # a kept cache made to hold `tokens` rows: a later request on the same condition images has a prompt of another length,
 # so every row after the kept head moves. the rows before `start` are copied as they are (already quantised, with the
-# first request's frozen mean and steps); the rest is scratch that the next `sage_write` fills.
-def sage_refit(kv: SageKV, tokens: int) -> SageKV:
+# first request's frozen mean and steps); the rest is scratch that the next `sage_write` fills. only the held rows
+# before `head` (the last condition image's end) stay held; `tail` is another layer's to share.
+def sage_refit(kv: SageKV, tokens: int, head: int, tail: tuple[Tensor, Tensor] | None = None) -> SageKV:
+    held = tuple(rows[:, : head - kv.start] for rows in kv.held)
     if tokens == kv.k.shape[1]:
-        return kv
-    padded, groups, held = -(-tokens // KEY_BLOCK) * KEY_BLOCK, kv.start // KEY_BLOCK, kv.head[0].shape[1] - kv.start
+        return kv._replace(held=held)
+    padded, groups = -(-tokens // KEY_BLOCK) * KEY_BLOCK, kv.start // KEY_BLOCK
     keys = kv.k.new_empty(1, tokens, *kv.k.shape[2:])
     keys[:, : kv.start] = kv.k[:, : kv.start]
     if kv.k.dtype == torch.uint8:  # nvfp4 keys: one scale row per key; nvfp4 values: 64-key tiles
@@ -212,10 +227,8 @@ def sage_refit(kv: SageKV, tokens: int) -> SageKV:
     else:
         values = kv.v.new_empty(*kv.v.shape[:3], padded)
         values[..., : kv.start] = kv.v[..., : kv.start]
-    tail = tuple(old.new_empty(1, tokens - kv.start, *old.shape[2:]) for old in kv.tail)
-    for new, old in zip(tail, kv.tail):
-        new[:, :held] = old[:, :held]
-    return SageKV(keys, scales, values, kv.v_scale, kv.mean, tail, kv.start, kv.head)
+    tail = tail or tuple(old.new_empty(1, tokens - kv.start, *old.shape[2:]) for old in kv.tail)
+    return SageKV(keys, scales, values, kv.v_scale, kv.mean, tail, kv.start, held, kv.head)
 
 
 # `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
