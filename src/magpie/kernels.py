@@ -7,6 +7,7 @@ from typing import Callable, NamedTuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 from torch import Tensor
 
 ROWS = 32  # (token, head) rows per program; must divide the head count, so a program never runs off the end
@@ -83,6 +84,59 @@ def qk_prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float, out: Tensor | N
     return out
 
 
+# `qk_prep` and sage's int8 quantisation in one pass, for GROUP rows of one head: the output's first `held` rows are
+# already-prepped bf16 rows (a cache tail's held rows), the rest come from the projection x (row - held), normed and
+# rotated exactly as `qk_prep_kernel` does. with MEAN the head's bf16 mean is taken off; then the group's largest
+# magnitude sets its step (largest / 127) and every value becomes the nearest int8, as sage's quantiser does (rows
+# past `tokens` count as zeros). x, held, out are (rows, heads, 2 * HALF); scale is (heads, groups) with stride `scale_head`.
+@triton.jit
+def prep_int8_kernel(x_ptr, held_ptr, weight_ptr, rope_ptr, mean_ptr, out_ptr, scale_ptr, heads, tokens, held, scale_head, eps,
+                     GROUP: tl.constexpr, HALF: tl.constexpr, MEAN: tl.constexpr):
+    group, head = tl.program_id(0), tl.program_id(1)
+    row = group * GROUP + tl.arange(0, GROUP)
+    pairs = 2 * tl.arange(0, HALF)
+    live = (row < tokens)[:, None]
+    fresh = live & (row >= held)[:, None]
+    source = tl.maximum(row - held, 0)[:, None]
+    at = (source * heads + head) * (2 * HALF) + pairs[None, :]
+    a, b = widen(tl.load(x_ptr + at, mask=fresh, other=0)), widen(tl.load(x_ptr + at + 1, mask=fresh, other=0))
+    scale = tl.rsqrt(tl.sum(a * a + b * b, axis=1) / (2 * HALF) + eps)[:, None]
+    a = rounded(rounded(a * scale) * widen(tl.load(weight_ptr + pairs))[None, :])
+    b = rounded(rounded(b * scale) * widen(tl.load(weight_ptr + pairs + 1))[None, :])
+    phase = source * (2 * HALF) + pairs[None, :]
+    cos, sin = tl.load(rope_ptr + phase, mask=fresh, other=0), tl.load(rope_ptr + phase + 1, mask=fresh, other=0)
+    a, b = rounded(tl.fma(a, cos, -(b * sin))), rounded(tl.fma(a, sin, b * cos))
+    at = (row[:, None] * heads + head) * (2 * HALF) + pairs[None, :]
+    kept = live & ~fresh
+    a = tl.where(kept, widen(tl.load(held_ptr + at, mask=kept, other=0)), a)
+    b = tl.where(kept, widen(tl.load(held_ptr + at + 1, mask=kept, other=0)), b)
+    if MEAN:
+        a = a - widen(tl.load(mean_ptr + head * 2 * HALF + pairs))[None, :]
+        b = b - widen(tl.load(mean_ptr + head * 2 * HALF + pairs + 1))[None, :]
+    a, b = tl.where(live, a, 0.0), tl.where(live, b, 0.0)
+    top = tl.maximum(tl.maximum(tl.max(tl.max(tl.abs(a), axis=1), axis=0), tl.max(tl.max(tl.abs(b), axis=1), axis=0)), 1e-7)
+    tl.store(scale_ptr + head * scale_head + group, top / 127.0)
+    inverse = 127.0 / top
+    tl.store(out_ptr + at, libdevice.rint(a * inverse).to(tl.int8), mask=live)
+    tl.store(out_ptr + at + 1, libdevice.rint(b * inverse).to(tl.int8), mask=live)
+
+
+# the projection x (1, rows, heads, dim) bf16 -> sage's int8 operand and its steps, qk-norm and rope included: `qk_prep`
+# then sage's quantiser with no bf16 rows written in between. queries (`group` QUERY_WARP) get a fresh (1, heads, steps)
+# in sage's per-warp layout; keys pass `out`/`scale`, the slices of a cache from its tail's first row on, with the tail's
+# `held` rows (already prepped) in front and the key `mean` taken off.
+def prep_int8(x: Tensor, weight: Tensor, rope: Tensor, eps: float, group: int, out: Tensor | None = None, scale: Tensor | None = None,
+              held: Tensor | None = None, mean: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    before, (heads, dim) = 0 if held is None else held.shape[1], x.shape[2:]
+    rows = before + x.shape[1]
+    out = x.new_empty(1, rows, heads, dim, dtype=torch.int8) if out is None else out
+    scale = x.new_empty(1, heads, -(-rows // QUERY_BLOCK) * (QUERY_BLOCK // group), dtype=torch.float32) if scale is None else scale
+    prep_int8_kernel[(scale.shape[-1], heads)](x.view(torch.int16), (x if held is None else held).view(torch.int16), weight.view(torch.int16), torch.view_as_real(rope),
+                                               (weight if mean is None else mean).view(torch.int16), out, scale, heads, rows, before, scale.stride(1), eps,
+                                               GROUP=group, HALF=dim // 2, MEAN=mean is not None, num_warps=4)
+    return out, scale
+
+
 # largest |q.k| / sqrt(d) the qk-norm weights allow: after the norm a row has length sqrt(d) times at most
 # max|weight|, rope keeps lengths, and a dot product is at most the product of the two lengths.
 def logit_bound(weight_q: Tensor, weight_k: Tensor) -> float:
@@ -149,18 +203,19 @@ def hadamard(dim: int, device: torch.device) -> Tensor:
 # quantises bf16 keys and values (1, rows, heads, dim) into `kv` from row `start` (a multiple of 64) to the end,
 # with kv's frozen key mean and value steps. the key scales come back in a fresh tensor because sage's quantiser
 # wants a contiguous one, then are copied into place. nvfp4 values (a uint8 `kv.v`) and nvfp4 keys (a uint8 `kv.k`)
-# go through the native kernels.
-def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
-    rows, heads, dim = k.shape[1:]
+# go through the native kernels. k None writes the values only (int8 keys already written by `prep_int8`).
+def sage_write(kv: SageKV, k: Tensor | None, v: Tensor, start: int) -> SageKV:
+    rows, heads, dim = v.shape[1:]
     if kv.k.dtype == torch.uint8:
         import magpie_attn4
         magpie_attn4.rows(k, kv.mean, kv.k[:, start:], kv.k_scale, True, start)
         magpie_attn4.values(v, kv.v_scale, kv.v, start // KEY_BLOCK)
         return kv
-    from sageattention.quant import _fused
-    scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
-    _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
-    kv.k_scale[:, :, start // KEY_BLOCK :] = scale
+    if k is not None:
+        from sageattention.quant import _fused
+        scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
+        _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
+        kv.k_scale[:, :, start // KEY_BLOCK :] = scale
     if kv.v.dtype == torch.uint8:
         import magpie_attn
         magpie_attn.values(v, kv.v_scale, kv.v, start // KEY_BLOCK)
@@ -277,9 +332,18 @@ def sage_unpack(kv: SageKV) -> tuple[Tensor, Tensor]:
     return keys, values
 
 
-# `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
-# native kernel (int8 q x k as in sage, 4-bit weights x values); nvfp4 keys the one with both matmuls 4-bit.
-def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
+# a decode step's attention on a cache with int8 keys, from the raw q and k projections (1, rows, heads, dim): both go
+# through `prep_int8` (norm, rope and quantisation in one pass, the keys straight into the cache after its held rows),
+# the tail's values through `sage_write`, then the cached kernel.
+def sage_step(q: Tensor, k: Tensor, kv: SageKV, weights: tuple[Tensor, Tensor], rope: Tensor, eps: float) -> Tensor:
+    prep_int8(k, weights[1], rope, eps, KEY_BLOCK, kv.k[:, kv.start :], kv.k_scale[:, :, kv.start // KEY_BLOCK :], kv.held[0], kv.mean)
+    return sage_cached(q, sage_write(kv, None, kv.tail[1], kv.start), prep_int8(q, weights[0], rope, eps, QUERY_WARP))
+
+
+# `sage` on keys and values that are already quantised: only the queries are quantised here, unless `quantised` (int8
+# queries and their per-warp steps) is given. nvfp4 values take the native kernel (int8 q x k as in sage, 4-bit
+# weights x values); nvfp4 keys the one with both matmuls 4-bit.
+def sage_cached(q: Tensor, kv: SageKV, quantised: tuple[Tensor, Tensor] | None = None) -> Tensor:
     out = torch.empty_like(q)
     if kv.k.dtype == torch.uint8:
         import magpie_attn4
@@ -289,9 +353,9 @@ def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
         return out
     from sageattention.core import sm89_compile
     from sageattention.quant import _fused
-    q8 = torch.empty_like(q, dtype=torch.int8)
-    scale = kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP))
-    _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
+    q8, scale = quantised or (torch.empty_like(q, dtype=torch.int8), kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP)))
+    if quantised is None:
+        _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
     if kv.v.dtype == torch.uint8:
         import magpie_attn
         magpie_attn.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
-                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_tail, sage_unpack, sage_write)
+                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_unpack, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -180,8 +180,9 @@ class Attention(nn.Module):
     # layer_norm(x) * mod projected to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
     # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. a projection with
     # fp8 weights is an fp8 matmul on the norm's fp8 rows, whose kernel also forms the stream x; the others read
-    # the norm's bf16 output. returns (x formed, q, k, v).
-    def qkv(self, x: Stream, mod: Tensor, rope: Tensor, into: KV | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # the norm's bf16 output. returns (x formed, q, k, v); with `prepped` False q and k are the raw projections (k then
+    # not written into `into`), for a caller that norms, rotates and quantises them in one pass.
+    def qkv(self, x: Stream, mod: Tensor, rope: Tensor, into: KV | None = None, prepped: bool = True) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         packed = self.packed if fp8_ready(self.packed, x.branch) else Fp8Attention(None, None, None, None)
         rows = fp8_norm(flat(x), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
         x = formed(x) if rows is None else x.branch
@@ -193,8 +194,9 @@ class Attention(nn.Module):
             flat = linear(n) if out is None else torch.matmul(n, linear.weight.t(), out=out.flatten(2))
             return flat.unflatten(-1, (self.heads, -1))
 
-        q = prep(project(self.to_q, packed.q), self.norm_q.weight, rope, self.eps)
-        k = prep(project(self.to_k, packed.k), self.norm_k.weight, rope, self.eps, None if into is None else into[0])
+        q, k = project(self.to_q, packed.q), project(self.to_k, packed.k)
+        if prepped:
+            q, k = prep(q, self.norm_q.weight, rope, self.eps), prep(k, self.norm_k.weight, rope, self.eps, None if into is None else into[0])
         return x, q, k, project(self.to_v, packed.v, None if into is None else into[1])
 
     # the attention branch's residual: the stream skip + gate * to_out(attended), the sum left to the next norm.
@@ -246,12 +248,17 @@ class Block(nn.Module):
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
     # keys and values are written into the end of the cache's bf16 buffers, so nothing is concatenated; a SageKV
-    # then requantises just its tail (held rows and target) next to its already quantised prefix.
+    # then requantises just its tail (held rows and target) next to its already quantised prefix. with int8 keys the
+    # queries and new keys skip bf16 altogether: `sage_step` norms, rotates and quantises them in one pass.
     def decode(self, x: Stream, mod: tuple[Tensor, ...], rope: Tensor, cache: KV | SageKV) -> Stream:
         packed, rows = isinstance(cache, SageKV), x.branch.shape[1]
+        fused = packed and cache.k.dtype == torch.int8
         k, v = sage_tail(cache) if packed else cache
-        x, q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
-        attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
+        x, q, new, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]), not fused)
+        if fused:
+            attended = sage_step(q, new, cache, (self.attn.norm_q.weight, self.attn.norm_k.weight), rope, self.eps)
+        else:
+            attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
         x = self.attn.out(attended, x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
