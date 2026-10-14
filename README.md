@@ -111,10 +111,12 @@ Edit a generated image with a different seed from the one that drew it; the same
 ## limits
 
 - An RTX 5090 fits one reference at 2048² and up to eleven at 1024² (three with the encoder resident). A 2048² edit
-  stays fully resident with `MAGPIE_ENCODER=nvfp4`: 5.97 s, 26.4 GiB.
+  stays fully resident: 5.35 s and 18.2 GiB with `MAGPIE_ENCODER=nvfp4` (1448² reference), 5.41 s and 27.5 GiB with
+  the bf16 encoder.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
 - Text-to-image keeps the subject and style but shifts the composition against the bf16 baseline: it does not pass
-  the gate (DINOv2 min 0.90 at 1024² and 2048²).
+  the gate (DINOv2 min 0.90 at 1024² and 2048²). The NVFP4 MLP weights cause it; with MXFP8 MLP weights it passes
+  (0.984 at 1024²).
 - Turbo only. The 40-step base checkpoint runs in the port but is not tuned or gated.
 
 ## layout

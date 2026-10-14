@@ -59,15 +59,23 @@
     "text": 149,
     "free": 64,
     "dit_vae": 6624,
-    "peak_gib": 22.84
+    "peak_gib": 22.84,
+    "note": "measured before the 2026-10-14 levers"
    },
    "magpie, encoder staged, 8-bit attention": {
     "total": 8477,
     "dit_vae": 7982,
-    "peak_gib": 26.35
+    "peak_gib": 26.35,
+    "note": "measured before the 2026-10-14 levers"
    },
-   "magpie, everything resident": "out of memory",
-   "magpie, calibrated nvfp4 encoder, resident": "out of memory",
+   "magpie, everything resident": "out of memory before the 2026-10-14 levers; not re-measured since",
+   "magpie, calibrated nvfp4 encoder, resident": {
+    "total": 6449,
+    "text": 89,
+    "dit_vae": 6360,
+    "peak_gib": 19.72,
+    "note": "fits since the shared kv tail (2026-10-14); out of memory before"
+   },
    "sglang fp8 + sage": {
     "total": 11755,
     "peak_gib": 31.35
@@ -78,10 +86,11 @@
    },
    "official diffusers, cpu offload": "out of memory",
    "magpie, nvfp4 encoder, 1448 reference, resident, 4-bit attention": {
-    "total": 5973,
-    "text": 110,
-    "dit_vae": 5863,
-    "peak_gib": 26.41
+    "total": 5350,
+    "text": 89,
+    "dit_vae": 5261,
+    "peak_gib": 18.19,
+    "note": "after the shared kv tail and mlp blocks (2026-10-14 levers); was 5,973 ms / 26.41 gib"
    }
   },
   "text-to-image 2048": {
@@ -433,7 +442,146 @@
   "4-bit attention here": "MAGPIE_PV4_KEYS=16384 MAGPIE_QK4_KEYS=16384 (the defaults, 30,720, leave a smaller reference on the 8-bit kernel)"
  },
  "prefix_reuse_2048": {
-  "result": "out of memory on the first kept request (30.0 gib allocated in Dit.prefill)",
-  "why": "keep holds each layer's bf16 keys and values for the reference rows: 16,384 x 4,096 x 2 bytes x 2 x 32 layers = 8.6 gib on top of a ~22 gib request (at 1024: 2.1 gib, 13.55 -> 17.59 gib measured)"
+  "result": "fits since the shared tail (2026-10-14): 2048 output at the 1448 reference resumed 5,143 ms vs 5,291 fresh, 20.17 gib; see levers_2026_10_14",
+  "before": {
+   "result": "out of memory on the first kept request (30.0 gib allocated in Dit.prefill)",
+   "why": "keep holds each layer's bf16 keys and values for the reference rows: 16,384 x 4,096 x 2 bytes x 2 x 32 layers = 8.6 gib on top of a ~22 gib request (at 1024: 2.1 gib, 13.55 -> 17.59 gib measured)"
+  }
+ },
+ "levers_2026_10_14": {
+  "what": "the user's memory and fusion levers, one process per commit, resident, median of 5 warm (runpod secure, driver 580.159, 600 w); dit + vae ms and peak gib",
+  "edit 1024, bf16 encoder": {
+   "s1 1448 default": [
+    1103.7,
+    25.93
+   ],
+   "s2 shared tail": [
+    1120.0,
+    23.99
+   ],
+   "s4 mlp in 8,192-row blocks": [
+    1127.6,
+    23.92
+   ],
+   "s5 residual in the norm": [
+    1118.1,
+    23.99
+   ],
+   "s6 qk int8 in prep": [
+    1120.5,
+    23.99
+   ],
+   "vae compiled + cudnn benchmark": [
+    1247.0,
+    23.99
+   ],
+   "cudnn benchmark only": [
+    1110.9,
+    23.99
+   ],
+   "final": [
+    1112.4,
+    23.99
+   ]
+  },
+  "edit 2048, 1448 reference, nvfp4 encoder, 4-bit": {
+   "s1 1448 default": [
+    5238.5,
+    26.41
+   ],
+   "s2 shared tail": [
+    5289.0,
+    18.66
+   ],
+   "s4 mlp in 8,192-row blocks": [
+    5321.5,
+    18.19
+   ],
+   "s5 residual in the norm": [
+    5283.4,
+    18.19
+   ],
+   "s6 qk int8 in prep": [
+    5286.7,
+    18.19
+   ],
+   "vae compiled + cudnn benchmark": [
+    5780.3,
+    21.56
+   ],
+   "final": [
+    5261.4,
+    18.19
+   ]
+  },
+  "gate edit16_1024": {
+   "s1": "pass, min 0.9861",
+   "s6": "identical images to s1",
+   "cudnn benchmark": "fail, items 0 and 4 (0.9728, 0.9617)",
+   "final": "pass, min 0.9861"
+  },
+  "gate 2048 at the 1448 reference (frozen, small_refs)": {
+   "pass": true,
+   "dino_min": 0.9853,
+   "dreamsim_max": 0.0241
+  },
+  "now fits, resident": {
+   "8-bit attention, 1448 reference, nvfp4 encoder": {
+    "total": 5955,
+    "dit_vae": 5867,
+    "peak_gib": 20.44
+   },
+   "bf16 encoder, 1448 reference": {
+    "total": 5412,
+    "dit_vae": 5268,
+    "peak_gib": 27.45
+   },
+   "full 2048 reference, nvfp4 encoder": {
+    "total": 6449,
+    "dit_vae": 6360,
+    "peak_gib": 19.72
+   }
+  },
+  "prefix reuse (dit + vae only)": {
+   "1024, bf16 reference rows kept": {
+    "fresh": 1143,
+    "resumed": 1009,
+    "peak_gib": 13.73,
+    "dino_min": 0.977
+   },
+   "1024, dequantised": {
+    "fresh": 1123,
+    "resumed": 1012,
+    "peak_gib": 11.71,
+    "dino_min": 0.897
+   },
+   "2048 output at 1448, bf16 reference rows kept": {
+    "fresh": 5371,
+    "resumed": 5070,
+    "peak_gib": 24.12,
+    "dino_min": 0.953
+   },
+   "2048 output at 1448, dequantised": {
+    "fresh": 5291,
+    "resumed": 5143,
+    "peak_gib": 20.17,
+    "dino_min": 0.923
+   }
+  },
+  "t2i 1024 ablations, dino min vs frozen bf16": {
+   "bf16 port here": 0.9975,
+   "full build": 0.902,
+   "sdpa attention": 0.927,
+   "bf16 attention projections": 0.754,
+   "mxfp8 mlp (passes)": 0.9836
+  },
+  "server, one gpu thread, round trip ms": {
+   "edit 1024 repeat (prompt remembered)": 1139,
+   "edit 2048 first": 5553,
+   "edit 2048 repeat": 5320,
+   "t2i 1024 (encoder fetched)": 1452,
+   "before the thread fix, edit 1024": 2687,
+   "before, edit 2048": 9843
+  }
  }
 }

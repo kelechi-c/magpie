@@ -2,7 +2,7 @@
   "generated": "2026-10-14",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "ac8e1291e6c22f66976df582e82a60031c7fa299"
+    "head": "cad0709a0f911cd2477bb5e8f6a8c87eb95b9cb3"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -26,11 +26,11 @@
   },
   "compare": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/compare.json",
-    "sha256": "898356bb43f9a2f22610aaf56dee1b5c68007c6abe0ea903fcb5a32a1415ae20"
+    "sha256": "dd9b5896dee13659042cabbdd9e203b719e693b2ccba626ad602d01aa8177dd4"
   },
   "rtx5090": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/rtx5090.json",
-    "sha256": "c330f32eccc0e41e31314b851591294bbc818e643ccc272395c75f69f6162172"
+    "sha256": "e4aaeac85d6e1014fc58d00f28cfee1e76062c048c159a75ba088d32d8032ddf"
   },
   "charts": {
     "stage-split": [
@@ -320,6 +320,8 @@
       "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].peak_gib",
       "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].total",
       "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].peak_gib",
+      "rtx5090.whole_request_ms[edit 2048][magpie, calibrated nvfp4 encoder, resident].total",
+      "rtx5090.whole_request_ms[edit 2048][magpie, calibrated nvfp4 encoder, resident].peak_gib",
       "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].total",
       "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].peak_gib",
       "rtx5090.whole_request_ms[edit 2048][sglang default].total",
