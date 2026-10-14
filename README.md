@@ -67,6 +67,32 @@ that request and the next. It needs about 16 GiB of free host memory.
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
 | `HF_HOME` | where weights are cached |
 
+## runpod serverless
+
+`python -m magpie.worker` runs the same request as a [RunPod serverless](https://docs.runpod.io/serverless/overview)
+queue worker: a job's `input` is the JSON `POST /generate` takes, and its output is the reply (JPEG unless
+`format` says otherwise). The model loads once per worker, before the first job.
+
+The worker needs torch 2.14.1, `runpod` (`pip install -e ".[serverless]"`), the native kernels and the weights where it starts. One way that
+needs no image registry: a network volume in a datacenter with RTX 5090s holding a virtual environment
+(`python -m venv --system-site-packages` over `runpod/pytorch:1.4.1-rc.177-cu1300-torch2130-ubuntu2404`, the
+same image the endpoint runs), this repository, and `HF_HOME`, filled once from a pod with the volume mounted
+at `/runpod-volume`. The endpoint's start command is then
+
+```
+bash -c 'cd /runpod-volume/magpie && HF_HOME=/runpod-volume/hf HF_HUB_OFFLINE=1 PYTHONPATH=src exec /runpod-volume/venv/bin/python -u -m magpie.worker'
+```
+
+A job is the request wrapped in `input`; the reply comes back under `output`:
+
+```
+curl -s https://api.runpod.ai/v2/<endpoint>/runsync -H "Authorization: Bearer <runpod api key>" -H "Content-Type: application/json" \
+  -d '{"input": {"prompt": "Ink drawing of a magpie on a fence post", "seed": 1}}'
+```
+
+When a worker has to start first, `/runsync` can return `IN_QUEUE` with an `id` before the job finishes. Poll
+`/status/<id>` until it reads `COMPLETED`. A worker loads the model in about a minute.
+
 ## from python
 
 ```python
@@ -90,7 +116,7 @@ Edit a generated image with a different seed from the one that drew it; the same
 
 ## layout
 
-- `src/magpie/` — `dit.py`, `vae.py`, `text.py`, `sampling.py`, `pipeline.py`, `kernels.py`, `server.py`
+- `src/magpie/` — `dit.py`, `vae.py`, `text.py`, `sampling.py`, `pipeline.py`, `kernels.py`, `server.py`, `worker.py`
 - `native/` — CUDA sources of the matmul and attention kernels
 - `baseline/` — measured numbers behind the charts in `assets/charts/`
 
