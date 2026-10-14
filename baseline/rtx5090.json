@@ -442,11 +442,12 @@
   "4-bit attention here": "MAGPIE_PV4_KEYS=16384 MAGPIE_QK4_KEYS=16384 (the defaults, 30,720, leave a smaller reference on the 8-bit kernel)"
  },
  "prefix_reuse_2048": {
-  "result": "fits since the shared tail (2026-10-14): 2048 output at the 1448 reference resumed 5,143 ms vs 5,291 fresh, 20.17 gib; see levers_2026_10_14",
+  "result": "fits since the shared tail (2026-10-14): 2048 output at the 1448 reference resumed 5,070 ms vs 5,371 fresh, 24.12 gib, dino min 0.953 resumed vs fresh (bf16 reference rows kept); see levers_2026_10_14",
   "before": {
    "result": "out of memory on the first kept request (30.0 gib allocated in Dit.prefill)",
    "why": "keep holds each layer's bf16 keys and values for the reference rows: 16,384 x 4,096 x 2 bytes x 2 x 32 layers = 8.6 gib on top of a ~22 gib request (at 1024: 2.1 gib, 13.55 -> 17.59 gib measured)"
-  }
+  },
+  "dequantised_references": "tried and reverted: 20.17 gib, but resumed-vs-fresh dino min 0.923 at 2048 and 0.897 at 1024 (0.977 with bf16 rows)"
  },
  "levers_2026_10_14": {
   "what": "the user's memory and fusion levers, one process per commit, resident, median of 5 warm (runpod secure, driver 580.159, 600 w); dit + vae ms and peak gib",
