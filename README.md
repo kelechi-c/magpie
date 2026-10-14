@@ -72,7 +72,7 @@ curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-
 | `images` | optional | base64 images (or data URLs) to edit or combine; none means text-to-image |
 | `resolution` | 1024 | 1024 or 2048: the side of a square with the output's area |
 | `width`, `height` | optional | exact output size, rounded to multiples of 32. Without them an edit takes the last image's shape |
-| `reference` | `resolution` | the side the images enter the model at; 1448 for a 2048² edit passes the quality gate and saves about 6 % (16 % with 4-bit attention, below) |
+| `reference` | `resolution`, at most 1448 | the side the images enter the model at. 1448 for a 2048² edit passes the quality gate, 16 % sooner than a full-size reference |
 | `seed` | 0 | |
 | `format` | `png` | `png`, `jpeg` or `webp` |
 
@@ -88,7 +88,6 @@ that request and the next. It needs about 16 GiB of free host memory.
 | `MAGPIE_TOKEN` | when set, requests must carry `Authorization: Bearer <token>` |
 | `MAGPIE_ENCODER=nvfp4` | a calibrated 4-bit text encoder: 9 GiB less on the card, slightly different images |
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
-| `MAGPIE_PV4_KEYS=16384 MAGPIE_QK4_KEYS=16384` | 4-bit attention for a 2048² output with a smaller reference too (passes the gate at a 1448 reference) |
 | `HF_HOME` | where weights are cached |
 
 ## from python
@@ -109,7 +108,7 @@ Edit a generated image with a different seed from the one that drew it; the same
 ## limits
 
 - An RTX 5090 fits one reference at 2048² and up to eleven at 1024² (three with the encoder resident). A 2048² edit
-  stays fully resident with `MAGPIE_ENCODER=nvfp4`, `reference` 1448 and 4-bit attention: 5.97 s, 26.4 GiB.
+  stays fully resident with `MAGPIE_ENCODER=nvfp4`: 5.97 s, 26.4 GiB.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
 - Text-to-image keeps the subject and style but shifts the composition against the bf16 baseline: it does not pass
   the gate (DINOv2 min 0.90 at 1024² and 2048²).

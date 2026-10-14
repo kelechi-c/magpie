@@ -21,8 +21,8 @@ MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scale
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
 ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
-PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "30720")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
-QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "30720")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
+PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "24000")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4 (a 2048 output with a 1448 reference has ~24,600)
+QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "24000")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
 FP4_QUERIES = int(os.environ.get("MAGPIE_FP4_QUERIES", "15360"))  # ... and only when the image being drawn has this many tokens (2048 squared, less the few percent a non-square size rounds away): seven 1024 references reach the key count too, and there the 4-bit kernel drops and doubles subjects
 ATTN8 = find_spec("magpie_attn8") is not None and os.environ.get("MAGPIE_ATTN8") != "0"  # MAGPIE_ATTN8=0 falls back to sage's kernel; the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
@@ -166,7 +166,7 @@ def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
 
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
-# number of leading rows that will never change. from PV4_KEYS keys up (30,720 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
+# number of leading rows that will never change. from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 # from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,

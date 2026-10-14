@@ -7,8 +7,8 @@
                     -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib"}
 
 only `prompt` is required. with images and no width/height the output takes the last image's shape at `resolution`
-(1024 or 2048, the side of a square of the same area); with neither it is a square. `reference` (default: `resolution`)
-is the side the images enter the model at: 1024 for a 2048 output shortens its sequence by a third. MAGPIE_TOKEN, when set, must
+(1024 or 2048, the side of a square of the same area); with neither it is a square. `reference` (default: `resolution`,
+at most 1448) is the side the images enter the model at. MAGPIE_TOKEN, when set, must
 arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start).
 """
 
@@ -145,7 +145,7 @@ def elapsed(start: float) -> float:
 @torch.no_grad()
 def generate(runtime: Runtime, job: Job, parked: bool) -> tuple[Job, bool]:
     models, resolution = runtime.models, int(job.get("resolution", 1024))
-    reference = int(job.get("reference") or resolution)
+    reference = int(job.get("reference") or pipeline.reference_side(resolution))
     images = tuple(decoded(data) for data in job.get("images", []))
     sized = pipeline.resized(images, reference)
     size = (round(job["width"] / 32) * 32, round(job["height"] / 32) * 32) if job.get("width") and job.get("height") else None

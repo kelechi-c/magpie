@@ -14,6 +14,7 @@ from magpie.text import encode, reslot
 from magpie.vae import Vae, VaeConfig, image_weights
 
 Shape = tuple[int, int]
+REFERENCE = 1448  # condition images enter the dit at this side at most: a 2048 edit then passes the gate 16 % sooner than at full size
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,11 @@ def denoise_kept(
     return latents, cache
 
 
+# the side condition images enter the dit at for an output of side `resolution`.
+def reference_side(resolution: int) -> int:
+    return min(resolution, REFERENCE)
+
+
 # condition images at the working size: `resolution`^2 pixels, their own aspect ratio, sides multiples of 32.
 def resized(images: tuple[Image.Image, ...], resolution: int) -> list[Image.Image]:
     return [image.convert("RGBA").resize(fit(resolution**2, image.width / image.height), Image.LANCZOS) for image in images]
@@ -195,15 +201,16 @@ def render_kept(
 # prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. above `look`, the encoder reads
 # look^2-pixel copies of the condition images while the vae still reads them at `resolution` (a 2048 edit encodes
 # three times faster and the gate does not see it); the slots are then resized to what the real images need.
-# look=None always shows the encoder the full-size images. `reference` (default: `resolution`) is the side the condition
-# images enter the dit at: a 1024 reference for a 2048 output cuts the sequence from ~32,900 tokens to ~20,500.
+# look=None always shows the encoder the full-size images. `reference` (default: `reference_side(resolution)`) is the side
+# the condition images enter the dit at: 1448 for a 2048 output cuts the sequence from ~32,900 tokens to ~24,600.
 @torch.no_grad()
 def generate(
     models: Models, prompt: str, sampler: SamplerConfig, images: tuple[Image.Image, ...] = (),
     size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = 1024, reference: int | None = None,
 ) -> Image.Image:
-    sized = resized(images, reference or resolution)
-    small = look is not None and (reference or resolution) > look
+    reference = reference or reference_side(resolution)
+    sized = resized(images, reference)
+    small = look is not None and reference > look
     text, slots = encode(models.encoder, models.processor, prompt, resized(images, look) if small else sized)
     if small:
         text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
