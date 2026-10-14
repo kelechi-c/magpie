@@ -158,20 +158,20 @@ void fed_report(const char *name, float *out, int sms)
 // (rows, depth) bytes and `b` (columns, depth) bytes; the bytes are not laid out as a real kernel would need, so the
 // result is meaningless, but every load, wait and instruction of a real kernel is there. this is what a hand-written
 // kernel could reach, to hold against cutlass (whose sm_120 kernels only build with 128 x 128 and 128 x 64 tiles).
-constexpr uint32_t DEEP = 128, STRIDE = 144;
+// a stage holds D bytes of depth (128, or 64 where two stages of a larger tile would not fit the ~100 kb a block may have).
 
-template <int FORMAT, int TM, int TN, int NT>
+template <int FORMAT, int TM, int TN, int NT, int D>
 __global__ void streamed(const uint8_t *a, const uint8_t *b, float *out, uint32_t depth)
 {
   extern __shared__ uint8_t bytes[];
-  constexpr uint32_t stage_bytes = (TM + TN) * STRIDE, chunks = (TM + TN) * 8, threads = (TM / 64) * (TN / (8 * NT)) * 32;
+  constexpr uint32_t DEEP = D, STRIDE = D + 16, PER = D / 16, stage_bytes = (TM + TN) * STRIDE, chunks = (TM + TN) * PER, threads = (TM / 64) * (TN / (8 * NT)) * 32;
   const uint32_t warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint8_t *rows[2] = {a + size_t(blockIdx.y) * TM * depth, b + size_t(blockIdx.x) * TN * depth};
   auto fetch = [&](uint32_t tile) { // one 128-byte-deep slice of both operands into stage tile % 2
     uint8_t *stage = bytes + (tile % 2) * stage_bytes;
     for (uint32_t chunk = threadIdx.x; chunk < chunks; chunk += threads)
     {
-      const uint32_t which = chunk >= TM * 8, row = (chunk - which * TM * 8) / 8, col = chunk % 8;
+      const uint32_t which = chunk >= TM * PER, row = (chunk - which * TM * PER) / PER, col = chunk % PER;
       const uint32_t target = static_cast<uint32_t>(__cvta_generic_to_shared(stage + (which * TM + row) * STRIDE + col * 16));
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(target), "l"(rows[which] + size_t(row) * depth + tile * DEEP + col * 16));
     }
@@ -187,7 +187,7 @@ __global__ void streamed(const uint8_t *a, const uint8_t *b, float *out, uint32_
     if (tile + 1 < tiles) asm volatile("cp.async.wait_group 1;\n" ::); else asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
     const uint8_t *stage = bytes + (tile % 2) * stage_bytes;
-    for (uint32_t step = 0; step < 4; step++)
+    for (uint32_t step = 0; step < DEEP / 32; step++)
     {
       uint32_t A[4][4], B[NT][2];
 #pragma unroll
@@ -215,36 +215,36 @@ __global__ void streamed(const uint8_t *a, const uint8_t *b, float *out, uint32_
 }
 
 // rows x columns x depth bytes; an fp8 byte is one value, an nvfp4 byte two.
-template <int FORMAT, int TM, int TN, int NT>
+template <int FORMAT, int TM, int TN, int NT, int D>
 void streamed_rate(const char *name, uint32_t rows, uint32_t columns, uint32_t depth)
 {
-  const uint32_t smem = 2 * (TM + TN) * STRIDE, threads = (TM / 64) * (TN / (8 * NT)) * 32;
+  const uint32_t smem = 2 * (TM + TN) * (D + 16), threads = (TM / 64) * (TN / (8 * NT)) * 32;
   uint8_t *a, *b;
   float *out;
   cudaMalloc(&a, size_t(rows) * depth), cudaMalloc(&b, size_t(columns) * depth), cudaMalloc(&out, sizeof(float) * (rows / TM) * (columns / TN));
   cudaMemset(a, 0x11, size_t(rows) * depth), cudaMemset(b, 0x11, size_t(columns) * depth);
-  cudaFuncSetAttribute(streamed<FORMAT, TM, TN, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  cudaFuncSetAttribute(streamed<FORMAT, TM, TN, NT, D>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   cudaEvent_t start, stop;
   cudaEventCreate(&start), cudaEventCreate(&stop);
   const dim3 grid(columns / TN, rows / TM);
-  streamed<FORMAT, TM, TN, NT><<<grid, threads, smem>>>(a, b, out, depth);
+  streamed<FORMAT, TM, TN, NT, D><<<grid, threads, smem>>>(a, b, out, depth);
   cudaEventRecord(start);
-  for (int run = 0; run < 10; run++) streamed<FORMAT, TM, TN, NT><<<grid, threads, smem>>>(a, b, out, depth);
+  for (int run = 0; run < 10; run++) streamed<FORMAT, TM, TN, NT, D><<<grid, threads, smem>>>(a, b, out, depth);
   cudaEventRecord(stop), cudaEventSynchronize(stop);
   float ms;
   cudaEventElapsedTime(&ms, start, stop);
   const double values = FORMAT == 3 ? 2.0 * depth : depth;
-  printf("streamed %s tile=%dx%d warp=64x%d %ux%ux%.0f %.3f ms %.0f (%s)\n", name, TM, TN, 8 * NT, rows, columns, values, ms / 10,
+  printf("streamed %s tile=%dx%dx%d warp=64x%d %ux%ux%.0f %.3f ms %.0f (%s)\n", name, TM, TN, D, 8 * NT, rows, columns, values, ms / 10,
          2.0 * rows * columns * values * 10 / (ms * 1e-3) / 1e12, cudaGetErrorString(cudaGetLastError()));
   cudaFree(a), cudaFree(b), cudaFree(out);
 }
 
 // the dit's matmuls as (rows of activations, weight rows, depth in bytes): mlp hidden, q/k/v/out, mlp out.
-template <int TM, int TN, int NT>
+template <int TM, int TN, int NT, int D>
 void streamed_report()
 {
-  streamed_rate<2, TM, TN, NT>("mxfp8", 4096, 24576, 4096), streamed_rate<2, TM, TN, NT>("mxfp8", 4096, 4096, 4096);
-  streamed_rate<3, TM, TN, NT>("nvfp4", 4096, 24576, 2048), streamed_rate<3, TM, TN, NT>("nvfp4", 4096, 4096, 6144);
+  streamed_rate<2, TM, TN, NT, D>("mxfp8", 4096, 24576, 4096), streamed_rate<2, TM, TN, NT, D>("mxfp8", 4096, 4096, 4096);
+  streamed_rate<3, TM, TN, NT, D>("nvfp4", 4096, 24576, 2048), streamed_rate<3, TM, TN, NT, D>("nvfp4", 4096, 4096, 6144);
 }
 
 template <int FORMAT, int TILES>
@@ -280,7 +280,7 @@ int main(int argc, char **argv)
   cudaDeviceProp card;
   cudaGetDeviceProperties(&card, 0);
   printf("peak card %s sms=%d\n", card.name, card.multiProcessorCount);
-  streamed_report<128, 128, 4>(), streamed_report<128, 128, 8>(), streamed_report<256, 128, 8>(), streamed_report<128, 256, 8>(), streamed_report<256, 256, 8>();
+  streamed_report<128, 128, 4, 128>(), streamed_report<128, 128, 4, 64>(), streamed_report<256, 128, 8, 64>(), streamed_report<128, 256, 8, 64>(), streamed_report<256, 256, 8, 64>();
   if (argc > 1) return 0; // any argument: the streamed matmuls only
   float *out;
   cudaMalloc(&out, sizeof(float) * card.multiProcessorCount * 64);

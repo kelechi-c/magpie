@@ -1,0 +1,358 @@
+{
+ "measured": "2026-10-13/14, one RTX 5090 (RunPod secure cloud, 31.4 GiB usable, driver 610.57, torch 2.14.1 + CUDA 13.0), Qwen-Image 2.1 Turbo, 8 steps, batch 1, median of 5 warm requests unless noted; gates are 16 images",
+ "note": "a first pod (community cloud) capped the card at 400 W and ran 13 times slow (16.5 tflop/s bf16 against 240); its numbers were discarded",
+ "whole_request_ms": {
+  "edit 1024": {
+   "magpie, everything resident": {
+    "total": 1310,
+    "text": 144,
+    "dit_vae": 1166,
+    "peak_gib": 25.93
+   },
+   "magpie, encoder staged": {
+    "total": 1682,
+    "fetch": 288,
+    "text": 149,
+    "free": 68,
+    "dit_vae": 1173,
+    "peak_gib": 20.92
+   },
+   "magpie, calibrated nvfp4 encoder, resident": {
+    "total": 1266,
+    "text": 90,
+    "dit_vae": 1176,
+    "peak_gib": 16.66
+   },
+   "sglang fp8 + sage": {
+    "total": 2440,
+    "peak_gib": 13.97
+   },
+   "sglang default": {
+    "total": 4192,
+    "peak_gib": 20.19
+   },
+   "official diffusers, cpu offload": {
+    "total": 27138,
+    "peak_gib": 19.1
+   }
+  },
+  "text-to-image 1024": {
+   "magpie, everything resident": {
+    "total": 927,
+    "text": 25,
+    "dit_vae": 902,
+    "peak_gib": 24.33
+   },
+   "sglang fp8 + sage": {
+    "total": 2015,
+    "peak_gib": 10.79
+   },
+   "sglang default": {
+    "total": 3425,
+    "peak_gib": 17.16
+   }
+  },
+  "edit 2048": {
+   "magpie, encoder staged": {
+    "total": 7140,
+    "fetch": 288,
+    "text": 149,
+    "free": 64,
+    "dit_vae": 6624,
+    "peak_gib": 22.84
+   },
+   "magpie, encoder staged, 8-bit attention": {
+    "total": 8477,
+    "dit_vae": 7982,
+    "peak_gib": 26.35
+   },
+   "magpie, everything resident": "out of memory",
+   "magpie, calibrated nvfp4 encoder, resident": "out of memory",
+   "sglang fp8 + sage": {
+    "total": 11755,
+    "peak_gib": 31.35
+   },
+   "sglang default": {
+    "total": 23045,
+    "peak_gib": 30.25
+   },
+   "official diffusers, cpu offload": "out of memory"
+  },
+  "text-to-image 2048": {
+   "magpie, calibrated nvfp4 encoder, resident": {
+    "total": 5208,
+    "text": 32,
+    "dit_vae": 5176,
+    "peak_gib": 25.84
+   },
+   "magpie, everything resident": "out of memory"
+  }
+ },
+ "sglang": "sglang[diffusion] 0.5.21, http time including png; magpie and diffusers are in-process",
+ "gate": {
+  "edit 1024": {
+   "pass": true,
+   "dino_min": 0.9861,
+   "dreamsim_max": 0.0058,
+   "mean_step_error": 0.0356,
+   "dit_vae_ms": 1192
+  },
+  "edit 2048": {
+   "pass": true,
+   "dino_min": 0.992,
+   "dreamsim_max": 0.0149,
+   "mean_step_error": 0.0428,
+   "dit_vae_ms": 6812
+  },
+  "edit 2048, 8-bit attention": {
+   "pass": true,
+   "dino_min": 0.9949,
+   "dreamsim_max": 0.0108,
+   "mean_step_error": 0.0315,
+   "dit_vae_ms": 8138
+  }
+ },
+ "memory_gib": {
+  "card": 31.4,
+  "resident idle": 20.65,
+  "staged idle (encoder in host memory)": 5.47,
+  "nvfp4 encoder resident idle": 11.38
+ },
+ "cold_start_s": {
+  "host": "this pod; an earlier 5090 host reached the first image in 8.4 s with the same files cached",
+  "files in page cache": {
+   "imports": 1.3,
+   "dit_vae_loaded": 5.1,
+   "encoder_loaded": 11.4,
+   "first_image": 14.1,
+   "first_request_ms": 2695
+  },
+  "files evicted from page cache": {
+   "imports": 1.8,
+   "dit_vae_loaded": 7.4,
+   "encoder_loaded": 17.3,
+   "first_image": 20.4,
+   "first_request_ms": 3083
+  },
+  "calibrated nvfp4 encoder, cached": {
+   "first_image": 13.2
+  },
+  "encoder alone from disk": 5.9,
+  "dit + vae alone from disk": 3.9
+ },
+ "references": {
+  "what": "most condition images in one edit before out of memory; (count, dit + vae ms, peak gib)",
+  "1024, encoder staged": {
+   "max": 11,
+   "tested_to": 12,
+   "rows": [
+    [
+     1,
+     1173,
+     10.75
+    ],
+    [
+     2,
+     1490,
+     12.35
+    ],
+    [
+     3,
+     1817,
+     13.96
+    ],
+    [
+     4,
+     2194,
+     15.57
+    ],
+    [
+     5,
+     2611,
+     17.19
+    ],
+    [
+     6,
+     3040,
+     18.8
+    ],
+    [
+     7,
+     3523,
+     20.39
+    ],
+    [
+     8,
+     4104,
+     22.0
+    ],
+    [
+     9,
+     4541,
+     23.61
+    ],
+    [
+     10,
+     5100,
+     25.23
+    ],
+    [
+     11,
+     5640,
+     26.84
+    ]
+   ]
+  },
+  "1024, everything resident": {
+   "max": 3,
+   "rows": [
+    [
+     1,
+     1166,
+     25.93
+    ],
+    [
+     2,
+     1570,
+     27.53
+    ],
+    [
+     3,
+     1815,
+     29.14
+    ]
+   ]
+  },
+  "1024, calibrated nvfp4 encoder resident": {
+   "max": 6,
+   "note": "6 measured on the 8-bit kernel (24.71 gib); 7 to 11 fitted only with the 4-bit kernel, which is no longer used at this size; 9 by arithmetic"
+  },
+  "2048, encoder staged": {
+   "max": 1
+  },
+  "2048, everything resident": {
+   "max": 0
+  }
+ },
+ "four_bit_many_references": {
+  "what": "7 to 10 references at 1024 crossed the old 32,768-key switch; 4-bit against 8-bit on the same request",
+  "dino": {
+   "7": 0.958,
+   "8": 0.924,
+   "9": 0.916,
+   "10": 0.76
+  },
+  "dreamsim": {
+   "7": 0.039,
+   "8": 0.085,
+   "9": 0.088,
+   "10": 0.186
+  },
+  "by_eye": "clean drawings, but subjects dropped or doubled",
+  "fix": "4-bit needs at least 15,360 target tokens and 30,720 keys"
+ },
+ "attention_kernel_ms": {
+  "what": "one decode call, 16,384 queries x 32,911 keys / 4,096 x 8,239",
+  "sageattention 2 (8-bit)": [
+   15.43,
+   1.074
+  ],
+  "8-bit, weights x values on block-scaled fp8": [
+   14.22,
+   0.975
+  ],
+  "4-bit weights x values": [
+   12.79,
+   0.858
+  ],
+  "both matmuls 4-bit": [
+   10.16,
+   0.679
+  ]
+ },
+ "tensor_core_tflops": {
+  "what": "native/peak.cu on the 5090 (170 SMs)",
+  "operands in registers": {
+   "bf16": 258,
+   "fp8 (plain e4m3)": 516,
+   "int8": 1024,
+   "mxfp8 (block-scaled)": 1024,
+   "nvfp4": 2030
+  },
+  "operands read from shared memory": {
+   "bf16": 257,
+   "mxfp8": 1000,
+   "nvfp4": 2015
+  },
+  "operands streamed from global memory (128 x 128 tiles)": {
+   "mxfp8": 590,
+   "nvfp4": 1108
+  },
+  "streamed, 128 x 256 tiles at half the stage depth": {
+   "mxfp8": 624,
+   "nvfp4": 1243
+  },
+  "cutlass kernels in use": {
+   "bf16 (torch)": 240,
+   "mxfp8": [
+    557,
+    708
+   ],
+   "nvfp4": [
+    1104,
+    1209
+   ]
+  }
+ },
+ "prefix_reuse_1024": {
+  "what": "a second, different edit of the same image (pipeline.render_kept), dit + vae",
+  "fresh_ms": 1193,
+  "resumed_ms": 1059,
+  "fresh_peak_gib": 13.55,
+  "resumed_peak_gib": 17.59,
+  "without_keep_peak_gib": 10.75,
+  "resumed_vs_fresh": {
+   "dino_min": 0.977,
+   "dino_median": 0.9986,
+   "dreamsim_max": 0.0141
+  }
+ },
+ "small_references_2048": {
+  "what": "2048 output, the condition image entering the dit smaller; dit + vae ms, peak, and scores against the full-size-reference output",
+  "2048 reference": {
+   "ms": 6800,
+   "peak_gib": 23.02
+  },
+  "1448 reference, 8-bit attention": {
+   "ms": 6637,
+   "peak_gib": 23.3,
+   "dino_min": 0.9913,
+   "dreamsim_max": 0.0115
+  },
+  "1024 reference, 8-bit attention": {
+   "ms": 5963,
+   "peak_gib": 22.72,
+   "dino_min": 0.9882,
+   "dreamsim_max": 0.0344
+  },
+  "1448 reference, 4-bit attention": {
+   "ms": 5686,
+   "peak_gib": 20.68,
+   "dino_min": 0.9915,
+   "dreamsim_max": 0.0136
+  },
+  "1024 reference, 4-bit attention": {
+   "ms": 5164,
+   "peak_gib": 20.52,
+   "dino_min": 0.9838,
+   "dreamsim_max": 0.027
+  }
+ },
+ "showcase": {
+  "images": 92,
+  "median_ms_1024_class": 1689,
+  "median_ms_2048_class": 7330,
+  "mode": "encoder staged",
+  "same_seed_note": "editing an image with the seed that generated it gives a harsh, over-sharpened result; a different seed fixes it"
+ }
+}
