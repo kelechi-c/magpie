@@ -91,7 +91,6 @@ that request and the next. It needs about 16 GiB of free host memory.
 | `MAGPIE_ENCODER=nvfp4` | a calibrated 4-bit text encoder: 9 GiB less on the card, slightly different images |
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
 | `MAGPIE_PROMPTS` | how many prompt and image pairs to remember (8; 0 turns it off) |
-| `MAGPIE_COMPILE_VAE=0` | leave the VAE decoder uncompiled (compiling costs the first decode of each size) |
 | `HF_HOME` | where weights are cached |
 
 ## from python

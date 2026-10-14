@@ -50,8 +50,8 @@ def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list
     return dit.eval(), adopt_vae(vae_state, mean, std)
 
 
-# the port's vae around already-loaded weights, channels-last. on the gpu its decoder is compiled (MAGPIE_COMPILE_VAE=0
-# leaves it eager; the first decode of each size pays the compile) and cudnn picks its convolution algorithms by timing.
+# the port's vae around already-loaded weights, channels-last. on the gpu cudnn picks its convolution algorithms by
+# timing; MAGPIE_COMPILE_VAE=1 also compiles the decoder (measured slower on the 5090: +127 ms at 1024, +3.4 gib at 2048).
 def adopt_vae(vae_state: dict[str, Tensor], mean: list[float], std: list[float]) -> Vae:
     reference = next(iter(vae_state.values()))
     vae = Vae(VaeConfig(), mean, std).to(reference.device, reference.dtype)
@@ -59,7 +59,7 @@ def adopt_vae(vae_state: dict[str, Tensor], mean: list[float], std: list[float])
     vae.to(memory_format=torch.channels_last)
     if reference.is_cuda:
         torch.backends.cudnn.benchmark = True
-        if os.environ.get("MAGPIE_COMPILE_VAE", "1") == "1":
+        if os.environ.get("MAGPIE_COMPILE_VAE") == "1":
             vae.decoder.compile()
     return vae.eval()
 
