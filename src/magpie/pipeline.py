@@ -195,15 +195,17 @@ def render_kept(
 # prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. above `look`, the encoder reads
 # look^2-pixel copies of the condition images while the vae still reads them at `resolution` (a 2048 edit encodes
 # three times faster and the gate does not see it); the slots are then resized to what the real images need.
-# look=None always shows the encoder the full-size images.
+# look=None always shows the encoder the full-size images. `reference` (default: `resolution`) is the side the condition
+# images enter the dit at: a 1024 reference for a 2048 output cuts the sequence from ~32,900 tokens to ~20,500.
 @torch.no_grad()
 def generate(
     models: Models, prompt: str, sampler: SamplerConfig, images: tuple[Image.Image, ...] = (),
-    size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = 1024,
+    size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = 1024, reference: int | None = None,
 ) -> Image.Image:
-    sized = resized(images, resolution)
-    small = look is not None and resolution > look
+    sized = resized(images, reference or resolution)
+    small = look is not None and (reference or resolution) > look
     text, slots = encode(models.encoder, models.processor, prompt, resized(images, look) if small else sized)
     if small:
         text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
-    return render(models.dit, models.vae, text, slots, sampler, sized, size, resolution, seed)
+    shape = size or (fit(resolution**2, images[-1].width / images[-1].height) if images else None)
+    return render(models.dit, models.vae, text, slots, sampler, sized, shape, resolution, seed)

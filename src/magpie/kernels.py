@@ -24,7 +24,7 @@ ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention ker
 PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "30720")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
 QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "30720")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
 FP4_QUERIES = int(os.environ.get("MAGPIE_FP4_QUERIES", "15360"))  # ... and only when the image being drawn has this many tokens (2048 squared, less the few percent a non-square size rounds away): seven 1024 references reach the key count too, and there the 4-bit kernel drops and doubles subjects
-ATTN8 = find_spec("magpie_attn8") is not None  # the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
+ATTN8 = find_spec("magpie_attn8") is not None and os.environ.get("MAGPIE_ATTN8") != "0"  # MAGPIE_ATTN8=0 falls back to sage's kernel; the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 

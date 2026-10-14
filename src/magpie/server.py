@@ -3,11 +3,12 @@
     python -m magpie.server [--host 0.0.0.0] [--port 8188]
 
     GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks"}
-    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "seed", "format"}
+    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format"}
                     -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib"}
 
 only `prompt` is required. with images and no width/height the output takes the last image's shape at `resolution`
-(1024 or 2048, the side of a square of the same area); with neither it is a square. MAGPIE_TOKEN, when set, must
+(1024 or 2048, the side of a square of the same area); with neither it is a square. `reference` (default: `resolution`)
+is the side the images enter the model at: 1024 for a 2048 output shortens its sequence by a third. MAGPIE_TOKEN, when set, must
 arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start).
 """
 
@@ -32,7 +33,7 @@ from magpie.sampling import TURBO
 from magpie.text import encode, load_encoder, reslot
 
 REPO = "Qwen/Qwen-Image-2.1-Turbo"
-PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16"  # private: the licence forbids passing weights on
+PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16"  # the transformer prepacked; qwen research license, non-commercial
 GIB = 2**30
 LOOK = 1024  # the encoder reads condition images no larger than this
 SMALL_CARD_GIB = 40  # below this the encoder cannot stay beside the dit for every request
@@ -67,8 +68,8 @@ def packed_path() -> pl.Path:
     return pl.Path(os.environ.get("HF_HOME", pl.Path.home() / ".cache/huggingface")) / "magpie" / f"turbo-nv_{'_'.join(sorted(NV))}-fp8_q_k_v_out.safetensors"
 
 
-# whether that file is there, downloading it from the private repo when it is not. false (no native matmul, or
-# no access to the repo) means the original transformer has to be packed here.
+# whether that file is there, downloading it from PACKED_REPO when it is not. false (no native matmul, or the
+# download failed) means the original transformer has to be packed here.
 def prepacked(local: pl.Path) -> bool:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import HfHubHTTPError
@@ -144,24 +145,25 @@ def elapsed(start: float) -> float:
 @torch.no_grad()
 def generate(runtime: Runtime, job: Job, parked: bool) -> tuple[Job, bool]:
     models, resolution = runtime.models, int(job.get("resolution", 1024))
+    reference = int(job.get("reference") or resolution)
     images = tuple(decoded(data) for data in job.get("images", []))
-    sized = pipeline.resized(images, resolution)
+    sized = pipeline.resized(images, reference)
     size = (round(job["width"] / 32) * 32, round(job["height"] / 32) * 32) if job.get("width") and job.get("height") else None
-    width, height = size or (sized[-1].size if sized else (resolution,) * 2)
+    width, height = size or (pipeline.fit(resolution**2, images[-1].width / images[-1].height) if images else (resolution,) * 2)
     crowded = runtime.parks and width * height + sum(image.width * image.height for image in sized) > RESIDENT_PIXELS
     torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     if parked:
         runtime.fetch()
     fetch_ms, start = elapsed(start), time.perf_counter()
-    small = resolution > LOOK
+    small = reference > LOOK
     text, slots = encode(models.encoder, models.processor, job["prompt"], pipeline.resized(images, LOOK) if small else sized)
     if small:
         text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
     text_ms, start = elapsed(start), time.perf_counter()
     if crowded:
         runtime.park()
-    image = pipeline.render(models.dit, models.vae, text, slots, TURBO, sized, size, resolution, int(job.get("seed", 0)))
+    image = pipeline.render(models.dit, models.vae, text, slots, TURBO, sized, (width, height), resolution, int(job.get("seed", 0)))
     render_ms, start = elapsed(start), time.perf_counter()
     fmt: Format = job.get("format", "png")
     reply = {"image": encoded(image, fmt), "format": fmt, "width": image.width, "height": image.height, "seed": int(job.get("seed", 0)),
