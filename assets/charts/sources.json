@@ -2,7 +2,7 @@
   "generated": "2026-10-14",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "cad0709a0f911cd2477bb5e8f6a8c87eb95b9cb3"
+    "head": "a9ac5ad08544e17c0aba9b873c5b74508a9d2f5e"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -30,7 +30,7 @@
   },
   "rtx5090": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/rtx5090.json",
-    "sha256": "e4aaeac85d6e1014fc58d00f28cfee1e76062c048c159a75ba088d32d8032ddf"
+    "sha256": "cc81cb35f29c71bb495b0d390099d269b19d31fa0ec068cb5967f90bacc25ae4"
   },
   "charts": {
     "stage-split": [
@@ -222,13 +222,18 @@
     ],
     "5090-references": [
       "rtx5090.memory_gib.card",
+      "rtx5090.references[1024, nvfp4 encoder resident].rows",
+      "rtx5090.references[1024, nvfp4 encoder resident].max",
+      "rtx5090.references[2048, nvfp4 encoder resident].rows",
+      "rtx5090.references[2048, nvfp4 encoder resident].max",
+      "rtx5090.references[1024, bf16 encoder resident].rows",
+      "rtx5090.references[1024, bf16 encoder resident].max",
+      "rtx5090.references[2048, bf16 encoder resident].rows",
+      "rtx5090.references[2048, bf16 encoder resident].max",
       "rtx5090.references[1024, encoder staged].rows",
       "rtx5090.references[1024, encoder staged].max",
-      "rtx5090.references[1024, everything resident].rows",
-      "rtx5090.references[1024, everything resident].max",
-      "rtx5090.references[1024, encoder staged].tested_to",
-      "rtx5090.references[2048, encoder staged].max",
-      "rtx5090.references[2048, everything resident].max"
+      "rtx5090.references[2048, encoder staged].rows",
+      "rtx5090.references[2048, encoder staged].max"
     ],
     "5090-cold-start": [
       "rtx5090.cold_start_s[files in page cache].imports",

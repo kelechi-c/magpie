@@ -86,9 +86,9 @@ repeat with another seed or size skips the encoder (`remembered` is then true). 
 `GET /health` reports the card.
 
 On a card under 40 GiB the text encoder steps aside to host memory when a request is too large to share
-the card with it, which costs about 0.4 s on that request and the next. With the 4-bit encoder that is past a
-2048² edit with a 2048² reference (or seven 1024² references); with the bf16 encoder, any 2048² request or more
-than three 1024² references. Stepping aside needs free host memory the size of the encoder.
+the card with it, which costs about 0.4 s on that request and the next. That is past twelve 1024² images of output
+plus references with the 4-bit encoder (a 1024² edit with eleven references stays resident), and past five with the
+bf16 encoder (four references). Stepping aside needs free host memory the size of the encoder.
 
 | environment | |
 |---|---|
@@ -116,8 +116,11 @@ Edit a generated image with a different seed from the one that drew it; the same
 ## limits
 
 - A 2048² edit on an RTX 5090 stays fully resident: 5.35 s and 18.2 GiB (1448² reference), 6.45 s and 19.7 GiB
-  with a 2048² reference; with the bf16 encoder, 5.41 s and 27.5 GiB. Reference counts at 1024² were measured before
-  the latest memory changes: eleven with the encoder off the card, three with the bf16 encoder resident.
+  with a 2048² reference; with the bf16 encoder, 5.41 s and 27.5 GiB.
+- References per edit, as Qwen suggests up to ten: an RTX PRO 6000 takes 10+ at both sizes with either encoder. An
+  RTX 5090 takes eleven at 1024² and six at 2048² (1448² references) with the 4-bit encoder resident, four and two
+  with the bf16 encoder, thirteen and seven with the encoder off the card. Each 1024² reference adds about 0.5 s and
+  1.4 GiB to a 1024² edit; each 1448² reference about 1.2 s and 1.9 GiB to a 2048² edit.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
 - Text-to-image keeps the subject, style and detail, but its composition can differ from the bf16 picture for the
   same seed (DINOv2 min 0.90 at 1024² and 2048²; the NVFP4 MLP weights shift it). It is judged on quality, not on

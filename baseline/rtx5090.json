@@ -177,97 +177,350 @@
   "dit + vae alone from disk": 3.9
  },
  "references": {
-  "what": "most condition images in one edit before out of memory; (count, dit + vae ms, peak gib)",
-  "1024, encoder staged": {
+  "what": "most condition images in one edit before out of memory; (count, dit + vae ms, peak gib); 2048 at the 1448 reference; one run per count (the 1-reference row from the five-warm latency run), 575 w pod, 2026-10-14",
+  "earlier": {
+   "1024, encoder staged": {
+    "max": 11,
+    "tested_to": 12,
+    "rows": [
+     [
+      1,
+      1173,
+      10.75
+     ],
+     [
+      2,
+      1490,
+      12.35
+     ],
+     [
+      3,
+      1817,
+      13.96
+     ],
+     [
+      4,
+      2194,
+      15.57
+     ],
+     [
+      5,
+      2611,
+      17.19
+     ],
+     [
+      6,
+      3040,
+      18.8
+     ],
+     [
+      7,
+      3523,
+      20.39
+     ],
+     [
+      8,
+      4104,
+      22.0
+     ],
+     [
+      9,
+      4541,
+      23.61
+     ],
+     [
+      10,
+      5100,
+      25.23
+     ],
+     [
+      11,
+      5640,
+      26.84
+     ]
+    ]
+   },
+   "1024, everything resident": {
+    "max": 3,
+    "rows": [
+     [
+      1,
+      1166,
+      25.93
+     ],
+     [
+      2,
+      1570,
+      27.53
+     ],
+     [
+      3,
+      1815,
+      29.14
+     ]
+    ]
+   },
+   "1024, calibrated nvfp4 encoder resident": {
+    "max": 6,
+    "note": "6 measured on the 8-bit kernel (24.71 gib); 7 to 11 fitted only with the 4-bit kernel, which is no longer used at this size; 9 by arithmetic"
+   },
+   "2048, encoder staged": {
+    "max": 1
+   },
+   "2048, everything resident": {
+    "max": 0
+   }
+  },
+  "1024, nvfp4 encoder resident": {
    "max": 11,
-   "tested_to": 12,
+   "out_of_memory_at": 12,
    "rows": [
     [
      1,
-     1173,
-     10.75
+     1153,
+     14.72
     ],
     [
      2,
-     1490,
-     12.35
+     1489,
+     16.11
     ],
     [
      3,
-     1817,
-     13.96
+     1814,
+     17.51
     ],
     [
      4,
-     2194,
-     15.57
+     2534,
+     18.91
     ],
     [
      5,
-     2611,
-     17.19
+     2564,
+     20.3
     ],
     [
      6,
-     3040,
-     18.8
+     2919,
+     21.7
     ],
     [
      7,
-     3523,
-     20.39
+     3423,
+     23.11
     ],
     [
      8,
-     4104,
-     22.0
+     3847,
+     24.51
     ],
     [
      9,
-     4541,
-     23.61
+     4556,
+     25.91
     ],
     [
      10,
-     5100,
-     25.23
+     4969,
+     27.31
     ],
     [
      11,
-     5640,
-     26.84
+     6686,
+     28.67
     ]
    ]
   },
-  "1024, everything resident": {
-   "max": 3,
+  "2048, nvfp4 encoder resident": {
+   "max": 6,
+   "out_of_memory_at": 7,
    "rows": [
     [
      1,
-     1166,
-     25.93
+     5517,
+     18.19
     ],
     [
      2,
-     1570,
-     27.53
+     6643,
+     19.67
     ],
     [
      3,
-     1815,
-     29.14
+     8163,
+     21.56
+    ],
+    [
+     4,
+     9000,
+     23.47
+    ],
+    [
+     5,
+     10331,
+     25.35
+    ],
+    [
+     6,
+     11642,
+     27.27
     ]
    ]
   },
-  "1024, calibrated nvfp4 encoder resident": {
-   "max": 6,
-   "note": "6 measured on the 8-bit kernel (24.71 gib); 7 to 11 fitted only with the 4-bit kernel, which is no longer used at this size; 9 by arithmetic"
+  "1024, bf16 encoder resident": {
+   "max": 4,
+   "out_of_memory_at": 5,
+   "rows": [
+    [
+     1,
+     1160,
+     23.99
+    ],
+    [
+     2,
+     1454,
+     25.37
+    ],
+    [
+     3,
+     1828,
+     26.77
+    ],
+    [
+     4,
+     2129,
+     28.17
+    ]
+   ]
+  },
+  "2048, bf16 encoder resident": {
+   "max": 2,
+   "out_of_memory_at": 3,
+   "rows": [
+    [
+     1,
+     5548,
+     27.45
+    ],
+    [
+     2,
+     6648,
+     28.94
+    ]
+   ]
+  },
+  "1024, encoder staged": {
+   "max": 13,
+   "out_of_memory_at": 14,
+   "rows": [
+    [
+     1,
+     1320,
+     12.46
+    ],
+    [
+     2,
+     1453,
+     13.86
+    ],
+    [
+     3,
+     1856,
+     15.26
+    ],
+    [
+     4,
+     2174,
+     16.66
+    ],
+    [
+     5,
+     2519,
+     18.06
+    ],
+    [
+     6,
+     2968,
+     19.46
+    ],
+    [
+     7,
+     3386,
+     20.86
+    ],
+    [
+     8,
+     3891,
+     22.26
+    ],
+    [
+     9,
+     4348,
+     23.66
+    ],
+    [
+     10,
+     5081,
+     25.06
+    ],
+    [
+     11,
+     5532,
+     26.43
+    ],
+    [
+     12,
+     6189,
+     27.83
+    ],
+    [
+     13,
+     6799,
+     29.23
+    ]
+   ]
   },
   "2048, encoder staged": {
-   "max": 1
-  },
-  "2048, everything resident": {
-   "max": 0
+   "max": 7,
+   "out_of_memory_at": 8,
+   "rows": [
+    [
+     1,
+     5756,
+     15.94
+    ],
+    [
+     2,
+     6610,
+     17.43
+    ],
+    [
+     3,
+     7789,
+     19.31
+    ],
+    [
+     4,
+     9043,
+     21.23
+    ],
+    [
+     5,
+     10324,
+     23.11
+    ],
+    [
+     6,
+     12067,
+     25.02
+    ],
+    [
+     7,
+     13265,
+     26.91
+    ]
+   ]
   }
  },
  "four_bit_many_references": {
