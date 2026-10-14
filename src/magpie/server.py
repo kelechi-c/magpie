@@ -1,8 +1,8 @@
 """http api for magpie: one qwen-image 2.1 turbo model on one gpu, one request at a time.
 
-    python -m magpie.server [--host 0.0.0.0] [--port 8188]
+    python -m magpie.server [--host 0.0.0.0] [--port 8188] [--encoder nvfp4|bf16]
 
-    GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks"}
+    GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks", "encoder"}
     POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format"}
                     -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib", "remembered"}
 
@@ -33,14 +33,16 @@ from PIL import Image
 from magpie import pipeline
 from magpie.kernels import MX, NV
 from magpie.sampling import TURBO
-from magpie.text import encode, load_encoder, reslot
+from magpie.text import ENCODER, Encoder, calibrated_folder, encode, load_encoder, reslot
 
 REPO = "Qwen/Qwen-Image-2.1-Turbo"
 PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16"  # the transformer prepacked; qwen research license, non-commercial
 GIB = 2**30
 LOOK = 1024  # the encoder reads condition images no larger than this
 SMALL_CARD_GIB = 40  # below this the encoder cannot stay beside the dit for every request
-RESIDENT_PIXELS = 4 * 1024**2  # output + reference pixels a 32 gb card holds with the encoder resident (measured: 3 references)
+# output + reference pixels a 32 gb card holds with the encoder resident. bf16: three 1024 references (measured).
+# nvfp4: a 2048 edit with a 2048 reference (measured, 19.7 gib); seven 1024 references are estimated (~26 gib).
+RESIDENT_PIXELS: dict[Encoder, int] = {"bf16": 4 * 1024**2, "nvfp4": 8 * 1024**2}
 PROMPTS = int(os.environ.get("MAGPIE_PROMPTS", "8"))  # conditionings kept for repeated requests
 Format = Literal["png", "jpeg", "webp"]
 Job = dict[str, Any]
@@ -55,6 +57,7 @@ class Runtime:
     fetch: Callable[[], None]
     park: Callable[[], None]
     parks: bool
+    encoder: Encoder
 
 
 # a `packed_state` file as written by the packer: fp8 tensors are stored as bytes under "<name>@f8".
@@ -104,8 +107,9 @@ def parking(encoder: Any) -> tuple[Callable[[], None], Callable[[], None]]:
 
 # downloads what is missing and puts dit, vae and encoder on the gpu. the dit comes prepacked when it can (and is
 # packed and saved here when it cannot);
-# the encoder gets a pinned host copy on cards under SMALL_CARD_GIB (or with MAGPIE_PARK=1) so it can step aside.
-def load() -> Runtime:
+# the encoder (`encoder_kind`: the calibrated nvfp4 checkpoint or the bf16 original) gets a pinned host copy on cards under
+# SMALL_CARD_GIB (or with MAGPIE_PARK=1) so it can step aside.
+def load(encoder_kind: Encoder = ENCODER) -> Runtime:
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file, save_file
 
@@ -124,10 +128,10 @@ def load() -> Runtime:
     if MX and not ready:  # packed here: keep it, so the next start reads one file and skips the bf16 transformer
         local.parent.mkdir(parents=True, exist_ok=True)
         save_file(to_disk(pipeline.packed_state(dit)), local)
-    encoder, processor = load_encoder(snapshot)
+    encoder, processor = load_encoder(snapshot, nvfp4_from=calibrated_folder(encoder_kind))
     parks = os.environ.get("MAGPIE_PARK") == "1" or torch.cuda.get_device_properties(0).total_memory < SMALL_CARD_GIB * GIB
     fetch, park = parking(encoder) if parks else (lambda: None, lambda: None)
-    return Runtime(pipeline.Models(encoder, processor, dit, vae), fetch, park, parks)
+    return Runtime(pipeline.Models(encoder, processor, dit, vae), fetch, park, parks, encoder_kind)
 
 
 def decoded(data: str) -> Image.Image:
@@ -162,7 +166,7 @@ def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered) -
     sized = pipeline.resized(images, reference)
     size = (round(job["width"] / 32) * 32, round(job["height"] / 32) * 32) if job.get("width") and job.get("height") else None
     width, height = size or (pipeline.fit(resolution**2, images[-1].width / images[-1].height) if images else (resolution,) * 2)
-    crowded = runtime.parks and width * height + sum(image.width * image.height for image in sized) > RESIDENT_PIXELS
+    crowded = runtime.parks and width * height + sum(image.width * image.height for image in sized) > RESIDENT_PIXELS[runtime.encoder]
     key = (job["prompt"], tuple((image.size, hashlib.blake2b(image.tobytes(), digest_size=16).hexdigest()) for image in sized))
     hit = key in remembered
     torch.cuda.reset_peak_memory_stats()
@@ -215,7 +219,7 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:
             props = torch.cuda.get_device_properties(0)
             health = {"gpu": props.name, "vram_gib": round(props.total_memory / GIB, 1), "allocated_gib": round(torch.cuda.memory_allocated() / GIB, 2),
-                      "busy": lock.locked(), "parks": runtime.parks}
+                      "busy": lock.locked(), "parks": runtime.parks, "encoder": runtime.encoder}
             self.reply(*((200, health) if self.path == "/health" and self.allowed() else (401 if self.path == "/health" else 404, {"error": "not found or not allowed"})))
 
         def do_POST(self) -> None:
@@ -246,10 +250,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8188)
+    parser.add_argument("--encoder", choices=("nvfp4", "bf16"), default=ENCODER, help="text encoder: calibrated 4-bit (default) or the bf16 original")
     args = parser.parse_args()
     start = time.perf_counter()
-    runtime = load()
-    print(f"loaded in {time.perf_counter() - start:.1f} s, encoder {'parks when crowded' if runtime.parks else 'resident'}; listening on {args.host}:{args.port}", flush=True)
+    runtime = load(args.encoder)
+    print(f"loaded in {time.perf_counter() - start:.1f} s, {runtime.encoder} encoder {'parks when crowded' if runtime.parks else 'resident'}; listening on {args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), handler(runtime)).serve_forever()
 
 

@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from magpie.kernels import NV_WEIGHT, Fp8Linear, MxMlp, mx_columns, mx_project, mx_rows, nv_rows, nv_slots, pack_mlp_nv, swiglu_block
 
 Format = Literal["bf16", "mxfp8", "nvfp4"]
+Encoder = Literal["nvfp4", "bf16"]  # the text encoder a run loads: the calibrated 4-bit checkpoint, or the original
 
 SYSTEM = "Comprehend and analyze the provided prompt."
 SLOT = "<image{}><|vision_start|><|image_pad|><|vision_end|>"
@@ -100,15 +101,16 @@ def unpacked(state: dict[str, Tensor], name: str) -> Tensor:
 
 
 CALIBRATED = "kaitchup/Qwen3-VL-8B-Instruct-NVFP4"  # auto-round w4a4 of the stock qwen3-vl-8b-instruct language model, apache-2.0
+ENCODER: Encoder = "bf16" if os.environ.get("MAGPIE_ENCODER") == "bf16" else "nvfp4"  # MAGPIE_ENCODER=bf16 picks the original
 
 
-# the calibrated nvfp4 encoder's folder when MAGPIE_ENCODER=nvfp4 asks for it (downloaded once), else None. it holds
-# 5.9 gib instead of 15.2, which lets a 32 gb card keep encoder, dit and vae loaded for 1024 edits; it fails the
-# gate on one image in sixteen (a different composition, not damage), so it is not the default.
-def calibrated_folder() -> pl.Path | None:
+# the calibrated nvfp4 encoder's folder for "nvfp4" (downloaded once), None for "bf16". it holds 5.9 gib instead of
+# 15.2, so a 32 gb card keeps encoder, dit and vae loaded even for a 2048 edit. against the bf16 encoder it moves one
+# edit in sixteen past the gate by composition, not damage (the vlm judge ties or flips with the order); the default.
+def calibrated_folder(encoder: Encoder = ENCODER) -> pl.Path | None:
     from huggingface_hub import snapshot_download
 
-    return pl.Path(snapshot_download(CALIBRATED, allow_patterns=["*.safetensors", "config.json"])) if os.environ.get("MAGPIE_ENCODER") == "nvfp4" else None
+    return pl.Path(snapshot_download(CALIBRATED, allow_patterns=["*.safetensors", "config.json"])) if encoder == "nvfp4" else None
 
 
 # a decoder layer's swiglu mlp on block-scaled weights; `nv` names its matmuls that run in nvfp4.
@@ -127,13 +129,13 @@ class PackedMlp(nn.Module):
 # language model's mlps and of its q, k, v, o projections; the bf16 originals are released. the vision tower stays bf16.
 # `nvfp4_from` is the folder of a calibrated nvfp4 checkpoint of the same model: its seven linears per layer replace
 # ours (the mlp then runs as three matmuls, since its gate and up layers carry different scales).
+# callers pass `calibrated_folder()` for the run's choice (MAGPIE_ENCODER); None keeps bf16.
 def load_encoder(snapshot: pl.Path, mlp: Format = "bf16", attention: Format = "bf16", nvfp4_from: pl.Path | None = None) -> tuple[Any, Any]:
     from safetensors.torch import load_file
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(snapshot / "text_encoder", dtype=torch.bfloat16)
     encoder.lm_head = nn.Identity()
-    nvfp4_from = nvfp4_from or calibrated_folder()
     # the calibrated linears replace ours while the model is still in host memory, so their bf16 originals never reach the gpu
     encoder = (encoder if nvfp4_from else encoder.to("cuda")).eval()
     state = {name: tensor for file in sorted(nvfp4_from.glob("*.safetensors")) for name, tensor in load_file(file).items()} if nvfp4_from else {}

@@ -7,12 +7,15 @@ matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that 
 
 | whole request, text encoder included | edit 1024² | edit 2048² |
 |---|---|---|
-| **magpie, RTX 5090** | **1.31 s** | **7.14 s** |
+| **magpie, RTX 5090** | **1.27 s** | **5.35 s** |
 | official diffusers pipeline, RTX 5090 (CPU offload) | 27.1 s | out of memory |
-| magpie, RTX PRO 6000 | 1.10 s | 5.80 s |
+| magpie, RTX PRO 6000 (bf16 text encoder) | 1.10 s | 5.80 s |
 
-Median of five warm requests. Both edit sizes pass a 16-image gate against the bf16 baseline (DINOv2 ≥ 0.98,
-DreamSim ≤ 0.05). Numbers are in `baseline/rtx5090.json` and `baseline/compare.json`.
+Median of five warm requests, everything resident, with the default calibrated 4-bit text encoder and, for 2048², a
+1448² reference. The transformer and VAE pass a 16-image gate against the bf16 baseline at both sizes (DINOv2 ≥ 0.98,
+DreamSim ≤ 0.05). The 4-bit encoder moves one of the sixteen edits' composition past that line (DINOv2 0.94; a VLM
+judge calls it a tie); `--encoder bf16` keeps the original. Numbers are in `baseline/rtx5090.json` and
+`baseline/compare.json`.
 
 ## requirements
 
@@ -53,10 +56,11 @@ Check (torch first: the extensions link against its libraries): `python -c "impo
 ## the server
 
 ```
-MAGPIE_TOKEN=<secret> python -m magpie.server --port 8188
+MAGPIE_TOKEN=<secret> python -m magpie.server --port 8188 [--encoder nvfp4|bf16]
 ```
 
-It loads the model once and takes one request at a time.
+It loads the model once and takes one request at a time. `--encoder` picks the text encoder: `nvfp4` (default), a
+calibrated 4-bit checkpoint at 5.9 GiB, or `bf16`, the original at 15.2 GiB.
 
 ```
 curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-Type: application/json" \
@@ -82,13 +86,14 @@ repeat with another seed or size skips the encoder (`remembered` is then true). 
 `GET /health` reports the card.
 
 On a card under 40 GiB the text encoder steps aside to host memory when a request is too large to share
-the card with it (any 2048² request, or more than three 1024² references), which costs about 0.4 s on
-that request and the next. It needs about 16 GiB of free host memory.
+the card with it, which costs about 0.4 s on that request and the next. With the 4-bit encoder that is past a
+2048² edit with a 2048² reference (or seven 1024² references); with the bf16 encoder, any 2048² request or more
+than three 1024² references. Stepping aside needs free host memory the size of the encoder.
 
 | environment | |
 |---|---|
 | `MAGPIE_TOKEN` | when set, requests must carry `Authorization: Bearer <token>` |
-| `MAGPIE_ENCODER=nvfp4` | a calibrated 4-bit text encoder: 9 GiB less on the card, slightly different images |
+| `MAGPIE_ENCODER=bf16` | the original text encoder, as `--encoder bf16` (default `nvfp4`) |
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
 | `MAGPIE_PROMPTS` | how many prompt and image pairs to remember (8; 0 turns it off) |
 | `HF_HOME` | where weights are cached |
@@ -110,9 +115,9 @@ Edit a generated image with a different seed from the one that drew it; the same
 
 ## limits
 
-- An RTX 5090 fits one reference at 2048² and up to eleven at 1024² (three with the encoder resident). A 2048² edit
-  stays fully resident: 5.35 s and 18.2 GiB with `MAGPIE_ENCODER=nvfp4` (1448² reference), 5.41 s and 27.5 GiB with
-  the bf16 encoder.
+- A 2048² edit on an RTX 5090 stays fully resident: 5.35 s and 18.2 GiB (1448² reference), 6.45 s and 19.7 GiB
+  with a 2048² reference; with the bf16 encoder, 5.41 s and 27.5 GiB. Reference counts at 1024² were measured before
+  the latest memory changes: eleven with the encoder off the card, three with the bf16 encoder resident.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
 - Text-to-image keeps the subject, style and detail, but its composition can differ from the bf16 picture for the
   same seed (DINOv2 min 0.90 at 1024² and 2048²; the NVFP4 MLP weights shift it). It is judged on quality, not on
