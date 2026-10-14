@@ -122,5 +122,68 @@
    "peak_gib": 38.02
   },
   "note": "attn8 saves ~3 ms per 1024 edit on this card (2 % per attention call, 224 calls); the 1,095 ms headline is within session noise of these"
+ },
+ "references_pro6000": {
+  "what": "most condition images in one edit before out of memory, everything resident, one run per count (2026-10-14, colab g4); 2048 at the 1448 reference; [count, dit + vae ms, peak gib] at 10 and the most (the first counts include warm-up)",
+  "1024, nvfp4 encoder": {
+   "max": 41,
+   "rows": [
+    [
+     10,
+     4165,
+     27.31
+    ],
+    [
+     41,
+     31162,
+     71.43
+    ]
+   ]
+  },
+  "2048, nvfp4 encoder": {
+   "max": 35,
+   "rows": [
+    [
+     10,
+     15686,
+     34.92
+    ],
+    [
+     35,
+     77138,
+     83.8
+    ]
+   ]
+  },
+  "1024, bf16 encoder": {
+   "max": 36,
+   "rows": [
+    [
+     10,
+     4185,
+     36.57
+    ],
+    [
+     36,
+     25139,
+     73.57
+    ]
+   ]
+  },
+  "2048, bf16 encoder": {
+   "max": 30,
+   "rows": [
+    [
+     10,
+     15637,
+     44.19
+    ],
+    [
+     30,
+     61211,
+     83.28
+    ]
+   ]
+  }
  }
 }
