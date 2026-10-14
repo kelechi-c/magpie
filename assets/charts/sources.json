@@ -2,7 +2,7 @@
   "generated": "2026-10-14",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "be792e192daa40611aca20bcc07c19396eaa4339"
+    "head": "ac8e1291e6c22f66976df582e82a60031c7fa299"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -30,7 +30,7 @@
   },
   "rtx5090": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/rtx5090.json",
-    "sha256": "21f4c95c35e107cc3e514c95886fbb1ca9399099812bd5ca73f53ab288352fee"
+    "sha256": "c330f32eccc0e41e31314b851591294bbc818e643ccc272395c75f69f6162172"
   },
   "charts": {
     "stage-split": [
@@ -264,33 +264,16 @@
       "rtx5090.small_references_2048[1448 reference, 4-bit attention].ms",
       "rtx5090.small_references_2048[1024 reference, 4-bit attention].ms",
       "rtx5090.prefix_reuse_1024.resumed_vs_fresh.dino_min",
-      "rtx5090.small_references_2048[1448 reference, 8-bit attention].dino_min",
-      "rtx5090.small_references_2048[1024 reference, 8-bit attention].dino_min",
-      "rtx5090.small_references_2048[1448 reference, 4-bit attention].dino_min",
-      "rtx5090.small_references_2048[1024 reference, 4-bit attention].dino_min"
-    ],
-    "5090-memory-vs-latency": [
-      "rtx5090.memory_gib.card",
-      "rtx5090.whole_request_ms[edit 1024][magpie, everything resident].total",
-      "rtx5090.whole_request_ms[edit 1024][magpie, everything resident].peak_gib",
-      "rtx5090.whole_request_ms[edit 1024][magpie, encoder staged].total",
-      "rtx5090.whole_request_ms[edit 1024][magpie, encoder staged].peak_gib",
-      "rtx5090.whole_request_ms[edit 1024][magpie, calibrated nvfp4 encoder, resident].total",
-      "rtx5090.whole_request_ms[edit 1024][magpie, calibrated nvfp4 encoder, resident].peak_gib",
-      "rtx5090.whole_request_ms[edit 1024][sglang fp8 + sage].total",
-      "rtx5090.whole_request_ms[edit 1024][sglang fp8 + sage].peak_gib",
-      "rtx5090.whole_request_ms[edit 1024][sglang default].total",
-      "rtx5090.whole_request_ms[edit 1024][sglang default].peak_gib",
-      "rtx5090.whole_request_ms[edit 1024][official diffusers, cpu offload].total",
-      "rtx5090.whole_request_ms[edit 1024][official diffusers, cpu offload].peak_gib",
-      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].total",
-      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].peak_gib",
-      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].total",
-      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].peak_gib",
-      "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].total",
-      "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].peak_gib",
-      "rtx5090.whole_request_ms[edit 2048][sglang default].total",
-      "rtx5090.whole_request_ms[edit 2048][sglang default].peak_gib"
+      "rtx5090.small_references_2048[2048 reference].frozen_dino_min",
+      "rtx5090.small_references_2048[2048 reference].pass",
+      "rtx5090.small_references_2048[1448 reference, 8-bit attention].frozen_dino_min",
+      "rtx5090.small_references_2048[1448 reference, 8-bit attention].pass",
+      "rtx5090.small_references_2048[1024 reference, 8-bit attention].frozen_dino_min",
+      "rtx5090.small_references_2048[1024 reference, 8-bit attention].pass",
+      "rtx5090.small_references_2048[1448 reference, 4-bit attention].frozen_dino_min",
+      "rtx5090.small_references_2048[1448 reference, 4-bit attention].pass",
+      "rtx5090.small_references_2048[1024 reference, 4-bit attention].frozen_dino_min",
+      "rtx5090.small_references_2048[1024 reference, 4-bit attention].pass"
     ],
     "5090-staged-vs-resident": [
       "rtx5090.memory_gib.resident idle",
@@ -315,6 +298,34 @@
       "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].free",
       "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].dit_vae",
       "rtx5090.whole_request_ms[edit 2048][magpie, everything resident]"
+    ],
+    "5090-memory-vs-latency-1024": [
+      "rtx5090.memory_gib.card",
+      "rtx5090.whole_request_ms[edit 1024][magpie, everything resident].total",
+      "rtx5090.whole_request_ms[edit 1024][magpie, everything resident].peak_gib",
+      "rtx5090.whole_request_ms[edit 1024][magpie, encoder staged].total",
+      "rtx5090.whole_request_ms[edit 1024][magpie, encoder staged].peak_gib",
+      "rtx5090.whole_request_ms[edit 1024][magpie, calibrated nvfp4 encoder, resident].total",
+      "rtx5090.whole_request_ms[edit 1024][magpie, calibrated nvfp4 encoder, resident].peak_gib",
+      "rtx5090.whole_request_ms[edit 1024][sglang fp8 + sage].total",
+      "rtx5090.whole_request_ms[edit 1024][sglang fp8 + sage].peak_gib",
+      "rtx5090.whole_request_ms[edit 1024][sglang default].total",
+      "rtx5090.whole_request_ms[edit 1024][sglang default].peak_gib",
+      "rtx5090.whole_request_ms[edit 1024][official diffusers, cpu offload].total",
+      "rtx5090.whole_request_ms[edit 1024][official diffusers, cpu offload].peak_gib"
+    ],
+    "5090-memory-vs-latency-2048": [
+      "rtx5090.memory_gib.card",
+      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].total",
+      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].peak_gib",
+      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].total",
+      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged, 8-bit attention].peak_gib",
+      "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].total",
+      "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].peak_gib",
+      "rtx5090.whole_request_ms[edit 2048][sglang default].total",
+      "rtx5090.whole_request_ms[edit 2048][sglang default].peak_gib",
+      "rtx5090.whole_request_ms[edit 2048][magpie, nvfp4 encoder, 1448 reference, resident, 4-bit attention].total",
+      "rtx5090.whole_request_ms[edit 2048][magpie, nvfp4 encoder, 1448 reference, resident, 4-bit attention].peak_gib"
     ]
   }
 }

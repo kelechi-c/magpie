@@ -90,5 +90,37 @@
   "sglang's 20 ms and 2 ms text stages are conditioning-cache hits on a repeated prompt; magpie re-encodes every request",
   "sglang --enable-torch-compile failed to start for this model on 0.5.21 (pack_qkv_weights); --performance-mode speed measured the same as default (2,184 / 1,730 / 13,713 ms) at 41-64 gib",
   "fractalyze's showcase (1.85 s on an rtx 5090) is text-to-image with the 40-step base model and step caching: a different model, step count and task, not placed on these axes"
- ]
+ ],
+ "attn8_pro6000": {
+  "measured": "2026-10-14, colab rtx pro 6000 blackwell server edition (driver 580.82), edit 1024 whole request, each run its own process, median of 5 warm",
+  "attn8": {
+   "total_ms": 1082.8,
+   "text_ms": 104.1,
+   "dit_vae_ms": 979.4,
+   "peak_gib": 25.93
+  },
+  "sage (MAGPIE_ATTN8=0)": {
+   "total_ms": 1087.0,
+   "text_ms": 101.8,
+   "dit_vae_ms": 985.1,
+   "peak_gib": 25.93
+  },
+  "attn8 again": {
+   "total_ms": 1085.6,
+   "text_ms": 102.1,
+   "dit_vae_ms": 983.4,
+   "peak_gib": 25.93
+  },
+  "attention call 4096 x 8239": {
+   "attn8_ms": 0.867,
+   "sage_ms": 0.886
+  },
+  "edit 2048 (4-bit path, unchanged)": {
+   "total_ms": 5801.3,
+   "text_ms": 103.4,
+   "dit_vae_ms": 5697.9,
+   "peak_gib": 38.02
+  },
+  "note": "attn8 saves ~3 ms per 1024 edit on this card (2 % per attention call, 224 calls); the 1,095 ms headline is within session noise of these"
+ }
 }
