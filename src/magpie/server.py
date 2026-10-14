@@ -40,9 +40,10 @@ PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16
 GIB = 2**30
 LOOK = 1024  # the encoder reads condition images no larger than this
 SMALL_CARD_GIB = 40  # below this the encoder cannot stay beside the dit for every request
-# output + reference pixels a 32 gb card holds with the encoder resident. bf16: three 1024 references (measured).
-# nvfp4: a 2048 edit with a 2048 reference (measured, 19.7 gib); seven 1024 references are estimated (~26 gib).
-RESIDENT_PIXELS: dict[Encoder, int] = {"bf16": 4 * 1024**2, "nvfp4": 8 * 1024**2}
+# output + reference pixels a 32 gb card holds with the encoder resident (rtx 5090, measured 2026-10-14): a 1024 edit
+# with four references for bf16 (five fail), with eleven for nvfp4 (28.7 gib; twelve fail). pixels are a rough proxy:
+# a 2048 edit at the 1448 reference also fits with two (bf16) or six (nvfp4) references, but parks past these lines.
+RESIDENT_PIXELS: dict[Encoder, int] = {"bf16": 5 * 1024**2, "nvfp4": 12 * 1024**2}
 PROMPTS = int(os.environ.get("MAGPIE_PROMPTS", "8"))  # conditionings kept for repeated requests
 Format = Literal["png", "jpeg", "webp"]
 Job = dict[str, Any]
