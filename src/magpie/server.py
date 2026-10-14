@@ -23,6 +23,7 @@ import pathlib as pl
 import threading
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Literal
 
@@ -186,10 +187,12 @@ def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered) -
     return {**reply, "ms": ms}, crowded or (parked and hit), remembered
 
 
-# the request handler for one runtime. the gpu takes one job at a time (`lock`); `state` holds whether the last job
-# left the encoder off the card and the conditionings kept, as the last `generate` returned them.
+# the request handler for one runtime. the gpu takes one job at a time (`lock`), always on the same thread (`gpu`): the
+# first gpu work on a new thread costs ~1.6 s (measured on the 5090: 2.7 s instead of 1.1 s for a 1024 edit), and the
+# server gives every connection a new one. `state` holds whether the last job left the encoder off the card and the
+# conditionings kept, as the last `generate` returned them.
 def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
-    lock, state, token = threading.Lock(), [False, {}], os.environ.get("MAGPIE_TOKEN")
+    lock, gpu, state, token = threading.Lock(), ThreadPoolExecutor(1), [False, {}], os.environ.get("MAGPIE_TOKEN")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"  # keep-alive: a proxy in front reuses its connection, and http/1.0 would close it under it
@@ -223,11 +226,11 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 return self.reply(400, {"error": "prompt is required"})
             with lock:
                 try:
-                    body, *state[:] = generate(runtime, job, *state)
+                    body, *state[:] = gpu.submit(generate, runtime, job, *state).result()
                 except torch.OutOfMemoryError as error:  # the one failure a caller can act on: ask for less
                     message = str(error)[:200]
                     del error
-                    runtime.park()
+                    gpu.submit(runtime.park).result()
                     state[0] = runtime.parks
                     return self.reply(507, {"error": f"out of gpu memory: {message}"})
             print(f"{body['width']}x{body['height']} {len(job.get('images', []))} images {body['ms']} peak {body['peak_gib']} gib", flush=True)
