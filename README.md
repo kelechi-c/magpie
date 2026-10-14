@@ -1,5 +1,6 @@
 # magpie
 
+custom runtime for Qwen-Image 2.1 Turbo on Blackwell/sm_120 GPUs (like the 5090). 
 Qwen-Image 2.1 Turbo (8 steps, one 7.1 B transformer for text-to-image and image editing) made fast on
 Blackwell GPUs (sm_120: RTX 5090, RTX PRO 6000): a lean PyTorch port with block-scaled FP8 and NVFP4
 matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that stays quantised.
@@ -16,10 +17,11 @@ DreamSim ≤ 0.05). Numbers are in `baseline/rtx5090.json` and `baseline/compare
 ## requirements
 
 - A Blackwell GPU with a driver ≥ 580, CUDA 13, PyTorch 2.14.
-- About 31 GiB of weights from `Qwen/Qwen-Image-2.1-Turbo`, downloaded on first start.
-- The fast paths are native extensions built from `native/` on the machine that runs them (`magpie_gemm`,
-  `magpie_attn`, `magpie_attn4`, `magpie_attn8`, on CUTLASS and SageAttention 2 headers). Without them
-  magpie falls back to its Triton and PyTorch paths: same images, slower.
+- About 31 GiB of weights from `Qwen/Qwen-Image-2.1-Turbo`, downloaded on first start. The transformer comes
+  prepacked from [tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16](https://huggingface.co/tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16)
+  (under the same license); without the native matmul kernels it loads the original bf16 transformer instead.
+- The fast paths are native extensions built from `native/` on the machine that runs them (see below).
+  Without them magpie falls back to its Triton and PyTorch paths: same images, slower.
 
 ## install
 
@@ -27,6 +29,26 @@ DreamSim ≤ 0.05). Numbers are in `baseline/rtx5090.json` and `baseline/compare
 git clone https://github.com/kelechi-c/magpie && cd magpie
 pip install -e .
 ```
+
+## build the kernels
+
+```
+bash tools/build_native.sh
+```
+
+Run it once per machine, inside the Python environment magpie runs in. It needs `nvcc` from CUDA 13
+(`CUDA_HOME`, default `/usr/local/cuda`) and gcc with C++20, and takes about ten minutes. It fetches
+SageAttention 2 and CUTLASS at pinned commits into `MAGPIE_DEPS` (default `~/.cache/magpie`), installs
+`sageattention`, and builds four extensions into the environment:
+
+| extension | from | used for |
+|---|---|---|
+| `magpie_gemm` | `native/gemm.cu` on CUTLASS | block-scaled MXFP8 and NVFP4 matmuls in the transformer |
+| `magpie_attn8` | `native/attn.cu` | 8-bit attention, everything below 2048-class outputs |
+| `magpie_attn4` | `native/attn.cu` | 4-bit attention (both matmuls) for 2048-class outputs |
+| `magpie_attn` | `native/attn.cu` | 4-bit weights × values only; switches the 4-bit path on, and runs it when `MAGPIE_QK4_KEYS` is raised |
+
+Check (torch first: the extensions link against its libraries): `python -c "import torch, magpie_gemm, magpie_attn, magpie_attn4, magpie_attn8, sageattention"`.
 
 ## the server
 
