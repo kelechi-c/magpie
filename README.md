@@ -114,9 +114,9 @@ Edit a generated image with a different seed from the one that drew it; the same
   stays fully resident: 5.35 s and 18.2 GiB with `MAGPIE_ENCODER=nvfp4` (1448² reference), 5.41 s and 27.5 GiB with
   the bf16 encoder.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
-- Text-to-image keeps the subject and style but shifts the composition against the bf16 baseline: it does not pass
-  the gate (DINOv2 min 0.90 at 1024² and 2048²). The NVFP4 MLP weights cause it; with MXFP8 MLP weights it passes
-  (0.984 at 1024²).
+- Text-to-image keeps the subject, style and detail, but its composition can differ from the bf16 picture for the
+  same seed (DINOv2 min 0.90 at 1024² and 2048²; the NVFP4 MLP weights shift it). It is judged on quality, not on
+  matching that picture.
 - Turbo only. The 40-step base checkpoint runs in the port but is not tuned or gated.
 
 ## layout
