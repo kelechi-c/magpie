@@ -115,7 +115,7 @@ class SageKV(NamedTuple):
     tail: tuple[Tensor, Tensor]
     start: int
     held: tuple[Tensor, Tensor]
-    head: tuple[Tensor, Tensor] | None = None  # bf16 (keys, values) of the rows before the last condition image's end, when kept for a later request
+    head: tuple[Tensor, Tensor, Tensor] | None = None  # bf16 (keys, values) of the text rows before the last condition image's end, and their row numbers, when kept for a later request
 
 
 # bf16 values (tokens, heads, DIM) -> fp8 in sage's layout, for one head and TOKENS output slots: out[channel, head,
@@ -177,12 +177,12 @@ def sage_tail(kv: SageKV) -> tuple[Tensor, Tensor]:
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
 # number of leading rows that will never change, `rows` the number before the target; `tail` is another layer's to
-# share (a fresh one when None). from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
+# share (a fresh one when None); `keep`, row numbers before `prefix`, keeps those rows in bf16 too (`head`). from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 # from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
 # that basis) taken off, `k_scale` (1, heads, S padded to 64, 8) bytes, one e4m3 scale per 16 dimensions.
-def sage_pack(k: Tensor, v: Tensor, prefix: int, rows: int, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> SageKV:
+def sage_pack(k: Tensor, v: Tensor, prefix: int, rows: int, keep: Tensor | None = None, tail: tuple[Tensor, Tensor] | None = None) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
     wide = tokens - prefix >= FP4_QUERIES
@@ -200,7 +200,7 @@ def sage_pack(k: Tensor, v: Tensor, prefix: int, rows: int, keep: bool = False, 
         keys, scales, mean = torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), k.mean(dim=1)
     tail = tail or (torch.empty_like(k[:, start:]), torch.empty_like(v[:, start:]))
     held = (k[:, start:rows].clone(), v[:, start:rows].clone())
-    kv = SageKV(keys, scales, values, step, mean, tail, start, held, (k[:, :prefix].clone(), v[:, :prefix].clone()) if keep else None)
+    kv = SageKV(keys, scales, values, step, mean, tail, start, held, None if keep is None else (k[:, keep].clone(), v[:, keep].clone(), keep))
     return sage_write(kv, k, v, 0)
 
 
@@ -229,6 +229,51 @@ def sage_refit(kv: SageKV, tokens: int, head: int, tail: tuple[Tensor, Tensor] |
         values[..., : kv.start] = kv.v[..., : kv.start]
     tail = tail or tuple(old.new_empty(1, tokens - kv.start, *old.shape[2:]) for old in kv.tail)
     return SageKV(keys, scales, values, kv.v_scale, kv.mean, tail, kv.start, held, kv.head)
+
+
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # the eight nvfp4 magnitudes
+
+
+# nvfp4 bytes (..., n) -> fp32 (..., 2n): the low nibble is the even element; bit 3 of a nibble is the sign.
+def fp4_values(packed: Tensor) -> Tensor:
+    codes = torch.stack([packed & 15, packed >> 4], dim=-1).flatten(-2).long()
+    magnitude = torch.tensor(E2M1, device=packed.device)[codes & 7]
+    return torch.where(codes >= 8, -magnitude, magnitude)
+
+
+# the inverse of sage's 16-key shuffle of fp8 values (`value_fp8_kernel`) and of the 64-key tile order of nvfp4 values:
+# for each key of a group, the slot it was stored in.
+@functools.lru_cache
+def key_slots(group: int, device: torch.device) -> Tensor:
+    slot = torch.arange(group)
+    place = slot % 16
+    token = slot - place + ((place // 2) % 2) * 8 + (place // 4) * 2 + place % 2 if group == 16 else \
+        32 * (slot // 32) + 8 * ((slot % 8) // 2) + 2 * ((slot % 32) // 8) + slot % 2
+    return torch.argsort(token).to(device)
+
+
+# a kept cache's rows before `start` back in bf16 (1, start, heads, dim), dequantised from whichever form they are in,
+# with the text rows `head` keeps put back exactly. what a resumed request's closing text attends to.
+def sage_unpack(kv: SageKV) -> tuple[Tensor, Tensor]:
+    rows, heads = kv.start, kv.k.shape[2]
+    if kv.k.dtype == torch.uint8:  # nvfp4 in a hadamard basis, one e4m3 scale per 16 dimensions, step-1 mean taken off
+        scale = kv.k_scale[0, :, :rows].view(torch.float8_e4m3fn).float().transpose(0, 1).repeat_interleave(16, -1)
+        keys = (fp4_values(kv.k[0, :rows]) * scale + kv.mean[0]) @ hadamard(scale.shape[-1], kv.k.device)
+    else:  # int8 with the step-1 mean taken off, one step per 64 keys
+        keys = kv.k[0, :rows].float() * kv.k_scale[0, :, : rows // KEY_BLOCK].repeat_interleave(KEY_BLOCK, -1).t()[..., None] + kv.mean[0].float()
+    if kv.v.dtype == torch.uint8:  # 64-key tiles: per channel 32 bytes of nibbles in slot order, then 4 scale bytes per channel
+        tiles = kv.v[0, :, : rows // KEY_BLOCK]
+        dim = tiles.shape[-1] // 36
+        nibbles = fp4_values(tiles[..., : dim * 32].unflatten(-1, (dim, 32)))
+        scale = tiles[..., dim * 32 :].view(torch.float8_e4m3fn).float().unflatten(-1, (dim, 4)).repeat_interleave(16, -1)
+        values = (nibbles * scale)[..., key_slots(KEY_BLOCK, kv.v.device)].permute(1, 3, 0, 2).flatten(0, 1)
+        values = (values + kv.v_scale[0]) @ hadamard(dim, kv.v.device)
+    else:  # fp8 (dim, heads, slots) with one step per (head, channel) and the keys shuffled in 16s
+        values = kv.v[0, :, :, :rows].float().permute(2, 1, 0) * kv.v_scale[0]
+        values = values.unflatten(0, (-1, 16))[:, key_slots(16, kv.v.device)].flatten(0, 1)
+    keys, values = keys[None].bfloat16(), values[None].bfloat16()
+    keys[:, kv.head[2]], values[:, kv.head[2]] = kv.head[0], kv.head[1]
+    return keys, values
 
 
 # `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
