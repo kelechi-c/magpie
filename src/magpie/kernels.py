@@ -2,7 +2,7 @@ import functools
 import math
 import os
 from importlib.util import find_spec
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 import triton
@@ -27,6 +27,7 @@ FP4_QUERIES = int(os.environ.get("MAGPIE_FP4_QUERIES", "15360"))  # ... and only
 ATTN8 = find_spec("magpie_attn8") is not None and os.environ.get("MAGPIE_ATTN8") != "0"  # MAGPIE_ATTN8=0 falls back to sage's kernel; the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
+MLP_ROWS = int(os.environ.get("MAGPIE_MLP_ROWS", "8192"))  # rows one native mlp pass takes: its hidden tensor is six times as wide as the stream, so a long sequence goes in blocks
 
 
 # bf16 bits (int16) -> the same number in fp32: bf16 is the top half of an fp32, so shift it into place.
@@ -703,15 +704,32 @@ def mx_project(x: Tensor, sf: Tensor, linear: Fp8Linear, out: Tensor | None = No
 
     raw = x.new_empty(x.shape[0], linear[0].shape[0], dtype=torch.bfloat16) if out is None else out
     (magpie_gemm.nvfp4 if x.dtype == torch.uint8 else magpie_gemm.mxfp8)(x, sf, *linear, raw, alpha)
-    return raw if skip is None else torch.addcmul(skip, gate, raw)
+    return raw if skip is None else torch.addcmul(skip, gate, raw, out=raw)
+
+
+# rows [first, first + MLP_ROWS) of a (rows, width) tensor; a one-row one (a mod or gate every token shares) whole.
+def block_rows(x: Tensor, first: int) -> Tensor:
+    return x if x.shape[0] == 1 else x[first : first + MLP_ROWS]
+
+
+# `branch(rows, mod, gate, out)` over MLP_ROWS rows at a time of x (B, S, width) and its (B, 1 or S, width) mod and gate,
+# each block written into its rows of one output: the mlp's wide hidden tensors then exist for one block at a time.
+def by_blocks(branch: Callable[[Tensor, Tensor, Tensor, Tensor], Tensor], x: Tensor, mod: Tensor, gate: Tensor) -> Tensor:
+    flat, mod, gate = x.flatten(0, 1), mod.flatten(0, 1).contiguous(), gate.flatten(0, 1).contiguous()
+    out = torch.empty_like(flat)
+    for first in range(0, flat.shape[0], MLP_ROWS):
+        branch(*(block_rows(part, first) for part in (flat, mod, gate, out)))
+    return out.view_as(x)
 
 
 # a block's mlp branch and residual as `mlp_fp8`, on the native matmul: norm to mxfp8, one matmul for gate and proj
-# together, the swiglu and requantisation in one pass, the output matmul, the residual.
+# together, the swiglu and requantisation in one pass, the output matmul, the residual; MLP_ROWS rows at a time.
 def mlp_mx(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
-    flat = x.flatten(0, 1)
-    hidden = mx_rows(mx_project(*mx_norm(flat, mod.flatten(0, 1).contiguous(), eps), packed.hidden), swiglu=True)
-    return mx_project(*hidden, packed.out, skip=flat, gate=gate.flatten(0, 1).contiguous()).view_as(x)
+    def branch(rows: Tensor, mod: Tensor, gate: Tensor, out: Tensor) -> Tensor:
+        hidden = mx_rows(mx_project(*mx_norm(rows, mod, eps), packed.hidden), swiglu=True)
+        return mx_project(*hidden, packed.out, out, rows, gate)
+
+    return by_blocks(branch, x, mod, gate)
 
 
 # ---- nvfp4: 4-bit values (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and a sign) two per byte, one fp8 scale per 16 elements ----
@@ -818,10 +836,12 @@ def swiglu_block(x: Tensor, packed: MxMlp, nv: set[str]) -> Tensor:
 
 # `mlp_mx` with the matmuls named in NV in nvfp4; `alpha` undoes the scaling of weights and swiglu outputs.
 def mlp_nv(x: Tensor, mod: Tensor, gate: Tensor, packed: MxMlp, eps: float) -> Tensor:
-    flat, mod = x.flatten(0, 1), mod.flatten(0, 1).contiguous()
-    first = mx_project(*nv_norm(flat, mod, eps), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in NV else mx_project(*mx_norm(flat, mod, eps), packed.hidden)
-    hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in NV else (mx_rows(first, True), 1.0)
-    return mx_project(*hidden, packed.out, skip=flat, gate=gate.flatten(0, 1).contiguous(), alpha=alpha).view_as(x)
+    def branch(rows: Tensor, mod: Tensor, gate: Tensor, out: Tensor) -> Tensor:
+        first = mx_project(*nv_norm(rows, mod, eps), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in NV else mx_project(*mx_norm(rows, mod, eps), packed.hidden)
+        hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in NV else (mx_rows(first, True), 1.0)
+        return mx_project(*hidden, packed.out, out, rows, gate, alpha)
+
+    return by_blocks(branch, x, mod, gate)
 
 
 if MX:  # the native matmul takes over every fp8 linear: same call shapes, block scales instead of row and column steps
