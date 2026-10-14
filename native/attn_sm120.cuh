@@ -11,6 +11,9 @@
 //   ATTN_QK4     1: the q x k matmul runs on the same 4-bit instruction (128 dimensions in 2 instructions instead of
 //                4). queries and keys arrive as nvfp4 rows in a hadamard basis (`rows_fp4_kernel`), 64 bytes of nibbles
 //                and 8 e4m3 scales per row; the logits come out in fp32 with the scales already applied.
+//   ATTN_PVX     1: the 8-bit weights x values matmul runs on the block-scaled fp8 instruction (mxf8f6f4) with every
+//                scale set to 1. same operands, same sum; on sm_120 that form runs at twice the rate of the plain
+//                e4m3 instruction upstream uses (native/peak.cu: 1,024 against 516 tflop/s on a 5090).
 //   ATTN_ABLATE  profiling only: 1 skips the q x k matmul, 2 the softmax update, 3 the weights x values matmul,
 //                4 the key and value loads, in the main loop. the output is then wrong by design.
 #ifndef ATTN_LAZY
@@ -24,6 +27,9 @@
 #endif
 #ifndef ATTN_ABLATE
 #define ATTN_ABLATE 0
+#endif
+#ifndef ATTN_PVX
+#define ATTN_PVX 0
 #endif
 /*
  * Copyright (c) 2024 by SageAttention team.
@@ -51,6 +57,33 @@
 #include "permuted_smem.cuh"
 #include "math.cuh"
 #include "dispatch_utils.h"
+
+#if ATTN_PVX
+// upstream's 16 x 16 x 32 fp8 matmul (two 16 x 8 instructions) on the block-scaled instruction, scales of 2^0.
+namespace mma
+{
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void fp8_unit_scaled(float *C, uint32_t *A, uint32_t *B)
+{
+  static constexpr uint16_t zero = 0;
+  const uint32_t one = 0x7f7f7f7f;
+#pragma unroll
+  for (uint32_t half = 0; half < 2; half++)
+  {
+    float *c = C + 4 * half;
+    if constexpr (mma_mode == MMAMode::kInit)
+      c[0] = c[1] = c[2] = c[3] = 0.f;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13}, {%14}, {%15, %16}, {%17}, {%18, %19};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2 * half]), "r"(B[2 * half + 1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
+          "r"(one), "h"(zero), "h"(zero), "r"(one), "h"(zero), "h"(zero));
+  }
+}
+} // namespace mma
+#define mma_sync_m16n16k32_row_col_f8f8f32 fp8_unit_scaled
+#endif
 
 #include "attn_utils.cuh"
 

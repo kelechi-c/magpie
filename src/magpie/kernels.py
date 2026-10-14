@@ -21,8 +21,10 @@ MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scale
 SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
 SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
 ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
-PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "32768")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
-QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "32768")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
+PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "30720")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4
+QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "30720")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
+FP4_QUERIES = int(os.environ.get("MAGPIE_FP4_QUERIES", "15360"))  # ... and only when the image being drawn has this many tokens (2048 squared, less the few percent a non-square size rounds away): seven 1024 references reach the key count too, and there the 4-bit kernel drops and doubles subjects
+ATTN8 = find_spec("magpie_attn8") is not None  # the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 
@@ -110,6 +112,7 @@ class SageKV(NamedTuple):
     mean: Tensor
     tail: tuple[Tensor, Tensor]
     start: int
+    head: tuple[Tensor, Tensor] | None = None  # bf16 (keys, values) of the rows before the last condition image's end, when kept for a later request
 
 
 # bf16 values (tokens, heads, DIM) -> fp8 in sage's layout, for one head and TOKENS output slots: out[channel, head,
@@ -163,28 +166,56 @@ def sage_write(kv: SageKV, k: Tensor, v: Tensor, start: int) -> SageKV:
 
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
-# number of leading rows that will never change. from PV4_KEYS keys up (32,768 by default: a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
+# number of leading rows that will never change. from PV4_KEYS keys up (30,720 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
 # kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
 # basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
 # from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
 # that basis) taken off, `k_scale` (1, heads, S padded to 64, 8) bytes, one e4m3 scale per 16 dimensions.
-def sage_pack(k: Tensor, v: Tensor, prefix: int) -> SageKV:
+def sage_pack(k: Tensor, v: Tensor, prefix: int, keep: bool = False) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
-    if tokens >= PV4_KEYS:
+    wide = tokens - prefix >= FP4_QUERIES
+    if wide and tokens >= PV4_KEYS:
         values = torch.empty((1, heads, padded // KEY_BLOCK, 4608), dtype=torch.uint8, device=k.device)
         step = (v.mean(dim=1, dtype=torch.float32) @ hadamard(dim, v.device)).contiguous()
     else:
         values = torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device)
         step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
-    if tokens >= max(PV4_KEYS, QK4_KEYS):
+    if wide and tokens >= max(PV4_KEYS, QK4_KEYS):
         keys = torch.empty((1, tokens, heads, dim // 2), dtype=torch.uint8, device=k.device)
         scales = torch.full((1, heads, padded, 8), 0x38, dtype=torch.uint8, device=k.device)  # e4m3 1.0 under the padding
         mean = (k.mean(dim=1, dtype=torch.float32) @ hadamard(dim, k.device)).contiguous()
     else:
         keys, scales, mean = torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), k.mean(dim=1)
-    kv = SageKV(keys, scales, values, step, mean, (k[:, start:].clone(), v[:, start:].clone()), start)
+    kv = SageKV(keys, scales, values, step, mean, (k[:, start:].clone(), v[:, start:].clone()), start, (k[:, :prefix].clone(), v[:, :prefix].clone()) if keep else None)
     return sage_write(kv, k, v, 0)
+
+
+# a kept cache made to hold `tokens` rows: a later request on the same condition images has a prompt of another length,
+# so every row after the kept head moves. the rows before `start` are copied as they are (already quantised, with the
+# first request's frozen mean and steps); the rest is scratch that the next `sage_write` fills.
+def sage_refit(kv: SageKV, tokens: int) -> SageKV:
+    if tokens == kv.k.shape[1]:
+        return kv
+    padded, groups, held = -(-tokens // KEY_BLOCK) * KEY_BLOCK, kv.start // KEY_BLOCK, kv.head[0].shape[1] - kv.start
+    keys = kv.k.new_empty(1, tokens, *kv.k.shape[2:])
+    keys[:, : kv.start] = kv.k[:, : kv.start]
+    if kv.k.dtype == torch.uint8:  # nvfp4 keys: one scale row per key; nvfp4 values: 64-key tiles
+        scales = torch.full((1, kv.k_scale.shape[1], padded, 8), 0x38, dtype=torch.uint8, device=kv.k.device)
+        scales[:, :, : kv.start] = kv.k_scale[:, :, : kv.start]
+    else:
+        scales = kv.k_scale.new_empty(1, kv.k_scale.shape[1], padded // KEY_BLOCK)
+        scales[:, :, :groups] = kv.k_scale[:, :, :groups]
+    if kv.v.dtype == torch.uint8:
+        values = kv.v.new_empty(1, kv.v.shape[1], padded // KEY_BLOCK, kv.v.shape[3])
+        values[:, :, :groups] = kv.v[:, :, :groups]
+    else:
+        values = kv.v.new_empty(*kv.v.shape[:3], padded)
+        values[..., : kv.start] = kv.v[..., : kv.start]
+    tail = tuple(old.new_empty(1, tokens - kv.start, *old.shape[2:]) for old in kv.tail)
+    for new, old in zip(tail, kv.tail):
+        new[:, :held] = old[:, :held]
+    return SageKV(keys, scales, values, kv.v_scale, kv.mean, tail, kv.start, kv.head)
 
 
 # `sage` on keys and values that are already quantised: only the queries are quantised here. nvfp4 values take the
@@ -205,6 +236,10 @@ def sage_cached(q: Tensor, kv: SageKV) -> Tensor:
     if kv.v.dtype == torch.uint8:
         import magpie_attn
         magpie_attn.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
+        return out
+    if ATTN8:
+        import magpie_attn8
+        magpie_attn8.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
         return out
     sm89_compile.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, 0, 0, 2, q.shape[-1] ** -0.5, 0)
     return out

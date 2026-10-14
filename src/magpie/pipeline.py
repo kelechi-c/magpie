@@ -122,16 +122,27 @@ def denoise(
     dit: Dit, text: Tensor, slots: Tensor, references: Tensor | None, noise: Tensor, shapes: list[Shape],
     sampler: SamplerConfig,
 ) -> Tensor:
+    return denoise_kept(dit, text, slots, references, noise, shapes, sampler)[0]
+
+
+# `denoise` that also returns its kv cache. `keep` makes that cache reusable; `kept` is such a cache from an earlier
+# request on the same condition images (any prompt, seed or output size): step 0 then skips the rows up to the last
+# condition image, and `references` is not read.
+@torch.no_grad()
+def denoise_kept(
+    dit: Dit, text: Tensor, slots: Tensor, references: Tensor | None, noise: Tensor, shapes: list[Shape],
+    sampler: SamplerConfig, kept: list | None = None, keep: bool = False,
+) -> tuple[Tensor, list]:
     lay = layout(slots, shapes, dit.cfg)
     sigmas = schedule(noise.shape[1], sampler).to(noise.device)
     levels = (sigmas * 1000).to(noise.dtype) / 1000  # the dit sees sigma rounded like the reference does
     joint = noise if references is None else torch.cat([references, noise], dim=1)
-    velocity, cache = dit.prefill(joint, text, levels[:1], lay)
+    velocity, cache = dit.prefill(joint, text, levels[:1], lay, keep) if kept is None else dit.resume(noise, text, levels[:1], lay, kept)
     latents = euler(noise, velocity, sigmas[0], sigmas[1])
     for i in range(1, len(sigmas) - 1):
         velocity = dit.decode(latents, levels[i : i + 1], lay, cache)
         latents = euler(latents, velocity, sigmas[i], sigmas[i + 1])
-    return latents
+    return latents, cache
 
 
 # condition images at the working size: `resolution`^2 pixels, their own aspect ratio, sides multiples of 32.
@@ -156,6 +167,29 @@ def render(
     noise = torch.randn((1, 1, 64, *shapes[-1]), generator=generator, dtype=dtype).to(device)
     latents = denoise(dit, text.to(device, dtype), slots.to(device), references, pack(noise[:, 0]), shapes, sampler)
     return to_image(vae.decode(unpack(latents, shapes[-1])))
+
+
+# what `render_kept` leaves for the next edit of the same condition images: their identity and the dit's kv cache.
+Kept = tuple[tuple, list]
+
+
+# `render` for editing one set of condition images repeatedly: returns the image and a `Kept`; given the `Kept` of an
+# earlier call on the same (already resized) images, it skips their vae encode and their rows of the first dit step.
+# a `Kept` of other images is ignored. it holds the cache on the gpu between requests (see `Dit.prefill`'s `keep`).
+@torch.no_grad()
+def render_kept(
+    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Image.Image],
+    size: Shape | None = None, seed: int = 0, kept: Kept | None = None,
+) -> tuple[Image.Image, Kept]:
+    device, dtype = dit.img_in.weight.device, dit.img_in.weight.dtype
+    key = tuple((image.size, hash(image.tobytes())) for image in images)
+    cache = kept[1] if kept is not None and kept[0] == key else None
+    width, height = size or images[-1].size
+    shapes = [(image.height // 16, image.width // 16) for image in images] + [(height // 16, width // 16)]
+    references = torch.cat([pack(vae.encode(to_pixels(image, device, dtype))) for image in images], dim=1) if cache is None else None
+    noise = torch.randn((1, 1, 64, *shapes[-1]), generator=torch.Generator("cpu").manual_seed(seed), dtype=dtype).to(device)
+    latents, cache = denoise_kept(dit, text.to(device, dtype), slots.to(device), references, pack(noise[:, 0]), shapes, sampler, cache, True)
+    return to_image(vae.decode(unpack(latents, shapes[-1]))), (key, cache)
 
 
 # prompt (+ optional condition images) -> rgba image: the text encoder, then `render`. above `look`, the encoder reads

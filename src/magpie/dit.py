@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, flash, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8, norm_mod, qk_prep,
-                            sage, sage_cached, sage_pack, sage_write)
+                            sage, sage_cached, sage_pack, sage_refit, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -34,6 +34,7 @@ class Layout:
     repeats: Tensor  # (T + N/4,) how many joint tokens each encoder position expands into (4 or 1)
     image: Tensor  # (S,) bool, true where a latent token sits
     prefix: int  # number of text + condition-image tokens
+    head: int  # where the last condition image ends: the rows before it do not depend on the prompt, which comes after
     segments: tuple[Segment, ...]  # runs of the prefix: each text run, each condition image
     rope: Tensor  # (S, head_dim/2) complex rotations
 
@@ -87,7 +88,8 @@ def layout(slots: Tensor, shapes: list[tuple[int, int]], cfg: DitConfig) -> Layo
     ]
     axes = rope_positions(image.tolist(), shapes)
     rope = torch.cat([table[torch.tensor(axis)] for table, axis in zip(tables, axes)], dim=-1)
-    return Layout(repeats, image, prefix, runs, rope.to(image.device))
+    head = max([end for _, end, is_text in runs if not is_text], default=0)
+    return Layout(repeats, image, prefix, head, runs, rope.to(image.device))
 
 
 # rms norm over the last axis, statistics in fp32, as diffusers.RMSNorm does.
@@ -225,9 +227,9 @@ class Block(nn.Module):
 
     # full-sequence pass; also returns this layer's keys and values, whose prefix rows are the cache. on the sage
     # path they are quantised once here and returned in that form.
-    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout) -> tuple[Tensor, KV | SageKV]:
+    def prefill(self, x: Tensor, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False) -> tuple[Tensor, KV | SageKV]:
         q, k, v = self.attn.qkv(x, mod[0], lay.rope)
-        packed = sage_pack(k, v, lay.prefix) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
+        packed = sage_pack(k, v, lay.head, keep) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
         x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
 
@@ -239,6 +241,19 @@ class Block(nn.Module):
         k, v = cache.tail if packed else cache
         q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -x.shape[1] :], v[:, -x.shape[1] :]))
         attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
+        x = self.attn.out(attended, x, mod[1])
+        return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
+
+    # first step of a later request on the same condition images: only the rows after the kept head are computed,
+    # the closing text run (`texts` rows) then the target. the text run reads the head's kept bf16 keys and values
+    # under its causal triangle, as in `prefill`; the target reads the quantised cache, as in `decode`.
+    def resume(self, x: Tensor, mod: tuple[Tensor, ...], rope: Tensor, cache: SageKV, texts: int) -> Tensor:
+        k, v = cache.tail
+        rows, held = x.shape[1], cache.head[0].shape[1]
+        q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
+        keys, values = (torch.cat([old, new[:, -rows : texts - rows]], dim=1) for old, new in zip(cache.head, (k, v)))
+        mask = torch.cat([q.new_ones(texts, held, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
+        attended = torch.cat([attend(q[:, :texts], keys, values, self.attn.bound, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
         x = self.attn.out(attended, x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
@@ -299,7 +314,8 @@ class Dit(nn.Module):
 
     # first step: runs the whole joint sequence and returns (velocity for the target tokens, cache).
     # latents: (B, R + N, 64) condition-image latents then the noisy target; text: (B, T, 4096).
-    def prefill(self, latents: Tensor, text: Tensor, sigma: Tensor, lay: Layout) -> tuple[Tensor, list[KV | SageKV]]:
+    # `keep` also keeps each layer's bf16 keys and values before `lay.head`, which is what `resume` needs.
+    def prefill(self, latents: Tensor, text: Tensor, sigma: Tensor, lay: Layout, keep: bool = False) -> tuple[Tensor, list[KV | SageKV]]:
         batch, target = latents.shape[0], lay.image.numel() - lay.prefix
         text = self.text_embed(text)
         x = torch.cat([text, text.new_zeros(batch, target // SLOT, text.shape[-1])], dim=1)
@@ -309,9 +325,23 @@ class Dit(nn.Module):
         mod, final = self.modulate(temb, torch.arange(lay.image.numel(), device=x.device) >= lay.prefix)
         cache: list[KV | SageKV] = []
         for block in self.transformer_blocks:
-            x, kv = block.prefill(x, mod, lay)
+            x, kv = block.prefill(x, mod, lay, keep)
             cache = cache + [kv]
         return self.head(x[:, lay.prefix :], final[:, lay.prefix :]), cache
+
+    # first step when `cache` was kept from an earlier request on the same condition images (`prefill` with `keep`):
+    # the rows up to the last image's end are prompt-independent (the prompt follows the images, and both the text
+    # encoder and this model are causal), so only the closing text run and the target are computed. the cache comes
+    # back refitted to this request's sequence length.
+    def resume(self, target: Tensor, text: Tensor, sigma: Tensor, lay: Layout, cache: list[SageKV]) -> tuple[Tensor, list[SageKV]]:
+        texts = lay.prefix - lay.head
+        x = torch.cat([self.text_embed(text[:, text.shape[1] - texts :]), self.img_in(target)], dim=1)
+        temb = self.time_embed(torch.cat([sigma, sigma.new_zeros(1)]))
+        mod, final = self.modulate(temb, torch.arange(x.shape[1], device=x.device) >= texts)
+        cache = [sage_refit(kv, lay.image.numel()) for kv in cache]
+        for block, kv in zip(self.transformer_blocks, cache):
+            x = block.resume(x, mod, lay.rope[lay.head :], kv, texts)
+        return self.head(x[:, texts:], final[:, texts:]), cache
 
     # later steps: only the target tokens are recomputed, attending to the cached prefix. batch 1 only: the
     # kernels write the new keys and values into the buffers' tails, which are contiguous for a single sequence.
