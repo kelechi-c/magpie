@@ -1,8 +1,8 @@
 {
-  "generated": "2026-10-14",
+  "generated": "2026-10-15",
   "repo": {
     "root": "/home/tensor/Shared/code/ml/magpie",
-    "head": "a9ac5ad08544e17c0aba9b873c5b74508a9d2f5e"
+    "head": "ac134174f4fdf4746b782fbda265b0fdec5ee86b"
   },
   "summary": {
     "path": "/home/tensor/Shared/code/ml/magpie/out/bench/summary.json",
@@ -26,7 +26,7 @@
   },
   "compare": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/compare.json",
-    "sha256": "dd9b5896dee13659042cabbdd9e203b719e693b2ccba626ad602d01aa8177dd4"
+    "sha256": "5dbbc8d3e80a2c98e6644a7b5a02da6253023f5344e103f04705794834d7a787"
   },
   "rtx5090": {
     "path": "/home/tensor/Shared/code/ml/magpie/baseline/rtx5090.json",
@@ -192,11 +192,11 @@
       "compare.cases[edit 2048][magpie].peak_gib"
     ],
     "5090-latency": [
-      "rtx5090.whole_request_ms[edit 1024][magpie, everything resident].total",
+      "rtx5090.whole_request_ms[edit 1024][magpie, calibrated nvfp4 encoder, resident].total",
       "rtx5090.whole_request_ms[edit 1024][sglang fp8 + sage].total",
       "rtx5090.whole_request_ms[edit 1024][sglang default].total",
       "rtx5090.whole_request_ms[edit 1024][official diffusers, cpu offload].total",
-      "rtx5090.whole_request_ms[edit 2048][magpie, encoder staged].total",
+      "rtx5090.whole_request_ms[edit 2048][magpie, nvfp4 encoder, 1448 reference, resident, 4-bit attention].total",
       "rtx5090.whole_request_ms[edit 2048][sglang fp8 + sage].total",
       "rtx5090.whole_request_ms[edit 2048][sglang default].total",
       "rtx5090.whole_request_ms[edit 2048][official diffusers, cpu offload].total"
