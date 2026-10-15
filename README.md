@@ -25,6 +25,8 @@ judge calls it a tie) and now and then gets requested lettering wrong; `--encode
   (under the same license); without the native matmul kernels it loads the original bf16 transformer instead.
 - The fast paths are native extensions built from `native/` on the machine that runs them (see below).
 
+**This is the `ada` branch:** it keeps the FP8 (Triton) linears for Ada cards (sm_89: RTX 4090, L40S, L4) and the paths below. `master` is Blackwell-only.
+
 magpie reads the GPU's architecture when it starts and picks what that card can run:
 
 | GPU | transformer linears | attention | text encoder |
