@@ -3,12 +3,13 @@
     python -m magpie.server [--host 0.0.0.0] [--port 8188] [--encoder nvfp4|bf16] [--max-memory GIB]
 
     GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks", "encoder", "limits"}
-    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format", "keep"}
+    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format", "fast", "keep"}
                     -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib", "mode", "remembered", "kept", "resumed"}
 
 only `prompt` is required. with images and no width/height the output takes the last image's shape at `resolution`
 (1024 or 2048, the side of a square of the same area); with neither it is a square. `reference` (default: `resolution`,
-at most 1448) is the side the images enter the model at. `keep` holds the images' kv cache on the card after the edit (~4.6 gib more at
+at most 1448) is the side the images enter the model at. `fast` runs 6 of the 8 transformer steps (steps 3 and 6
+reuse the previous step's velocity). `keep` holds the images' kv cache on the card after the edit (~4.6 gib more at
 1024 with one reference, ~11 at 2048), so the next `keep` edit of the same images at the same size skips their encode
 and their rows of the first step (~115 ms at 1024, ~250 at 2048); any other request drops it. MAGPIE_TOKEN, when set,
 must arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start). the text
@@ -40,7 +41,7 @@ from PIL import Image
 
 from magpie import pipeline
 from magpie.kernels import MX, NV
-from magpie.sampling import TURBO
+from magpie.sampling import TURBO, TURBO_FAST
 from magpie.text import ENCODER, Encoder, calibrated_folder, encode, load_encoder, reslot
 
 REPO = "Qwen/Qwen-Image-2.1-Turbo"
@@ -330,7 +331,7 @@ def generate(
         runtime.park()
     text_peak = torch.cuda.max_memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    sampler, seed = TURBO, int(job.get("seed", 0))
+    sampler, seed = TURBO_FAST if job.get("fast") else TURBO, int(job.get("seed", 0))
     if keep:
         image, kept = pipeline.render_kept(models.dit, models.vae, text, slots, sampler, sized, filed, (width, height), seed, kept)
     else:

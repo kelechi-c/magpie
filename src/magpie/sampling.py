@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor
@@ -7,7 +7,8 @@ from torch import Tensor
 
 # flow-matching sampler settings. `sigmas` set means a fixed grid shipped with the checkpoint (turbo);
 # otherwise a linear grid of `steps` values is shifted towards high noise by a resolution-dependent
-# amount and stretched to end at `terminal` (base).
+# amount and stretched to end at `terminal` (base). `skip` names steps (1 .. last) that reuse the previous step's
+# velocity instead of running the dit: fewer transformer passes for a small change in the image.
 @dataclass(frozen=True)
 class SamplerConfig:
     steps: int = 40
@@ -17,10 +18,12 @@ class SamplerConfig:
     max_tokens: int = 8192
     base_shift: float = 0.5
     max_shift: float = 0.9
+    skip: tuple[int, ...] = ()
 
 
 BASE = SamplerConfig()
 TURBO = SamplerConfig(sigmas=(1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568))
+TURBO_FAST = replace(TURBO, skip=(3, 6))  # 6 of 8 dit passes (opt-in): on an l4, 16 edits stayed inside the gate lines against the 8-step images (dino min 0.9938)
 
 
 # shift exponent mu, linear in the number of target tokens: more tokens -> more time at high noise.

@@ -82,6 +82,7 @@ curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-
 | `reference` | `resolution`, at most 1448 | the side the images enter the model at. 1448 for a 2048² edit passes the quality gate, 16 % sooner than a full-size reference |
 | `seed` | 0 | |
 | `format` | `png` | `png`, `jpeg` or `webp` |
+| `fast` | false | run 6 of the 8 transformer steps (steps 3 and 6 reuse the previous step's velocity): 1024² 979 → 787 ms, 2048² 4,679 → 3,690 ms (DiT + VAE, PRO 6000). On the 16-edit quality gate it flags the same items as 8 steps, no new ones |
 | `keep` | false | hold the images' attention cache on the card for the next edit of the same images at the same size: that edit skips their VAE encode and their part of the first step (1024² 979 → 863 ms, 2048² 4,679 → 4,443 ms on the PRO 6000) for +4.6 / +11 GiB. Kept only when it fits beside the request; any other request frees it. A resumed edit is close to a fresh one, not identical (DINOv2 median 0.998, worst 0.92 over 16 edits) |
 
 The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib`, `mode`, `predicted_gib`, `remembered`, `kept`, `resumed` and `ms`

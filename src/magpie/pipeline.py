@@ -127,7 +127,8 @@ def unpack(tokens: Tensor, shape: Shape) -> Tensor:
 
 # the denoising loop on precomputed conditioning. `text`/`slots` come from `text.encode`,
 # `references` are packed condition-image latents (B, R, 64) or None, `noise` is (B, N, 64).
-# step 0 runs the full joint sequence and fills the kv cache; later steps recompute target tokens only.
+# step 0 runs the full joint sequence and fills the kv cache; later steps recompute target tokens only (steps in
+# `sampler.skip` keep the previous velocity).
 @torch.no_grad()
 def denoise(
     dit: Dit, text: Tensor, slots: Tensor, references: Tensor | None, noise: Tensor, shapes: list[Shape],
@@ -151,7 +152,7 @@ def denoise_kept(
     velocity, cache = dit.prefill(joint, text, levels[:1], lay, keep) if kept is None else dit.resume(noise, text, levels[:1], lay, kept)
     latents = euler(noise, velocity, sigmas[0], sigmas[1])
     for i in range(1, len(sigmas) - 1):
-        velocity = dit.decode(latents, levels[i : i + 1], lay, cache)
+        velocity = velocity if i in sampler.skip else dit.decode(latents, levels[i : i + 1], lay, cache)
         latents = euler(latents, velocity, sigmas[i], sigmas[i + 1])
     return latents, cache
 
