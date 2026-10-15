@@ -837,5 +837,1061 @@
    "before the thread fix, edit 1024": 2687,
    "before, edit 2048": 9843
   }
+ },
+ "final": {
+  "measured": "2026-10-15, one runpod rtx 5090 (575 w, driver 580.126.09, bf16 8192^3 235.6 tflop/s), master at fdaaa9c, one pod for every row",
+  "gate_dit_vae_ms": {
+   "edit16_1024": {
+    "steps8": 1219.1,
+    "fast": 992.5
+   },
+   "edit16_2048": {
+    "steps8": 6665.5,
+    "fast": 5332.4
+   }
+  },
+  "gate_dino": {
+   "steps8": {
+    "edit16_1024": {
+     "dino": [
+      0.9861,
+      0.9997,
+      0.999,
+      0.9991,
+      0.9931,
+      0.9994,
+      0.9976,
+      0.9981,
+      0.9975,
+      0.9995,
+      0.9963,
+      0.9995,
+      0.9995,
+      0.9943,
+      0.9992,
+      0.9985
+     ],
+     "dreamsim": [
+      0.0058,
+      0.0015,
+      0.0019,
+      0.001,
+      0.0057,
+      0.0027,
+      0.0043,
+      0.0021,
+      0.0023,
+      0.0027,
+      0.0012,
+      0.0007,
+      0.0051,
+      0.0056,
+      0.0015,
+      0.0004
+     ]
+    },
+    "edit16_2048": {
+     "dino": [
+      0.9936,
+      0.9994,
+      0.9976,
+      0.9994,
+      0.9948,
+      0.9996,
+      0.9947,
+      0.9984,
+      0.994,
+      0.9981,
+      0.9962,
+      0.9993,
+      0.9988,
+      0.9949,
+      0.9979,
+      0.9978
+     ],
+     "dreamsim": [
+      0.0056,
+      0.0017,
+      0.0068,
+      0.0015,
+      0.0093,
+      0.0022,
+      0.01,
+      0.0029,
+      0.0038,
+      0.0044,
+      0.0034,
+      0.0014,
+      0.0147,
+      0.0094,
+      0.0021,
+      0.0051
+     ]
+    }
+   },
+   "fast": {
+    "edit16_1024": {
+     "dino": [
+      0.991,
+      0.9992,
+      0.9984,
+      0.9994,
+      0.992,
+      0.9994,
+      0.9943,
+      0.9979,
+      0.9969,
+      0.999,
+      0.9972,
+      0.9994,
+      0.9994,
+      0.9915,
+      0.9986,
+      0.9986
+     ],
+     "dreamsim": [
+      0.0093,
+      0.0047,
+      0.0017,
+      0.001,
+      0.008,
+      0.0032,
+      0.0112,
+      0.003,
+      0.003,
+      0.0035,
+      0.0016,
+      0.0006,
+      0.0047,
+      0.0095,
+      0.0039,
+      0.0006
+     ]
+    },
+    "edit16_2048": {
+     "dino": [
+      0.9961,
+      0.9996,
+      0.9975,
+      0.9995,
+      0.9935,
+      0.9995,
+      0.9959,
+      0.9977,
+      0.9964,
+      0.9986,
+      0.9969,
+      0.9993,
+      0.9989,
+      0.9889,
+      0.9986,
+      0.9984
+     ],
+     "dreamsim": [
+      0.0055,
+      0.0024,
+      0.0065,
+      0.0019,
+      0.0186,
+      0.0021,
+      0.0088,
+      0.003,
+      0.0026,
+      0.0062,
+      0.0027,
+      0.001,
+      0.0103,
+      0.011,
+      0.0018,
+      0.003
+     ]
+    }
+   }
+  },
+  "server_ms": {
+   "what": "tools/server_check.py, warm, remembered prompt, dit + vae ms, one reference (input 08); single samples, resumed is the median of three",
+   "1024": {
+    "plain": 1157.6,
+    "keep_first": 1159.9,
+    "resumed": 1023.2,
+    "fast": 934.9,
+    "peak_gib": {
+     "plain": 14.72,
+     "keep_first": 17.22,
+     "resumed": 19.31
+    }
+   },
+   "2048": {
+    "plain": 5473.9,
+    "keep_first": 5559.8,
+    "resumed": 5246.7,
+    "fast": 4305.5,
+    "peak_gib": {
+     "plain": 18.2,
+     "keep_first": 25.82,
+     "resumed": 29.48
+    }
+   }
+  },
+  "limits": {
+   "usable_gib": 29.6,
+   "1024": [
+    [
+     1,
+     "resident",
+     1156,
+     14.74,
+     14.65
+    ],
+    [
+     2,
+     "resident",
+     1451,
+     16.16,
+     16.06
+    ],
+    [
+     3,
+     "resident",
+     1855,
+     17.58,
+     17.47
+    ],
+    [
+     4,
+     "resident",
+     2152,
+     19.01,
+     18.88
+    ],
+    [
+     5,
+     "resident",
+     3889,
+     20.45,
+     20.29
+    ],
+    [
+     6,
+     "resident",
+     2928,
+     21.89,
+     21.7
+    ],
+    [
+     7,
+     "resident",
+     3380,
+     23.33,
+     23.11
+    ],
+    [
+     8,
+     "resident",
+     3859,
+     24.79,
+     24.52
+    ],
+    [
+     9,
+     "resident",
+     4386,
+     26.24,
+     25.93
+    ],
+    [
+     10,
+     "resident",
+     4922,
+     27.71,
+     27.34
+    ],
+    [
+     11,
+     "resident",
+     6786,
+     29.15,
+     28.75
+    ],
+    [
+     12,
+     "staged",
+     6217,
+     24.75,
+     24.29
+    ],
+    [
+     13,
+     "staged",
+     6828,
+     26.22,
+     25.7
+    ],
+    [
+     14,
+     "staged",
+     7520,
+     27.69,
+     27.11
+    ]
+   ],
+   "2048": [
+    [
+     1,
+     "resident",
+     5461,
+     18.85,
+     18.14
+    ],
+    [
+     2,
+     "resident",
+     6542,
+     20.3,
+     19.6
+    ],
+    [
+     3,
+     "resident",
+     7693,
+     22.16,
+     21.35
+    ],
+    [
+     4,
+     "resident",
+     8862,
+     24.06,
+     23.37
+    ],
+    [
+     5,
+     "resident",
+     10208,
+     25.94,
+     25.67
+    ],
+    [
+     6,
+     "resident",
+     11550,
+     27.85,
+     28.25
+    ],
+    [
+     7,
+     "staged",
+     13185,
+     23.87,
+     25.24
+    ],
+    [
+     8,
+     "staged",
+     14711,
+     25.77,
+     28.37
+    ]
+   ]
+  },
+  "cold_start_s": {
+   "what": "page cache dropped before the start; load and probe as the server logs them, then the first edit's round trip",
+   "load": 10.0,
+   "probe": 44.8,
+   "first_request_ms": 1537
+  },
+  "showcase_ab": {
+   "t_nature_heron": {
+    "steps8": {
+     "total_ms": 886,
+     "dit_vae_ms": 886,
+     "round_trip_ms": 1056,
+     "peak_gib": 13.11,
+     "size": [
+      1024,
+      1024
+     ]
+    },
+    "fast": {
+     "total_ms": 695,
+     "dit_vae_ms": 695,
+     "round_trip_ms": 857,
+     "peak_gib": 13.11,
+     "size": [
+      1024,
+      1024
+     ]
+    }
+   },
+   "t_human_dancer": {
+    "steps8": {
+     "total_ms": 882,
+     "dit_vae_ms": 882,
+     "round_trip_ms": 1030,
+     "peak_gib": 13.1,
+     "size": [
+      1024,
+      1024
+     ]
+    },
+    "fast": {
+     "total_ms": 690,
+     "dit_vae_ms": 690,
+     "round_trip_ms": 839,
+     "peak_gib": 13.1,
+     "size": [
+      1024,
+      1024
+     ]
+    }
+   },
+   "t_print_blueprint": {
+    "steps8": {
+     "total_ms": 4889,
+     "dit_vae_ms": 4889,
+     "round_trip_ms": 5413,
+     "peak_gib": 18.16,
+     "size": [
+      2048,
+      2048
+     ]
+    },
+    "fast": {
+     "total_ms": 3806,
+     "dit_vae_ms": 3806,
+     "round_trip_ms": 4326,
+     "peak_gib": 18.16,
+     "size": [
+      2048,
+      2048
+     ]
+    }
+   },
+   "c_print_blueprint_colour": {
+    "steps8": {
+     "total_ms": 5527,
+     "dit_vae_ms": 5527,
+     "round_trip_ms": 6101,
+     "peak_gib": 18.2,
+     "size": [
+      2048,
+      2048
+     ]
+    },
+    "fast": {
+     "total_ms": 4341,
+     "dit_vae_ms": 4341,
+     "round_trip_ms": 4903,
+     "peak_gib": 18.2,
+     "size": [
+      2048,
+      2048
+     ]
+    }
+   },
+   "e_vinci_tank_colour": {
+    "steps8": {
+     "total_ms": 1176,
+     "dit_vae_ms": 1175,
+     "round_trip_ms": 1370,
+     "peak_gib": 14.76,
+     "size": [
+      1216,
+      864
+     ]
+    },
+    "fast": {
+     "total_ms": 947,
+     "dit_vae_ms": 947,
+     "round_trip_ms": 1149,
+     "peak_gib": 14.76,
+     "size": [
+      1216,
+      864
+     ]
+    }
+   },
+   "e_nature_haeckel_night": {
+    "steps8": {
+     "total_ms": 5490,
+     "dit_vae_ms": 5490,
+     "round_trip_ms": 6193,
+     "peak_gib": 18.19,
+     "size": [
+      1696,
+      2464
+     ]
+    },
+    "fast": {
+     "total_ms": 4348,
+     "dit_vae_ms": 4348,
+     "round_trip_ms": 5023,
+     "peak_gib": 18.19,
+     "size": [
+      1696,
+      2464
+     ]
+    }
+   },
+   "e_nature_audubon_heron": {
+    "steps8": {
+     "total_ms": 1144,
+     "dit_vae_ms": 1144,
+     "round_trip_ms": 1384,
+     "peak_gib": 14.75,
+     "size": [
+      832,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 923,
+     "dit_vae_ms": 923,
+     "round_trip_ms": 1129,
+     "peak_gib": 14.75,
+     "size": [
+      832,
+      1248
+     ]
+    }
+   },
+   "e_nature_tetons_colour": {
+    "steps8": {
+     "total_ms": 1186,
+     "dit_vae_ms": 1186,
+     "round_trip_ms": 1424,
+     "peak_gib": 14.84,
+     "size": [
+      1152,
+      928
+     ]
+    },
+    "fast": {
+     "total_ms": 957,
+     "dit_vae_ms": 957,
+     "round_trip_ms": 1186,
+     "peak_gib": 14.84,
+     "size": [
+      1152,
+      928
+     ]
+    }
+   },
+   "e_human_vermeer_pencil": {
+    "steps8": {
+     "total_ms": 1144,
+     "dit_vae_ms": 1144,
+     "round_trip_ms": 1375,
+     "peak_gib": 14.76,
+     "size": [
+      928,
+      1120
+     ]
+    },
+    "fast": {
+     "total_ms": 920,
+     "dit_vae_ms": 920,
+     "round_trip_ms": 1156,
+     "peak_gib": 14.76,
+     "size": [
+      928,
+      1120
+     ]
+    }
+   },
+   "e_scifi_amazing_title": {
+    "steps8": {
+     "total_ms": 5430,
+     "dit_vae_ms": 5430,
+     "round_trip_ms": 6090,
+     "peak_gib": 18.21,
+     "size": [
+      1760,
+      2368
+     ]
+    },
+    "fast": {
+     "total_ms": 4298,
+     "dit_vae_ms": 4298,
+     "round_trip_ms": 4960,
+     "peak_gib": 18.21,
+     "size": [
+      1760,
+      2368
+     ]
+    }
+   },
+   "e_print_rhino_colour": {
+    "steps8": {
+     "total_ms": 5503,
+     "dit_vae_ms": 5503,
+     "round_trip_ms": 6414,
+     "peak_gib": 18.29,
+     "size": [
+      2304,
+      1824
+     ]
+    },
+    "fast": {
+     "total_ms": 4330,
+     "dit_vae_ms": 4330,
+     "round_trip_ms": 5181,
+     "peak_gib": 18.29,
+     "size": [
+      2304,
+      1824
+     ]
+    }
+   },
+   "e_print_wpa_text": {
+    "steps8": {
+     "total_ms": 1147,
+     "dit_vae_ms": 1147,
+     "round_trip_ms": 1341,
+     "peak_gib": 14.79,
+     "size": [
+      832,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 925,
+     "dit_vae_ms": 925,
+     "round_trip_ms": 1116,
+     "peak_gib": 14.79,
+     "size": [
+      832,
+      1248
+     ]
+    }
+   },
+   "e_print_hiroshige_snow": {
+    "steps8": {
+     "total_ms": 1149,
+     "dit_vae_ms": 1149,
+     "round_trip_ms": 1375,
+     "peak_gib": 14.79,
+     "size": [
+      832,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 926,
+     "dit_vae_ms": 926,
+     "round_trip_ms": 1153,
+     "peak_gib": 14.79,
+     "size": [
+      832,
+      1248
+     ]
+    }
+   },
+   "m_wave_bridge": {
+    "steps8": {
+     "total_ms": 1439,
+     "dit_vae_ms": 1438,
+     "round_trip_ms": 1757,
+     "peak_gib": 16.19,
+     "size": [
+      832,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 1185,
+     "dit_vae_ms": 1184,
+     "round_trip_ms": 1500,
+     "peak_gib": 16.19,
+     "size": [
+      832,
+      1248
+     ]
+    }
+   },
+   "m_three_scifi": {
+    "steps8": {
+     "total_ms": 1819,
+     "dit_vae_ms": 1819,
+     "round_trip_ms": 2185,
+     "peak_gib": 17.71,
+     "size": [
+      896,
+      1184
+     ]
+    },
+    "fast": {
+     "total_ms": 1564,
+     "dit_vae_ms": 1564,
+     "round_trip_ms": 1894,
+     "peak_gib": 17.71,
+     "size": [
+      896,
+      1184
+     ]
+    }
+   },
+   "e_sculpt_pieta_engraving": {
+    "steps8": {
+     "total_ms": 5455,
+     "dit_vae_ms": 5455,
+     "round_trip_ms": 6259,
+     "peak_gib": 18.27,
+     "size": [
+      2144,
+      1952
+     ]
+    },
+    "fast": {
+     "total_ms": 4361,
+     "dit_vae_ms": 4361,
+     "round_trip_ms": 5176,
+     "peak_gib": 18.27,
+     "size": [
+      2144,
+      1952
+     ]
+    }
+   },
+   "e_michel_creation_cartoon": {
+    "steps8": {
+     "total_ms": 1147,
+     "dit_vae_ms": 1147,
+     "round_trip_ms": 1403,
+     "peak_gib": 14.82,
+     "size": [
+      1248,
+      832
+     ]
+    },
+    "fast": {
+     "total_ms": 925,
+     "dit_vae_ms": 925,
+     "round_trip_ms": 1173,
+     "peak_gib": 14.82,
+     "size": [
+      1248,
+      832
+     ]
+    }
+   },
+   "e_space_saturn_notebook": {
+    "steps8": {
+     "total_ms": 1193,
+     "dit_vae_ms": 1192,
+     "round_trip_ms": 1566,
+     "peak_gib": 14.94,
+     "size": [
+      864,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 960,
+     "dit_vae_ms": 960,
+     "round_trip_ms": 1303,
+     "peak_gib": 14.94,
+     "size": [
+      864,
+      1248
+     ]
+    }
+   },
+   "t_dune_sandworm": {
+    "steps8": {
+     "total_ms": 4903,
+     "dit_vae_ms": 4903,
+     "round_trip_ms": 5532,
+     "peak_gib": 18.24,
+     "size": [
+      2048,
+      2048
+     ]
+    },
+    "fast": {
+     "total_ms": 3806,
+     "dit_vae_ms": 3806,
+     "round_trip_ms": 4426,
+     "peak_gib": 18.24,
+     "size": [
+      2048,
+      2048
+     ]
+    }
+   },
+   "m_adam_station": {
+    "steps8": {
+     "total_ms": 1446,
+     "dit_vae_ms": 1446,
+     "round_trip_ms": 1718,
+     "peak_gib": 16.24,
+     "size": [
+      1024,
+      1024
+     ]
+    },
+    "fast": {
+     "total_ms": 1193,
+     "dit_vae_ms": 1193,
+     "round_trip_ms": 1465,
+     "peak_gib": 16.24,
+     "size": [
+      1024,
+      1024
+     ]
+    }
+   },
+   "m_ladder_2_1024": {
+    "steps8": {
+     "total_ms": 1449,
+     "dit_vae_ms": 1449,
+     "round_trip_ms": 1718,
+     "peak_gib": 16.25,
+     "size": [
+      1024,
+      1024
+     ]
+    },
+    "fast": {
+     "total_ms": 1196,
+     "dit_vae_ms": 1195,
+     "round_trip_ms": 1435,
+     "peak_gib": 16.25,
+     "size": [
+      1024,
+      1024
+     ]
+    }
+   },
+   "m_ladder_3_1024": {
+    "steps8": {
+     "total_ms": 1759,
+     "dit_vae_ms": 1758,
+     "round_trip_ms": 2170,
+     "peak_gib": 17.63,
+     "size": [
+      800,
+      1280
+     ]
+    },
+    "fast": {
+     "total_ms": 1472,
+     "dit_vae_ms": 1471,
+     "round_trip_ms": 1885,
+     "peak_gib": 17.63,
+     "size": [
+      800,
+      1280
+     ]
+    }
+   },
+   "m_ladder_4_1024": {
+    "steps8": {
+     "total_ms": 2170,
+     "dit_vae_ms": 2168,
+     "round_trip_ms": 2692,
+     "peak_gib": 19.17,
+     "size": [
+      864,
+      1248
+     ]
+    },
+    "fast": {
+     "total_ms": 1844,
+     "dit_vae_ms": 1843,
+     "round_trip_ms": 2342,
+     "peak_gib": 19.17,
+     "size": [
+      864,
+      1248
+     ]
+    }
+   },
+   "m_ladder_2_2048": {
+    "steps8": {
+     "total_ms": 6538,
+     "dit_vae_ms": 6538,
+     "round_trip_ms": 7193,
+     "peak_gib": 19.87,
+     "size": [
+      2048,
+      2048
+     ]
+    },
+    "fast": {
+     "total_ms": 5243,
+     "dit_vae_ms": 5243,
+     "round_trip_ms": 5880,
+     "peak_gib": 19.87,
+     "size": [
+      2048,
+      2048
+     ]
+    }
+   },
+   "m_ladder_3_2048": {
+    "steps8": {
+     "total_ms": 7767,
+     "dit_vae_ms": 7766,
+     "round_trip_ms": 8592,
+     "peak_gib": 21.87,
+     "size": [
+      1632,
+      2592
+     ]
+    },
+    "fast": {
+     "total_ms": 6258,
+     "dit_vae_ms": 6257,
+     "round_trip_ms": 7220,
+     "peak_gib": 21.87,
+     "size": [
+      1632,
+      2592
+     ]
+    }
+   },
+   "m_ladder_4_2048": {
+    "steps8": {
+     "total_ms": 8892,
+     "dit_vae_ms": 8891,
+     "round_trip_ms": 9981,
+     "peak_gib": 23.85,
+     "size": [
+      1696,
+      2464
+     ]
+    },
+    "fast": {
+     "total_ms": 7280,
+     "dit_vae_ms": 7279,
+     "round_trip_ms": 8453,
+     "peak_gib": 23.85,
+     "size": [
+      1696,
+      2464
+     ]
+    }
+   }
+  },
+  "headline": {
+   "1024 steps8": {
+    "dit_vae_ms": 1155.9,
+    "round_trip_ms": 1390.4725089669228,
+    "text_ms": 98.0,
+    "fresh_round_trip_ms": 1486.151993041858,
+    "peak_gib": 14.95
+   },
+   "1024 fast": {
+    "dit_vae_ms": 932.6,
+    "round_trip_ms": 1167.7065659314394,
+    "text_ms": 95.1,
+    "fresh_round_trip_ms": 1255.2356969099492,
+    "peak_gib": 14.94
+   },
+   "2048 steps8": {
+    "dit_vae_ms": 5472.1,
+    "round_trip_ms": 6095.715446863323,
+    "text_ms": 93.4,
+    "fresh_round_trip_ms": 6185.31698314473,
+    "peak_gib": 18.4
+   },
+   "2048 fast": {
+    "dit_vae_ms": 4300.7,
+    "round_trip_ms": 4895.574528956786,
+    "text_ms": 104.2,
+    "fresh_round_trip_ms": 5098.020073957741,
+    "peak_gib": 18.38
+   }
+  },
+  "engines": {
+   "edit 1024": {
+    "magpie, fast": {
+     "ms": 1263,
+     "peak_gib": 14.94,
+     "how": "server, PNG reply"
+    },
+    "magpie, 8 steps": {
+     "ms": 1488,
+     "peak_gib": 14.95,
+     "how": "server, PNG reply"
+    },
+    "LightX2V": {
+     "ms": 4539,
+     "peak_gib": 30.73,
+     "how": "server, PNG reply"
+    },
+    "vLLM-Omni": {
+     "ms": null,
+     "peak_gib": null,
+     "how": "server, PNG reply",
+     "fail": "out of memory"
+    },
+    "sglang fp8 + sage": {
+     "ms": 2543,
+     "peak_gib": 13.66,
+     "how": "server, PNG reply"
+    },
+    "sglang default": {
+     "ms": 4487,
+     "peak_gib": 19.89,
+     "how": "server, PNG reply"
+    },
+    "official diffusers, CPU offload": {
+     "ms": 28047,
+     "peak_gib": 19.1,
+     "how": "in-process"
+    }
+   },
+   "edit 2048": {
+    "magpie, fast": {
+     "ms": 5000,
+     "peak_gib": 18.38,
+     "how": "server, PNG reply"
+    },
+    "magpie, 8 steps": {
+     "ms": 6189,
+     "peak_gib": 18.4,
+     "how": "server, PNG reply"
+    },
+    "LightX2V": {
+     "ms": 20072,
+     "peak_gib": 30.73,
+     "how": "server, PNG reply"
+    },
+    "vLLM-Omni": {
+     "ms": null,
+     "peak_gib": null,
+     "how": "server, PNG reply",
+     "fail": "out of memory"
+    },
+    "sglang fp8 + sage": {
+     "ms": 12066,
+     "peak_gib": 31.15,
+     "how": "server, PNG reply"
+    },
+    "sglang default": {
+     "ms": 23585,
+     "peak_gib": 27.8,
+     "how": "server, PNG reply"
+    },
+    "official diffusers, CPU offload": {
+     "ms": null,
+     "peak_gib": null,
+     "how": "in-process",
+     "fail": "out of memory"
+    }
+   }
+  },
+  "engines_note": "magpie's time is its median warm round trip plus its text encoder, which a repeated prompt would skip. Peaks: magpie is torch's peak allocated, the others nvidia-smi memory used.",
+  "engines_setup": "sglang 0.5.21 ran its default build and its FP8 build with SageAttention. LightX2V and vLLM-Omni (from main) run with their text encoders offloaded to CPU, since neither fits with it resident; vLLM-Omni still ran out of memory on its first 1024² edit.",
+  "base_dit_vae_ms": {
+   "edit_1024": 4764,
+   "edit_2048": 27904
+  },
+  "base_dino_min": {
+   "edit_1024": 0.9866,
+   "edit_2048": 0.9879
+  }
  }
 }

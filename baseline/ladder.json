@@ -235,5 +235,89 @@
    0.9973,
    0.9971
   ]
+ },
+ "groups": {
+  "what": "the ladder's in-sequence 1024\u00b2 steps (RTX PRO 6000, DiT + VAE, median of 5 warm) summed by kind; 'later' is everything since the 1,013 ms build, measured as one span on the same card (gate p50, 2026-10-15); 'fast' is the opt-in step skip on today's build",
+  "start": 2484,
+  "groups": [
+   {
+    "name": "low-precision linear layers",
+    "ms": 803,
+    "steps": [
+     {
+      "step": "FP8 MLP",
+      "ms": 222
+     },
+     {
+      "step": "FP8 row alignment + FP8 k,v",
+      "ms": 121
+     },
+     {
+      "step": "block-scaled FP8 (MXFP8) CUTLASS matmul",
+      "ms": 192
+     },
+     {
+      "step": "NVFP4 on MLP output matmul",
+      "ms": 98
+     },
+     {
+      "step": "NVFP4 on both MLP matmuls + ping-pong schedule",
+      "ms": 170
+     }
+    ]
+   },
+   {
+    "name": "fusion",
+    "ms": 396,
+    "steps": [
+     {
+      "step": "fused QK-norm + RoPE prep",
+      "ms": 205
+     },
+     {
+      "step": "fused VAE + K/V buffer + glue",
+      "ms": 191
+     }
+    ]
+   },
+   {
+    "name": "attention kernels",
+    "ms": 237,
+    "steps": [
+     {
+      "step": "max-free flash attention",
+      "ms": 34
+     },
+     {
+      "step": "SageAttention 2 + FP8 q,k,v,out",
+      "ms": 203
+     }
+    ]
+   },
+   {
+    "name": "less work per request",
+    "ms": 35,
+    "steps": [
+     {
+      "step": "KV cache quantised once",
+      "ms": 35
+     }
+    ]
+   }
+  ],
+  "ladder_end": 1013,
+  "later": {
+   "what": "8-bit attention instruction, residual add and int8 keys fused, memory levers, cleanup, gpu resize",
+   "from": 1013,
+   "to": 995.6
+  },
+  "now": 995.6,
+  "fast": 812.9,
+  "2048": {
+   "start": 14872,
+   "ladder_end": 6538,
+   "now": 5702,
+   "fast": 4539.7
+  }
  }
 }

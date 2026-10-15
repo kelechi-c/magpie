@@ -1,5 +1,10 @@
 # magpie
 
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="assets/plan_fractal-banner-dark.webp">
+<img src="assets/plan_fractal-banner.webp" alt="Pencil study of octagonal room plans with a drawing folded out of each wall">
+</picture>
+
 custom runtime for Qwen-Image 2.1 Turbo on Blackwell/sm_120 GPUs (like the 5090). 
 Qwen-Image 2.1 Turbo (8 steps, one 7.1 B transformer for text-to-image and image editing) made fast on
 Blackwell GPUs (sm_120: RTX 5090, RTX PRO 6000): a lean PyTorch port with block-scaled FP8 and NVFP4
@@ -7,7 +12,8 @@ matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that 
 
 | whole request, text encoder included | edit 1024² | edit 2048² |
 |---|---|---|
-| **magpie, RTX 5090** | **1.27 s** | **5.35 s** |
+| **magpie, RTX 5090** | **1.49 s** | **6.19 s** |
+| magpie, RTX 5090, `fast` | 1.26 s | 5.00 s |
 | official diffusers pipeline, RTX 5090 (CPU offload) | 27.1 s | out of memory |
 | magpie, RTX PRO 6000 (bf16 text encoder) | 1.10 s | 5.80 s |
 
@@ -126,8 +132,8 @@ Two text encoders, chosen when the model loads (not per request):
 | most references, RTX 5090 (1024² / 2048²) | 11 / 6 | 4 / 2 |
 | lettering | now and then misspells a requested title or leaves the old one (2 of 6 test renders that bf16 got right) | |
 
-Whole request, median of five warm runs, both encoders on the same 575 W RTX 5090 (the headline's card ran a few percent
-faster).
+Whole request, median of five warm runs, both encoders on the same 575 W RTX 5090 (a separate run; the headline row's 8-step
+numbers are 1.49 s and 6.19 s).
 
 Pick it with any of:
 
@@ -157,7 +163,7 @@ Edit a generated image with a different seed from the one that drew it; the same
 
 ## limits
 
-- A 2048² edit on an RTX 5090 stays fully resident: 5.35 s and 18.2 GiB (1448² reference), 6.45 s and 19.7 GiB
+- A 2048² edit on an RTX 5090 stays fully resident: 6.19 s and 18.4 GiB (1448² reference), 6.45 s and 19.7 GiB
   with a 2048² reference; with the bf16 encoder, 5.41 s and 27.5 GiB.
 - References per edit, as Qwen suggests up to ten: an RTX PRO 6000 takes 10+ at both sizes with either encoder. An
   RTX 5090 takes eleven at 1024² and six at 2048² (1448² references) with the 4-bit encoder resident, four and two

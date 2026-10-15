@@ -185,5 +185,252 @@
     ]
    ]
   }
+ },
+ "final_pro6000": {
+  "measured": "2026-10-15, colab rtx pro 6000 blackwell server edition, master at fdaaa9c (gpu resize, fast)",
+  "gate_dit_vae_ms": {
+   "edit16_1024": {
+    "steps8": 995.6,
+    "fast": 812.9
+   },
+   "edit16_2048": {
+    "steps8": 5702.1,
+    "fast": 4539.7
+   }
+  },
+  "gate_dino": {
+   "steps8": {
+    "edit16_1024": {
+     "dino": [
+      0.9746,
+      0.9996,
+      0.9989,
+      0.9989,
+      0.9639,
+      0.9995,
+      0.9971,
+      0.998,
+      0.9937,
+      0.999,
+      0.9962,
+      0.9993,
+      0.9995,
+      0.9947,
+      0.9985,
+      0.9986
+     ],
+     "dreamsim": [
+      0.0293,
+      0.0018,
+      0.0018,
+      0.002,
+      0.0233,
+      0.0019,
+      0.0039,
+      0.0021,
+      0.0036,
+      0.0038,
+      0.0014,
+      0.0007,
+      0.0022,
+      0.006,
+      0.0031,
+      0.0005
+     ]
+    },
+    "edit16_2048": {
+     "dino": [
+      0.9807,
+      0.9994,
+      0.9976,
+      0.9996,
+      0.9941,
+      0.9997,
+      0.9963,
+      0.9984,
+      0.9911,
+      0.9988,
+      0.997,
+      0.9995,
+      0.9989,
+      0.9865,
+      0.9975,
+      0.999
+     ],
+     "dreamsim": [
+      0.0118,
+      0.0023,
+      0.0026,
+      0.0017,
+      0.0117,
+      0.002,
+      0.0082,
+      0.0024,
+      0.0063,
+      0.0045,
+      0.002,
+      0.0013,
+      0.0128,
+      0.0163,
+      0.0025,
+      0.001
+     ]
+    }
+   },
+   "fast": {
+    "edit16_1024": {
+     "dino": [
+      0.9763,
+      0.9993,
+      0.9983,
+      0.9992,
+      0.9674,
+      0.9995,
+      0.9944,
+      0.9977,
+      0.9963,
+      0.9986,
+      0.9969,
+      0.9994,
+      0.9993,
+      0.992,
+      0.9977,
+      0.9987
+     ],
+     "dreamsim": [
+      0.029,
+      0.0042,
+      0.0016,
+      0.0024,
+      0.0195,
+      0.0021,
+      0.0096,
+      0.0022,
+      0.0035,
+      0.0045,
+      0.0014,
+      0.0007,
+      0.0048,
+      0.0086,
+      0.0051,
+      0.0007
+     ]
+    },
+    "edit16_2048": {
+     "dino": [
+      0.9826,
+      0.9993,
+      0.9969,
+      0.9996,
+      0.9943,
+      0.9995,
+      0.9969,
+      0.9978,
+      0.9957,
+      0.999,
+      0.9971,
+      0.9995,
+      0.999,
+      0.9891,
+      0.9987,
+      0.9989
+     ],
+     "dreamsim": [
+      0.0108,
+      0.0035,
+      0.0025,
+      0.0012,
+      0.0194,
+      0.0018,
+      0.0093,
+      0.0028,
+      0.0049,
+      0.007,
+      0.0018,
+      0.0009,
+      0.0094,
+      0.0197,
+      0.002,
+      0.0008
+     ]
+    }
+   }
+  },
+  "server_ms": {
+   "what": "tools/server_check.py, warm, remembered prompt, dit + vae ms; one reference (input 08), single samples",
+   "1024": {
+    "plain": 979,
+    "keep_first": 987,
+    "resumed": 863,
+    "fast": 787,
+    "round_trip": 1023,
+    "peak_gib": {
+     "plain": 14.73,
+     "keep_first": 17.22,
+     "resumed": 19.31
+    }
+   },
+   "2048": {
+    "plain": 4679,
+    "keep_first": 4695,
+    "resumed": 4443,
+    "fast": 3690,
+    "round_trip": 4757,
+    "peak_gib": {
+     "plain": 18.2,
+     "keep_first": 25.82,
+     "resumed": 29.48
+    }
+   },
+   "t2i_1024": {
+    "dit_vae": 750,
+    "round_trip": 776
+   }
+  },
+  "engines_round_trip_ms": {
+   "what": "same edit as server_check, warm round trip, png reply, p50 of 5 after one discarded; peak is nvidia-smi memory.used",
+   "magpie": {
+    "1024": 1023,
+    "2048": 4757
+   },
+   "lightx2v": {
+    "1024": 2512,
+    "2048": 13518,
+    "peak_gib": 45.2,
+    "note": "bf16 turbo config, sage_attn2, torch rope"
+   },
+   "vllm-omni": {
+    "1024": 2347,
+    "2048": 10340,
+    "peak_gib": 65.3,
+    "note": "main 11600ba, vllm 0.31.0, defaults"
+   }
+  },
+  "base_dit_vae_ms": {
+   "what": "40-step base checkpoint through the gate (edit_1024: 5 items, edit_2048: 3), p50",
+   "edit_1024": 4080,
+   "edit_2048": 24435,
+   "dino_min": {
+    "edit_1024": 0.9878,
+    "edit_2048": 0.9904
+   },
+   "port_baseline": {
+    "edit_1024": 10780,
+    "edit_2048": 68970
+   }
+  },
+  "other_cards_gate_dit_vae_ms": {
+   "what": "ada branch (triton fp8 linears, no native kernels), edit16 gate",
+   "b200": {
+    "edit16_1024": 2089,
+    "edit16_2048": 7915,
+    "note": "modal, sm_100; 1024 pass (dino min 0.9965); 2048 item 15 flagged (0.928)"
+   },
+   "rtx4090": {
+    "edit16_1024": 7508,
+    "edit16_2048": null,
+    "note": "runpod, 450 w; 1024 pass (dino min 0.9863); 2048 out of memory"
+   }
+  }
  }
 }
