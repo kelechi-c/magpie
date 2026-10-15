@@ -12,3 +12,4 @@ CLAUDE.md
 docs/
 tools/*
 !tools/build_native.sh
+assets/charts/

@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import (SAGE, SAGE_CACHE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
+from magpie.kernels import (SAGE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
                             norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
@@ -236,7 +236,7 @@ class Block(nn.Module):
     # `keep` also keeps the rows before `lay.head` in bf16.
     def prefill(self, x: Stream, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Stream, KV | SageKV]:
         x, q, k, v = self.attn.qkv(x, mod[0], lay.rope)
-        packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE_CACHE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
+        packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
         x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
 

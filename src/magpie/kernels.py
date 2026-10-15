@@ -18,14 +18,15 @@ FP8_TOP = 448.0  # largest fp8 (e4m3) value: 4 exponent bits, 3 mantissa bits
 TOP = tl.constexpr(FP8_TOP)
 SWIGLU_TILE, SWIGLU_WARPS = (64, 128, 64), 4  # (rows, columns, inner width) per program and warps of each fp8 matmul (swept on sm_120)
 PROJECT_TILE, PROJECT_WARPS = (256, 128, 64), 8
-MX = find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scaled matmuls, built by tools/build_native.sh
-SAGE = find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0), built from source for sm_120
-SAGE_CACHE = SAGE and os.environ.get("MAGPIE_SAGE_CACHE", "1") == "1"  # keep the kv cache in sage's 8-bit form (0: requantise it every call)
-ATTN = find_spec("magpie_attn") is not None  # native/attn.cu: the attention kernel whose weights x values matmul is 4-bit (sm_120 only)
-PV4_KEYS = int(os.environ.get("MAGPIE_PV4_KEYS", "24000")) if ATTN else 1 << 62  # sequences with at least this many keys cache their values in nvfp4 (a 2048 output with a 1448 reference has ~24,600)
-QK4_KEYS = int(os.environ.get("MAGPIE_QK4_KEYS", "24000")) if find_spec("magpie_attn4") is not None else 1 << 62  # ... and their keys too, on the kernel with both matmuls 4-bit
-FP4_QUERIES = int(os.environ.get("MAGPIE_FP4_QUERIES", "15360"))  # ... and only when the image being drawn has this many tokens (2048 squared, less the few percent a non-square size rounds away): seven 1024 references reach the key count too, and there the 4-bit kernel drops and doubles subjects
-ATTN8 = find_spec("magpie_attn8") is not None and os.environ.get("MAGPIE_ATTN8") != "0"  # MAGPIE_ATTN8=0 falls back to sage's kernel; the same fork with 8-bit operands, its weights x values matmul on the block-scaled fp8 instruction: sage's result, 12 % sooner
+CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)  # (major, minor) of gpu 0
+FP8 = CAPABILITY >= (8, 9)  # ada and later: fp8 tensor cores, which the triton fp8 linears and sage's 8-bit kernel need
+BLACKWELL = CAPABILITY[0] == 12  # sm_120: the native kernels below are built for it and nothing else
+MX = BLACKWELL and find_spec("magpie_gemm") is not None  # native/gemm.cu: cutlass block-scaled matmuls, built by tools/build_native.sh
+SAGE = FP8 and find_spec("sageattention") is not None  # thu-ml/SageAttention 2 (apache-2.0); its int8 x fp8 kernel is sm_89+
+ATTN4 = BLACKWELL and find_spec("magpie_attn4") is not None  # native/attn.cu with both attention matmuls on the 4-bit instruction
+ATTN8 = BLACKWELL and find_spec("magpie_attn8") is not None  # the same fork with 8-bit operands, weights x values on the block-scaled fp8 instruction: sage's result, 12 % sooner
+FP4_KEYS = 24000 if ATTN4 else 1 << 62  # sequences with at least this many keys keep their cache in nvfp4 (a 2048 output with a 1448 reference has ~24,600) ...
+FP4_QUERIES = 15360  # ... when the image being drawn has this many tokens (2048 squared, less what a non-square size rounds away): seven 1024 references reach the key count too, and there the 4-bit kernel drops and doubles subjects
 QUERY_BLOCK, QUERY_WARP, KEY_BLOCK = 128, 32, 64  # sage's sm89 kernel: queries per tile, queries per int8 scale, keys per int8 scale
 HEADROOM = 2.0  # a value channel may grow this far past its step-1 maximum before its frozen fp8 step clips
 MLP_ROWS = int(os.environ.get("MAGPIE_MLP_ROWS", "8192"))  # rows one native mlp pass takes: its hidden tensor is six times as wide as the stream, so a long sequence goes in blocks
@@ -202,8 +203,8 @@ def hadamard(dim: int, device: torch.device) -> Tensor:
 
 # quantises bf16 keys and values (1, rows, heads, dim) into `kv` from row `start` (a multiple of 64) to the end,
 # with kv's frozen key mean and value steps. the key scales come back in a fresh tensor because sage's quantiser
-# wants a contiguous one, then are copied into place. nvfp4 values (a uint8 `kv.v`) and nvfp4 keys (a uint8 `kv.k`)
-# go through the native kernels. k None writes the values only (int8 keys already written by `prep_int8`).
+# wants a contiguous one, then are copied into place. a 4-bit cache (uint8 `kv.k`) goes through the native kernels.
+# k None writes the values only (int8 keys already written by `prep_int8`).
 def sage_write(kv: SageKV, k: Tensor | None, v: Tensor, start: int) -> SageKV:
     rows, heads, dim = v.shape[1:]
     if kv.k.dtype == torch.uint8:
@@ -216,10 +217,6 @@ def sage_write(kv: SageKV, k: Tensor | None, v: Tensor, start: int) -> SageKV:
         scale = kv.k_scale.new_empty(1, heads, -(-rows // KEY_BLOCK))
         _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, kv.mean, kv.k[:, start:], scale, KEY_BLOCK, 0)
         kv.k_scale[:, :, start // KEY_BLOCK :] = scale
-    if kv.v.dtype == torch.uint8:
-        import magpie_attn
-        magpie_attn.values(v, kv.v_scale, kv.v, start // KEY_BLOCK)
-        return kv
     value_fp8_kernel[(-(-rows // KEY_BLOCK), heads)](v, kv.v, kv.v_scale, rows, start, kv.v.shape[-1], heads, DIM=dim, TOKENS=KEY_BLOCK, num_warps=4)
     return kv
 
@@ -233,26 +230,23 @@ def sage_tail(kv: SageKV) -> tuple[Tensor, Tensor]:
 
 # a full sequence's bf16 keys and values (1, S, heads, dim) -> SageKV, everything quantised once. `prefix` is the
 # number of leading rows that will never change, `rows` the number before the target; `tail` is another layer's to
-# share (a fresh one when None). from PV4_KEYS keys up (24,000 by default) with at least FP4_QUERIES rows after the prefix (a 2048 edit, the size the gate covers) the values are kept in nvfp4 for the native
-# kernel instead: `v` is then (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles of 4-bit values in a hadamard
-# basis of the channels, and `v_scale` their step-1 mean per (head, channel) in that basis, which the kernel adds back.
-# from QK4_KEYS keys up the keys are nvfp4 as well: `k` (1, S, heads, 64) bytes in a hadamard basis with `mean` (fp32,
-# that basis) taken off, `k_scale` (1, heads, S padded to 64, 8) bytes, one e4m3 scale per 16 dimensions.
+# share (a fresh one when None). from FP4_KEYS keys up with at least FP4_QUERIES rows after the prefix (a 2048 edit,
+# the size the gate covers) keys and values are nvfp4 for the native 4-bit kernel, both in a hadamard basis of the
+# channels: `k` (1, S, heads, 64) bytes with `mean` (fp32, that basis) taken off, `k_scale` (1, heads, S padded to 64, 8)
+# bytes, one e4m3 scale per 16 dimensions; `v` (1, heads, S / 64 rounded up, 4608) bytes, 64-key tiles, and `v_scale`
+# their step-1 mean per (head, channel), which the kernel adds back. otherwise sage's int8 keys and fp8 values.
 def sage_pack(k: Tensor, v: Tensor, prefix: int, rows: int, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> SageKV:
     tokens, heads, dim = k.shape[1:]
     padded, start = -(-tokens // KEY_BLOCK) * KEY_BLOCK, prefix // KEY_BLOCK * KEY_BLOCK
-    wide = tokens - prefix >= FP4_QUERIES
-    if wide and tokens >= PV4_KEYS:
+    if tokens - prefix >= FP4_QUERIES and tokens >= FP4_KEYS:
         values = torch.empty((1, heads, padded // KEY_BLOCK, 4608), dtype=torch.uint8, device=k.device)
         step = (v.mean(dim=1, dtype=torch.float32) @ hadamard(dim, v.device)).contiguous()
-    else:
-        values = torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device)
-        step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
-    if wide and tokens >= max(PV4_KEYS, QK4_KEYS):
         keys = torch.empty((1, tokens, heads, dim // 2), dtype=torch.uint8, device=k.device)
         scales = torch.full((1, heads, padded, 8), 0x38, dtype=torch.uint8, device=k.device)  # e4m3 1.0 under the padding
         mean = (k.mean(dim=1, dtype=torch.float32) @ hadamard(dim, k.device)).contiguous()
     else:
+        values = torch.empty((1, dim, heads, padded), dtype=torch.float8_e4m3fn, device=k.device)
+        step = (v.abs().amax(dim=1).float().clamp_min(1e-30) * (HEADROOM / FP8_TOP)).contiguous()
         keys, scales, mean = torch.empty_like(k, dtype=torch.int8), step.new_empty(1, heads, padded // KEY_BLOCK), k.mean(dim=1)
     tail = tail or (torch.empty_like(k[:, start:]), torch.empty_like(v[:, start:]))
     held = (k[:, start:rows].clone(), v[:, start:rows].clone())
@@ -296,8 +290,8 @@ def sage_step(q: Tensor, k: Tensor, kv: SageKV, weights: tuple[Tensor, Tensor], 
 
 
 # `sage` on keys and values that are already quantised: only the queries are quantised here, unless `quantised` (int8
-# queries and their per-warp steps) is given. nvfp4 values take the native kernel (int8 q x k as in sage, 4-bit
-# weights x values); nvfp4 keys the one with both matmuls 4-bit.
+# queries and their per-warp steps) is given. a 4-bit cache takes the native kernel with both matmuls 4-bit, an 8-bit
+# one magpie_attn8 when built, else sage's own kernel.
 def sage_cached(q: Tensor, kv: SageKV, quantised: tuple[Tensor, Tensor] | None = None) -> Tensor:
     out = torch.empty_like(q)
     if kv.k.dtype == torch.uint8:
@@ -311,10 +305,6 @@ def sage_cached(q: Tensor, kv: SageKV, quantised: tuple[Tensor, Tensor] | None =
     q8, scale = quantised or (torch.empty_like(q, dtype=torch.int8), kv.k_scale.new_empty(1, q.shape[2], -(-q.shape[1] // QUERY_BLOCK) * (QUERY_BLOCK // QUERY_WARP)))
     if quantised is None:
         _fused.quant_per_warp_int8_cuda(q, q8, scale, QUERY_BLOCK, QUERY_WARP, 0)
-    if kv.v.dtype == torch.uint8:
-        import magpie_attn
-        magpie_attn.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
-        return out
     if ATTN8:
         import magpie_attn8
         magpie_attn8.attend(q8, kv.k, kv.v, out, scale, kv.k_scale, kv.v_scale, q.shape[-1] ** -0.5)
@@ -886,18 +876,9 @@ def nv_slots(scales: Tensor) -> Tensor:
 
 
 # the mlp weights with the matmuls named in NV as nvfp4 (scaled up by NV_WEIGHT) and the rest as mxfp8.
-def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor, nv: set[str] | None = None) -> MxMlp:
-    nv = NV if nv is None else nv
+def pack_mlp_nv(gate: Tensor, proj: Tensor, out: Tensor) -> MxMlp:
     hidden = torch.cat([gate, proj])
-    return MxMlp(nv_rows(hidden, scale=NV_WEIGHT) if "hidden" in nv else mx_columns(hidden), nv_rows(out.contiguous(), scale=NV_WEIGHT) if "out" in nv else mx_columns(out))
-
-
-# out(silu(gate(x)) * proj(x)) for x (rows, width) bf16 and weights from `pack_mlp_nv` with the same `nv`: a swiglu
-# mlp with no norm and no residual, as a language model's block has it.
-def swiglu_block(x: Tensor, packed: MxMlp, nv: set[str]) -> Tensor:
-    first = mx_project(*nv_rows(x), packed.hidden, alpha=1 / NV_WEIGHT) if "hidden" in nv else mx_project(*mx_rows(x), packed.hidden)
-    hidden, alpha = (nv_rows(first, True, NV_HIDDEN), 1 / (NV_WEIGHT * NV_HIDDEN)) if "out" in nv else (mx_rows(first, True), 1.0)
-    return mx_project(*hidden, packed.out, alpha=alpha)
+    return MxMlp(nv_rows(hidden, scale=NV_WEIGHT) if "hidden" in NV else mx_columns(hidden), nv_rows(out.contiguous(), scale=NV_WEIGHT) if "out" in NV else mx_columns(out))
 
 
 # `mlp_mx` with the matmuls named in NV in nvfp4; `alpha` undoes the scaling of weights and swiglu outputs.

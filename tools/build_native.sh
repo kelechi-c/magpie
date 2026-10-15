@@ -2,9 +2,8 @@
 # builds magpie's native kernels on the machine that will run them, into the python environment that runs this script:
 #   sageattention 2 (pinned commit, sm_120 only)
 #   magpie_gemm  - native/gemm.cu on cutlass: the block-scaled mxfp8 and nvfp4 matmuls
-#   magpie_attn  - native/attn.cu on sageattention's headers, 4-bit weights x values (2048-class outputs)
-#   magpie_attn4 - the same with 4-bit q x k too
-#   magpie_attn8 - 8-bit, weights x values on the block-scaled instruction (everything else)
+#   magpie_attn4 - native/attn.cu on sageattention's headers, both attention matmuls 4-bit (2048-class outputs)
+#   magpie_attn8 - the same kernel 8-bit, weights x values on the block-scaled instruction (everything else)
 # needs a blackwell sm_120 card's toolchain: nvcc from cuda 13 (CUDA_HOME, default /usr/local/cuda), gcc with c++20, and the
 # torch magpie runs on. sources and build files go under MAGPIE_DEPS (default ~/.cache/magpie). about 10 minutes.
 #   bash tools/build_native.sh
@@ -30,7 +29,7 @@ module = load("magpie_gemm", ["native/gemm.cu"], extra_include_paths=[f"{deps}/c
               extra_cuda_cflags=["-O3", "-std=c++20", "-DNDEBUG", "--expt-relaxed-constexpr", *arch], build_directory=build("magpie_gemm"), verbose=False)
 shutil.copy(module.__file__, sysconfig.get_paths()["purelib"])
 print("magpie_gemm built", module.mxfp8_slots(4096, 4096), module.nvfp4_slots(4096, 4096))
-for name, flags in (("magpie_attn", ["-DATTN_PV4=1"]), ("magpie_attn4", ["-DATTN_PV4=1", "-DATTN_QK4=1"]), ("magpie_attn8", ["-DATTN_PVX=1"])):
+for name, flags in (("magpie_attn4", ["-DATTN_PV4=1", "-DATTN_QK4=1"]), ("magpie_attn8", ["-DATTN_PVX=1"])):
     module = load(name, ["native/attn.cu"], extra_include_paths=[f"{deps}/sage/csrc", f"{deps}/sage/csrc/qattn"],
                   extra_cuda_cflags=["-O3", "-std=c++20", "-DENABLE_BF16", "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__", "--use_fast_math",
                                      "-diag-suppress=174", *flags, *arch], build_directory=build(name), verbose=False)

@@ -1,12 +1,9 @@
 [project]
 name = "magpie"
 version = "0.1.0"
-description = "lean pytorch inference for qwen-image 2.1 (base and turbo) on blackwell gpus"
+description = "fast qwen-image 2.1 turbo image editing on blackwell gpus"
 requires-python = ">=3.12"
 dependencies = ["torch", "numpy", "pillow", "safetensors", "transformers>=5.17"]
-
-[project.optional-dependencies]
-bench = ["modal", "diffusers", "accelerate"]
 
 [build-system]
 requires = ["hatchling"]

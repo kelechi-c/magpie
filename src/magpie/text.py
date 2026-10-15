@@ -6,9 +6,8 @@ import torch
 from PIL import Image
 from torch import Tensor, nn
 
-from magpie.kernels import NV_WEIGHT, Fp8Linear, MxMlp, mx_columns, mx_project, mx_rows, nv_rows, nv_slots, pack_mlp_nv, swiglu_block
+from magpie.kernels import MX, Fp8Linear, mx_project, nv_rows, nv_slots
 
-Format = Literal["bf16", "mxfp8", "nvfp4"]
 Encoder = Literal["nvfp4", "bf16"]  # the text encoder a run loads: the calibrated 4-bit checkpoint, or the original
 
 SYSTEM = "Comprehend and analyze the provided prompt."
@@ -61,23 +60,19 @@ def language(encoder: Any) -> Any:
     return getattr(encoder.model, "language_model", encoder.model)
 
 
-# a bias-free linear on block-scaled weights (mxfp8, or nvfp4 when `nv`): each call writes its input rows in the
-# same format and runs the native matmul. `alpha` undoes the weights' scaling; `scale` multiplies the input before
-# it is rounded (a calibrated nvfp4 checkpoint brings one per layer) and is undone by `alpha` too.
+# a bias-free linear on nvfp4 weights: each call writes its input rows times `scale` as nvfp4 (a calibrated
+# checkpoint brings one per layer) and runs the native matmul; `alpha` undoes both the weights' and the input's scaling.
+# the packed weight is two buffers, so `state_dict` (and the server's parking of the encoder) carries it.
 class PackedLinear(nn.Module):
-    def __init__(self, packed: Fp8Linear, nv: bool, alpha: float = 1.0, scale: float = 1.0) -> None:
+    def __init__(self, packed: Fp8Linear, alpha: float, scale: float) -> None:
         super().__init__()
-        self.packed, self.nv, self.alpha, self.scale = packed, nv, alpha, scale
+        self.register_buffer("values", packed[0])
+        self.register_buffer("scales", packed[1])
+        self.alpha, self.scale = alpha, scale
 
     def forward(self, x: Tensor) -> Tensor:
         flat = x.reshape(-1, x.shape[-1]).contiguous()
-        rows = nv_rows(flat, scale=self.scale) if self.nv else mx_rows(flat)
-        return mx_project(*rows, self.packed, alpha=self.alpha).view(*x.shape[:-1], -1)
-
-
-# a linear's weight rounded here, with no calibration.
-def rounded(weight: Tensor, nv: bool) -> PackedLinear:
-    return PackedLinear(nv_rows(weight.contiguous(), scale=NV_WEIGHT), True, 1 / NV_WEIGHT) if nv else PackedLinear(mx_columns(weight), False)
+        return mx_project(*nv_rows(flat, scale=self.scale), (self.values, self.scales), alpha=self.alpha).view(*x.shape[:-1], -1)
 
 
 # one linear of a calibrated nvfp4 checkpoint in llm-compressor's layout (auto-round, nvidia's and red hat's
@@ -85,70 +80,38 @@ def rounded(weight: Tensor, nv: bool) -> PackedLinear:
 # weight is code * scale / weight_global_scale. inputs were calibrated as round(x * input_global_scale).
 def calibrated(state: dict[str, Tensor], name: str) -> PackedLinear:
     weights, inputs = float(state[f"{name}.weight_global_scale"]), float(state[f"{name}.input_global_scale"])
-    return PackedLinear((state[f"{name}.weight_packed"].cuda(), nv_slots(state[f"{name}.weight_scale"].cuda())), True, 1 / (weights * inputs), inputs)
-
-
-E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-# a calibrated linear's weight back in fp32: the check that the layout above is read correctly, and that the
-# checkpoint was made from the same weights as ours.
-def unpacked(state: dict[str, Tensor], name: str) -> Tensor:
-    packed = state[f"{name}.weight_packed"].long()
-    codes = torch.stack([packed & 15, packed >> 4], dim=-1).flatten(1)
-    values = torch.tensor(E2M1, device=packed.device)[codes & 7] * torch.where(codes > 7, -1.0, 1.0)
-    return values * state[f"{name}.weight_scale"].float().repeat_interleave(16, dim=1) / float(state[f"{name}.weight_global_scale"])
+    return PackedLinear((state[f"{name}.weight_packed"].cuda(), nv_slots(state[f"{name}.weight_scale"].cuda())), 1 / (weights * inputs), inputs)
 
 
 CALIBRATED = "kaitchup/Qwen3-VL-8B-Instruct-NVFP4"  # auto-round w4a4 of the stock qwen3-vl-8b-instruct language model, apache-2.0
-ENCODER: Encoder = "bf16" if os.environ.get("MAGPIE_ENCODER") == "bf16" else "nvfp4"  # MAGPIE_ENCODER=bf16 picks the original
+ENCODER: Encoder = os.environ.get("MAGPIE_ENCODER") or ("nvfp4" if MX else "bf16")  # nvfp4 needs the native matmul (blackwell); MAGPIE_ENCODER overrides
 
 
 # the calibrated nvfp4 encoder's folder for "nvfp4" (downloaded once), None for "bf16". it holds 5.9 gib instead of
 # 15.2, so a 32 gb card keeps encoder, dit and vae loaded even for a 2048 edit. against the bf16 encoder it moves one
-# edit in sixteen past the gate by composition, not damage (the vlm judge ties or flips with the order); the default.
+# edit in sixteen past the gate by composition, not damage (the vlm judge ties or flips with the order); the default
+# where the native matmul is built, since its linears run on it.
 def calibrated_folder(encoder: Encoder = ENCODER) -> pl.Path | None:
     from huggingface_hub import snapshot_download
 
+    if encoder == "nvfp4" and not MX:
+        raise ValueError("the nvfp4 text encoder runs on magpie_gemm, which needs a blackwell (sm_120) gpu and tools/build_native.sh; use --encoder bf16")
     return pl.Path(snapshot_download(CALIBRATED, allow_patterns=["*.safetensors", "config.json"])) if encoder == "nvfp4" else None
 
 
-# a decoder layer's swiglu mlp on block-scaled weights; `nv` names its matmuls that run in nvfp4.
-class PackedMlp(nn.Module):
-    def __init__(self, mlp: Any, nv: set[str]) -> None:
-        super().__init__()
-        self.nv = nv
-        self.packed: MxMlp = pack_mlp_nv(mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight, nv)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return swiglu_block(x.reshape(-1, x.shape[-1]).contiguous(), self.packed, self.nv).view_as(x)
-
-
 # the checkpoint's qwen3-vl as the pipeline's text encoder, on the gpu in bf16, and its processor. the lm head is
-# dropped before the move (the encoder never calls it, 1.2 gib). `mlp` and `attention` pick the format of the
-# language model's mlps and of its q, k, v, o projections; the bf16 originals are released. the vision tower stays bf16.
-# `nvfp4_from` is the folder of a calibrated nvfp4 checkpoint of the same model: its seven linears per layer replace
-# ours (the mlp then runs as three matmuls, since its gate and up layers carry different scales).
-# callers pass `calibrated_folder()` for the run's choice (MAGPIE_ENCODER); None keeps bf16.
-def load_encoder(snapshot: pl.Path, mlp: Format = "bf16", attention: Format = "bf16", nvfp4_from: pl.Path | None = None) -> tuple[Any, Any]:
+# dropped before the move (the encoder never calls it, 1.2 gib). `nvfp4_from` is the folder of a calibrated nvfp4
+# checkpoint of the same model (`calibrated_folder()`): its seven linears per layer replace ours while the model is
+# still in host memory, so their bf16 originals never reach the gpu; the vision tower stays bf16. None keeps bf16.
+def load_encoder(snapshot: pl.Path, nvfp4_from: pl.Path | None = None) -> tuple[Any, Any]:
     from safetensors.torch import load_file
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(snapshot / "text_encoder", dtype=torch.bfloat16)
     encoder.lm_head = nn.Identity()
-    # the calibrated linears replace ours while the model is still in host memory, so their bf16 originals never reach the gpu
-    encoder = (encoder if nvfp4_from else encoder.to("cuda")).eval()
     state = {name: tensor for file in sorted(nvfp4_from.glob("*.safetensors")) for name, tensor in load_file(file).items()} if nvfp4_from else {}
-    for index, layer in enumerate(language(encoder).layers):
-        prefix = f"model.language_model.layers.{index}"
-        if index == 0 and state:
-            ours, theirs = layer.self_attn.q_proj.weight.float(), unpacked(state, f"{prefix}.self_attn.q_proj")
-            print(f"calibrated checkpoint, layer 0 q_proj against our bf16 weight: {float((theirs - ours).norm() / ours.norm()):.3f} relative error", flush=True)
-        for owner, names in ((layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")), (layer.mlp, ("gate_proj", "up_proj", "down_proj"))) if state else ():
+    for index, layer in enumerate(language(encoder).layers if state else ()):
+        for owner, part, names in ((layer.self_attn, "self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")), (layer.mlp, "mlp", ("gate_proj", "up_proj", "down_proj"))):
             for name in names:
-                setattr(owner, name, calibrated(state, f"{prefix}.{'self_attn' if owner is layer.self_attn else 'mlp'}.{name}"))
-        if mlp != "bf16" and not state:
-            layer.mlp = PackedMlp(layer.mlp, {"hidden", "out"} if mlp == "nvfp4" else set())
-        for name in ("q_proj", "k_proj", "v_proj", "o_proj") if attention != "bf16" and not state else ():
-            setattr(layer.self_attn, name, rounded(getattr(layer.self_attn, name).weight, attention == "nvfp4"))
-    return encoder.to("cuda"), AutoProcessor.from_pretrained(snapshot / "processor")
+                setattr(owner, name, calibrated(state, f"model.language_model.layers.{index}.{part}.{name}"))
+    return encoder.to("cuda").eval(), AutoProcessor.from_pretrained(snapshot / "processor")

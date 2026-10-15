@@ -1,8 +1,6 @@
 // magpie's attention kernel for sm_120, forked from SageAttention 2's sm89 kernel (csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh
 // at d1a57a5, Apache-2.0, notice below): int8 q x k and fp8 weights x values on the tensor cores, fp32 accumulators.
 // it builds against the rest of SageAttention's csrc/ headers. what differs from upstream:
-//   ATTN_LAZY    1: the output and denominator are rescaled only when some row's running maximum moved (the scale is
-//                exactly 1 otherwise, so the result is bit-identical); upstream multiplies them on every key tile.
 //   ATTN_PV4     1: the weights x values matmul runs on blackwell's block-scaled 4-bit instruction (mxf4nvf4, 64 keys
 //                per instruction instead of 32). the values arrive as nvfp4 (see `load_fp4_values`), the weights are
 //                rounded to nvfp4 in registers (`weights_to_fp4`), and the denominator sums the rounded weights.
@@ -14,19 +12,11 @@
 //   ATTN_PVX     1: the 8-bit weights x values matmul runs on the block-scaled fp8 instruction (mxf8f6f4) with every
 //                scale set to 1. same operands, same sum; on sm_120 that form runs at twice the rate of the plain
 //                e4m3 instruction upstream uses (native/peak.cu: 1,024 against 516 tflop/s on a 5090).
-//   ATTN_ABLATE  profiling only: 1 skips the q x k matmul, 2 the softmax update, 3 the weights x values matmul,
-//                4 the key and value loads, in the main loop. the output is then wrong by design.
-#ifndef ATTN_LAZY
-#define ATTN_LAZY 0
-#endif
 #ifndef ATTN_PV4
 #define ATTN_PV4 0
 #endif
 #ifndef ATTN_QK4
 #define ATTN_QK4 0
-#endif
-#ifndef ATTN_ABLATE
-#define ATTN_ABLATE 0
 #endif
 #ifndef ATTN_PVX
 #define ATTN_PVX 0
@@ -518,81 +508,10 @@ __global__ void rows_fp4_kernel(const nv_bfloat16 *__restrict__ x, const float *
   }
 }
 
-// `update_mdo` for fp32 accumulators and fp8 weights (new maxima, rescale, exponentiate), with the rescale skipped
-// for a warp none of whose rows saw a new maximum.
-template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v>
-__device__ __forceinline__ void update_mdo_lazy(float RS[][num_tiles_k][8], float RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
-{
-  float m_prev[num_tiles_q][2];
-  bool moved = false;
-#pragma unroll
-  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-  {
-#pragma unroll
-    for (uint32_t k = 0; k < 2; k++)
-    {
-      float m_temp = -5000000.0f;
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-        m_temp = max(m_temp, max(max(RS[fq][fk][k * 2 + 0], RS[fq][fk][k * 2 + 1]), max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5])));
-      }
-      m_temp = fmaf(m_temp, sm_scale, -S_FP8_OFFSET);
-      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
-      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
-      m_prev[fq][k] = m[fq][k];
-      m[fq][k] = max(m[fq][k], m_temp);
-      moved |= m[fq][k] != m_prev[fq][k];
-    }
-  }
-  if (__any_sync(0xffffffff, moved))
-  {
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-#pragma unroll
-      for (uint32_t k = 0; k < 2; k++)
-      {
-        float o_scale = math::ptx_exp2(m_prev[fq][k] - m[fq][k]);
-        d[fq][k] *= o_scale;
-#pragma unroll
-        for (uint32_t fv = 0; fv < num_tiles_v; fv++)
-        {
-          RO[fq][fv][k * 2 + 0] *= o_scale;
-          RO[fq][fv][k * 2 + 1] *= o_scale;
-          RO[fq][fv][k * 2 + 4] *= o_scale;
-          RO[fq][fv][k * 2 + 5] *= o_scale;
-        }
-      }
-    }
-  }
-#pragma unroll
-  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-  {
-#pragma unroll
-    for (uint32_t k = 0; k < 2; k++)
-    {
-      float negative_m = -m[fq][k];
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-        RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
-        RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
-        RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
-        RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
-      }
-    }
-  }
-}
-
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v>
 __device__ __forceinline__ void ATTN_UPDATE(float RS[][num_tiles_k][8], float RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
 {
-#if ATTN_LAZY
-  update_mdo_lazy<num_tiles_q, num_tiles_k, num_tiles_v>(RS, RO, m, d, sm_scale);
-#else
   update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS, RO, m, d, sm_scale);
-#endif
 }
 
 #define PACK_SIZE_QK 16 // as if it is int8
@@ -879,7 +798,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     float RS_f32[num_tiles_q][num_tiles_k][8];
     logits_fp4<num_tiles_q, num_tiles_k, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK>(smem_Q, smem_K, reinterpret_cast<const uint32_t *>(smem_KS) + get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K * 2, RQ_sf, RS_f32, Q_smem_offset_mma, K_smem_offset_mma);
 #else
-#if ATTN_ABLATE != 1
     // compute QK^T
     if constexpr (num_tiles_qk_inner == 1)
     {
@@ -891,7 +809,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
       compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
         smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
-#endif
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
 #pragma unroll
@@ -911,12 +828,10 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
 
     K_idx_lane_base += CTA_K;
 
-#if ATTN_ABLATE != 2
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
       ATTN_UPDATE<num_tiles_q, num_tiles_k, num_tiles_v>(RS_f32, RO, m, d, sm_scale);
     }
-#endif
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
     {
@@ -941,7 +856,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
 
     __syncthreads();
 
-#if ATTN_ABLATE != 4
     // load K without predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
@@ -950,7 +864,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     KS_tile += 512;
 #endif
     cp_async::commit_group();
-#endif
 
 #if ATTN_QK4
     dequant_scale = 1.f;
@@ -966,7 +879,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
     // for fp16:
     // compute_fp16_sv_permuted<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
     //   smem_V, RS_f16, RO, d, V_smem_offset_mma);
-#if ATTN_ABLATE != 3
 #if ATTN_PV4
     values_fp4<num_tiles_q, num_tiles_v>(smem_V4, RS_f4, RS_sf, RO);
 #else
@@ -987,9 +899,7 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
       }
     }
 #endif
-#endif
     __syncthreads();
-#if ATTN_ABLATE != 4
     // load V
     // for fp16: 
     // load_global_to_share                stride_seq_v
@@ -1001,7 +911,6 @@ __global__ void attn_sm120_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K
       &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
 #endif
     cp_async::commit_group();
-#endif
   
     K_load_idx_lane_base += CTA_K;
   }
