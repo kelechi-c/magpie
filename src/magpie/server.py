@@ -380,11 +380,11 @@ def card_limits(runtime: Runtime) -> dict[str, dict[str, int]]:
 
 # what this process runs on and with, before anything loads.
 def describe() -> str:
-    from magpie.kernels import ATTN4, ATTN8, CAPABILITY, FP8, MX, SAGE
+    from magpie.kernels import ATTN4, ATTN8, CAPABILITY, MX, SAGE
 
     props = torch.cuda.get_device_properties(0)
-    linears = "mxfp8 + nvfp4 (cutlass)" if MX else "fp8 (triton)" if FP8 else "bf16"
-    attention = "magpie_attn8" if ATTN8 else "sageattention 2" if SAGE else "triton / torch"
+    linears = "mxfp8 + nvfp4 (cutlass)" if MX else "bf16 (no native matmul: build it with tools/build_native.sh on an sm_120 card)"
+    attention = "magpie_attn8" if ATTN8 else "sageattention 2" if SAGE else "torch sdpa"
     return (f"gpu: {props.name}, sm_{CAPABILITY[0]}{CAPABILITY[1]}, {props.total_memory / GIB:.1f} gib\n"
             f"paths: linears {linears}; attention {attention}{', magpie_attn4 for 2048-class outputs' if ATTN4 else ''}")
 

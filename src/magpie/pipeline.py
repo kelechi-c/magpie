@@ -8,7 +8,7 @@ from PIL import Image
 from torch import Tensor
 
 from magpie.dit import Dit, layout
-from magpie.kernels import FP8, Fp8Attention, MxMlp, fp8_columns, logit_bound, pack_mlp
+from magpie.kernels import MX, Fp8Attention, MxMlp, mx_columns, pack_mlp
 from magpie.sampling import SamplerConfig, euler, schedule
 from magpie.text import encode, reslot
 from magpie.vae import Vae, VaeConfig, image_weights
@@ -27,10 +27,9 @@ class Models:
 
 # builds the port's dit and vae around already-loaded weights (e.g. a diffusers pipeline's state
 # dicts) without copying them: the dit is created on the meta device so 7b parameters are never
-# initialised, then `assign=True` swaps the real tensors in. each block's logit bound is read off its weights,
-# and bf16 weights on a gpu with fp8 tensor cores (sm_89+) also get fp8 copies of the mlp weights and of the attention
-# linears named in `attention` (any of q, k, v, out; all four by default): block-scaled ones on the native matmul, row-
-# and column-scaled ones for the triton kernels otherwise. `slim` (the default) then drops the bf16 originals of those
+# initialised, then `assign=True` swaps the real tensors in. where the native matmul is built (blackwell), bf16 weights
+# on the gpu also get block-scaled copies of the mlp weights (nvfp4 / mxfp8, see NV) and of the attention linears named
+# in `attention` (any of q, k, v, out; all four by default, mxfp8). `slim` (the default) then drops the bf16 originals of those
 # linears, ~13 gib, which leaves them no bf16 path; `slim=False` keeps both, for checks against the bf16 arithmetic.
 # `dit_state` is emptied once its tensors are in the dit, so each dropped original is freed as its block is packed and
 # loading peaks near the bf16 size (a 24 gb card holds bf16 and fp8 copies of the whole dit only just not).
@@ -41,12 +40,11 @@ def adopt(dit_state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: list
     dit.load_state_dict(dit_state, assign=True)
     dit_state.clear()
     for block in dit.transformer_blocks:
-        block.attn.bound = logit_bound(block.attn.norm_q.weight, block.attn.norm_k.weight)
         mlp, attn = block.img_mlp, block.attn
-        if FP8 and mlp.out.weight.is_cuda and mlp.out.weight.dtype == torch.bfloat16:
+        if MX and mlp.out.weight.is_cuda and mlp.out.weight.dtype == torch.bfloat16:
             mlp.packed = pack_mlp(mlp.gate_layer.weight, mlp.proj.weight, mlp.out.weight)
             layers = {name: layer for name, layer in zip(Fp8Attention._fields, (attn.to_q, attn.to_k, attn.to_v, attn.to_out[0])) if name in attention}
-            attn.packed = Fp8Attention(*(fp8_columns(layers[name].weight) if name in layers else None for name in Fp8Attention._fields))
+            attn.packed = Fp8Attention(*(mx_columns(layers[name].weight) if name in layers else None for name in Fp8Attention._fields))
             layers = tuple(layers.values())
             for layer in (mlp.gate_layer, mlp.proj, mlp.out, *layers) if slim else ():
                 layer.weight = None
@@ -84,7 +82,6 @@ def adopt_packed(state: dict[str, Tensor], vae_state: dict[str, Tensor], mean: l
     for index, block in enumerate(dit.transformer_blocks):
         pairs = [tuple(state[f"packed.{index}.{name}.{part}"] for part in ("values", "scales")) if f"packed.{index}.{name}.values" in state else None for name in PACKED]
         mlp, attn = block.img_mlp, block.attn
-        attn.bound = logit_bound(attn.norm_q.weight, attn.norm_k.weight)
         mlp.packed, attn.packed = MxMlp(*pairs[:2]), Fp8Attention(*pairs[2:])
         for layer, pair in zip((mlp.gate_layer, mlp.proj, mlp.out, attn.to_q, attn.to_k, attn.to_v, attn.to_out[0]), (pairs[0], pairs[0], *pairs[1:])):
             layer.weight = layer.weight if pair is None else None

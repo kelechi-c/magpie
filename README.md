@@ -25,16 +25,10 @@ judge calls it a tie) and now and then gets requested lettering wrong; `--encode
   (under the same license); without the native matmul kernels it loads the original bf16 transformer instead.
 - The fast paths are native extensions built from `native/` on the machine that runs them (see below).
 
-magpie reads the GPU's architecture when it starts and picks what that card can run:
-
-| GPU | transformer linears | attention | text encoder |
-|---|---|---|---|
-| Blackwell, sm_120, kernels built | MXFP8 and NVFP4 (CUTLASS) | 8-bit, 4-bit for 2048² | calibrated NVFP4 |
-| Blackwell, kernels not built | FP8 (Triton) | SageAttention 2 if installed | bf16 |
-| Ada, sm_89 (RTX 4090, L40S, L4) | FP8 (Triton) | SageAttention 2 if installed | bf16 |
-| Ampere and older (RTX 3090, A100) | bf16 | Triton / PyTorch | bf16 |
-
-Off Blackwell the images are not the gated ones (other kernels, other rounding) and nothing there is tuned.
+magpie is built for Blackwell (sm_120) and checks for it when it starts. Without the native kernels, or on another
+GPU, it still runs, in plain bf16 with PyTorch's attention: slower, and not tuned or gated there. The
+[`ada` branch](https://github.com/kelechi-c/magpie/tree/ada) keeps an FP8 (Triton) path for Ada cards (sm_89: RTX 4090,
+L40S, L4).
 
 ## install
 

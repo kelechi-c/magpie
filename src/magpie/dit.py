@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from magpie.kernels import (SAGE, Fp8Attention, Fp8Mlp, SageKV, Stream, flash, flat, formed, fp8_norm, fp8_project, fp8_rows, max_free, mlp_fp8,
-                            norm_mod, qk_prep, sage, sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_write)
+from magpie.kernels import (SAGE, Fp8Attention, MxMlp, SageKV, Stream, flat, formed, mlp_packed, mx_norm, mx_project, mx_rows, norm_mod, qk_prep, sage,
+                            sage_cached, sage_pack, sage_refit, sage_step, sage_tail, sage_write)
 
 Segment = tuple[int, int, bool]  # (start, end, is_text) run of the prefix
 KV = tuple[Tensor, Tensor]  # one layer's keys and values for the whole sequence, each (B, S, heads, head_dim):
@@ -113,8 +113,8 @@ def prep(x: Tensor, weight: Tensor, rope: Tensor, eps: float, out: Tensor | None
     return plain if out is None else out.copy_(plain)
 
 
-# true when a layer carries packed fp8 weights (`pipeline.adopt` packs them) and x is bf16 on the gpu.
-def fp8_ready(packed: Fp8Attention | Fp8Mlp | None, x: Tensor) -> bool:
+# true when a layer carries block-scaled weights (`pipeline.adopt` packs them) and x is bf16 on the gpu.
+def packed_ready(packed: Fp8Attention | MxMlp | None, x: Tensor) -> bool:
     return packed is not None and x.is_cuda and x.dtype == torch.bfloat16
 
 
@@ -130,21 +130,17 @@ def sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
     return out.transpose(1, 2)
 
 
-# attention as the model runs it. unmasked bf16 calls on the gpu take sageattention 2's 8-bit kernel when the package
-# is installed. without it they take the max-free flash kernel where `bound` (the block's largest possible logit)
-# proves exp cannot overflow. everything else is `sdpa`: masked text runs, cpu, and the blocks that need the max.
-def attend(q: Tensor, k: Tensor, v: Tensor, bound: float, mask: Tensor | None = None) -> Tensor:
-    fused = mask is None and q.is_cuda and q.dtype == torch.bfloat16
-    if fused and SAGE:
-        return sage(q, k, v)
-    return flash(q, k, v, stable=False) if fused and max_free(bound, k.shape[1]) else sdpa(q, k, v, mask)
+# attention as the model runs it: unmasked bf16 calls on the gpu take sageattention 2's 8-bit kernel when it is built,
+# everything else (masked text runs, cpu, no sage) torch's `sdpa`.
+def attend(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
+    return sage(q, k, v) if SAGE and mask is None and q.is_cuda and q.dtype == torch.bfloat16 else sdpa(q, k, v, mask)
 
 
 # block-causal attention over the whole joint sequence: a token sees every earlier token, plus all
 # of its own image block. done as one flash call per prefix run (text runs get a causal triangle
 # over their own keys) and one for the target image, which sees everything; with `packed`, the whole sequence's
 # keys and values already in sage's 8-bit form, the target call reads those.
-def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float, packed: SageKV | None = None) -> Tensor:
+def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, packed: SageKV | None = None) -> Tensor:
     def run(start: int, end: int, is_text: bool) -> Tensor:
         size = end - start
         mask = (
@@ -152,9 +148,9 @@ def attend_prefill(q: Tensor, k: Tensor, v: Tensor, lay: Layout, bound: float, p
             if is_text
             else None
         )
-        return attend(q[:, start:end], k[:, :end], v[:, :end], bound, mask)
+        return attend(q[:, start:end], k[:, :end], v[:, :end], mask)
 
-    target = attend(q[:, lay.prefix :], k, v, bound) if packed is None else sage_cached(q[:, lay.prefix :], packed)
+    target = attend(q[:, lay.prefix :], k, v) if packed is None else sage_cached(q[:, lay.prefix :], packed)
     return torch.cat([run(*s) for s in lay.segments] + [target], dim=1)
 
 
@@ -162,7 +158,6 @@ class Attention(nn.Module):
     def __init__(self, cfg: DitConfig) -> None:
         super().__init__()
         self.heads, self.eps = cfg.heads, cfg.eps
-        self.bound = math.inf  # largest possible logit; `pipeline.adopt` sets it from the loaded qk-norm weights
         self.packed: Fp8Attention | None = None
         self.to_q, self.to_k, self.to_v = (nn.Linear(cfg.width, cfg.width, bias=False) for _ in range(3))
         self.to_out = nn.ModuleList([nn.Linear(cfg.width, cfg.width, bias=False)])
@@ -173,18 +168,18 @@ class Attention(nn.Module):
 
     # layer_norm(x) * mod projected to per-head q, k, v; q and k are rms-normed (bounds the logits) then rotated.
     # with `into` = (keys, values) views of a kv buffer, k and v are written straight there. a projection with
-    # fp8 weights is an fp8 matmul on the norm's fp8 rows, whose kernel also forms the stream x; the others read
+    # block-scaled weights is a native matmul on the norm's mxfp8 rows, whose kernel also forms the stream x; the others read
     # the norm's bf16 output. returns (x formed, q, k, v); with `prepped` False q and k are the raw projections (k then
     # not written into `into`), for a caller that norms, rotates and quantises them in one pass.
     def qkv(self, x: Stream, mod: Tensor, rope: Tensor, into: KV | None = None, prepped: bool = True) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        packed = self.packed if fp8_ready(self.packed, x.branch) else Fp8Attention(None, None, None, None)
-        rows = fp8_norm(flat(x), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
+        packed = self.packed if packed_ready(self.packed, x.branch) else Fp8Attention(None, None, None, None)
+        rows = mx_norm(flat(x), mod.flatten(0, 1).contiguous(), self.eps) if any(packed[:3]) else None
         x = formed(x) if rows is None else x.branch
         n = normed(x, mod, self.eps) if not all(packed[:3]) else None
 
         def project(linear: nn.Linear, fp8: tuple[Tensor, Tensor] | None, out: Tensor | None = None) -> Tensor:
             if fp8 is not None:
-                return fp8_project(*rows, fp8, None if out is None else out.flatten(0, 1).flatten(1)).view(*x.shape[:2], self.heads, -1)
+                return mx_project(*rows, fp8, None if out is None else out.flatten(0, 1).flatten(1)).view(*x.shape[:2], self.heads, -1)
             flat = linear(n) if out is None else torch.matmul(n, linear.weight.t(), out=out.flatten(2))
             return flat.unflatten(-1, (self.heads, -1))
 
@@ -195,8 +190,8 @@ class Attention(nn.Module):
 
     # the attention branch's residual: the stream skip + gate * to_out(attended), the sum left to the next norm.
     def out(self, attended: Tensor, skip: Tensor, gate: Tensor) -> Stream:
-        if fp8_ready(self.packed, skip) and self.packed.out is not None:
-            return Stream(fp8_project(*fp8_rows(attended.reshape(-1, skip.shape[-1])), self.packed.out).view_as(skip), skip, gate)
+        if packed_ready(self.packed, skip) and self.packed.out is not None:
+            return Stream(mx_project(*mx_rows(attended.reshape(-1, skip.shape[-1])), self.packed.out).view_as(skip), skip, gate)
         return Stream(self.to_out[0](attended.flatten(2, 3)), skip, gate)
 
 
@@ -207,17 +202,17 @@ class SwiGLU(nn.Module):
         self.proj = nn.Linear(cfg.width, hidden, bias=False)
         self.gate_layer = nn.Linear(cfg.width, hidden, bias=False)
         self.out = nn.Linear(hidden, cfg.width, bias=False)
-        self.packed: Fp8Mlp | None = None
+        self.packed: MxMlp | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 
 # a block's mlp branch with its residual: the stream `x + gate * mlp(layer_norm(x) * mod)`, the sum left to the next
-# norm; bf16 tensors on the gpu take the fp8 kernels when the mlp carries packed fp8 weights.
+# norm; bf16 tensors on the gpu take the native kernels when the mlp carries block-scaled weights.
 def feed(mlp: SwiGLU, x: Stream, mod: Tensor, gate: Tensor, eps: float) -> Stream:
-    if fp8_ready(mlp.packed, x.branch):
-        return mlp_fp8(x, mod, gate, mlp.packed, eps)
+    if packed_ready(mlp.packed, x.branch):
+        return mlp_packed(x, mod, gate, mlp.packed, eps)
     x = formed(x)
     return Stream(mlp(F.layer_norm(x, x.shape[-1:], eps=eps) * mod), x, gate)
 
@@ -237,7 +232,7 @@ class Block(nn.Module):
     def prefill(self, x: Stream, mod: tuple[Tensor, ...], lay: Layout, keep: bool = False, tail: tuple[Tensor, Tensor] | None = None) -> tuple[Stream, KV | SageKV]:
         x, q, k, v = self.attn.qkv(x, mod[0], lay.rope)
         packed = sage_pack(k, v, lay.head, lay.prefix, keep, tail) if SAGE and k.is_cuda and k.dtype == torch.bfloat16 and k.shape[0] == 1 else None
-        x = self.attn.out(attend_prefill(q, k, v, lay, self.attn.bound, packed), x, mod[1])
+        x = self.attn.out(attend_prefill(q, k, v, lay, packed), x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), packed or (k, v)
 
     # target-only pass: target queries attend to [cached prefix, target] with no mask at all. the new target
@@ -252,7 +247,7 @@ class Block(nn.Module):
         if fused:
             attended = sage_step(q, new, cache, (self.attn.norm_q.weight, self.attn.norm_k.weight), rope, self.eps)
         else:
-            attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v, self.attn.bound)
+            attended = sage_cached(q, sage_write(cache, k, v, cache.start)) if packed else attend(q, k, v)
         x = self.attn.out(attended, x, mod[1])
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps)
 
@@ -266,7 +261,7 @@ class Block(nn.Module):
         x, q, _, _ = self.attn.qkv(x, mod[0], rope, (k[:, -rows:], v[:, -rows:]))
         keys, values = (torch.cat([old, new[:, -rows : texts - rows]], dim=1) for old, new in zip(cache.head, (k, v)))
         mask = torch.cat([q.new_ones(texts, held, dtype=torch.bool), q.new_ones(texts, texts, dtype=torch.bool).tril()], 1)
-        attended = torch.cat([attend(q[:, :texts], keys, values, self.attn.bound, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
+        attended = torch.cat([attend(q[:, :texts], keys, values, mask), sage_cached(q[:, texts:], sage_write(cache, k, v, cache.start))], dim=1)
         x = self.attn.out(attended, x, mod[1])
         held = tuple(part[:, : part.shape[1] - rows + texts].clone() for part in (k, v))
         return feed(self.img_mlp, x, mod[2], mod[3], self.eps), cache._replace(held=held)
