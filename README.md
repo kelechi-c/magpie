@@ -14,8 +14,8 @@ matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that 
 Median of five warm requests, everything resident, with the default calibrated 4-bit text encoder and, for 2048², a
 1448² reference. The transformer and VAE pass a 16-image gate against the bf16 baseline at both sizes (DINOv2 ≥ 0.98,
 DreamSim ≤ 0.05). The 4-bit encoder moves one of the sixteen edits' composition past that line (DINOv2 0.94; a VLM
-judge calls it a tie); `--encoder bf16` keeps the original. Numbers are in `baseline/rtx5090.json` and
-`baseline/compare.json`.
+judge calls it a tie) and now and then gets requested lettering wrong; `--encoder bf16` keeps the original (see
+[the text encoder](#the-text-encoder)). Numbers are in `baseline/rtx5090.json` and `baseline/compare.json`.
 
 ## requirements
 
@@ -59,8 +59,7 @@ Check (torch first: the extensions link against its libraries): `python -c "impo
 MAGPIE_TOKEN=<secret> python -m magpie.server --port 8188 [--encoder nvfp4|bf16]
 ```
 
-It loads the model once and takes one request at a time. `--encoder` picks the text encoder: `nvfp4` (default), a
-calibrated 4-bit checkpoint at 5.9 GiB, or `bf16`, the original at 15.2 GiB.
+It loads the model once and takes one request at a time. `--encoder nvfp4|bf16` picks the text encoder (see below).
 
 ```
 curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-Type: application/json" \
@@ -83,7 +82,7 @@ curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-
 The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib`, `remembered` and `ms` (`fetch`, `text`,
 `dit_vae`, `encode_image`). The server keeps the text encoder's output for its last eight prompt and image pairs, so a
 repeat with another seed or size skips the encoder (`remembered` is then true). Out of memory comes back as status 507.
-`GET /health` reports the card.
+`GET /health` reports the card and the text encoder.
 
 On a card under 40 GiB the text encoder steps aside to host memory when a request is too large to share
 the card with it, which costs about 0.4 s on that request and the next. That is past twelve 1024² images of output
@@ -93,10 +92,36 @@ bf16 encoder (four references). Stepping aside needs free host memory the size o
 | environment | |
 |---|---|
 | `MAGPIE_TOKEN` | when set, requests must carry `Authorization: Bearer <token>` |
-| `MAGPIE_ENCODER=bf16` | the original text encoder, as `--encoder bf16` (default `nvfp4`) |
+| `MAGPIE_ENCODER` | `nvfp4` (default) or `bf16`: the text encoder, as `--encoder` |
 | `MAGPIE_PARK=1` | let the encoder step aside on a large card too |
 | `MAGPIE_PROMPTS` | how many prompt and image pairs to remember (8; 0 turns it off) |
 | `HF_HOME` | where weights are cached |
+
+## the text encoder
+
+Two text encoders, chosen when the model loads (not per request):
+
+| | `nvfp4` (default) | `bf16` |
+|---|---|---|
+| what | Qwen's encoder with calibrated 4-bit weights, 5.9 GiB | the original, 15.2 GiB |
+| edit 1024², RTX 5090 | 1.31 s, 14.7 GiB | 1.32 s, 24.0 GiB |
+| edit 2048² (1448² reference), RTX 5090 | 5.63 s, 18.2 GiB | 5.71 s, 27.5 GiB |
+| most references, RTX 5090 (1024² / 2048²) | 11 / 6 | 4 / 2 |
+| lettering | now and then misspells a requested title or leaves the old one (2 of 6 test renders that bf16 got right) | |
+
+Whole request, median of five warm runs, both encoders on the same 575 W RTX 5090 (the headline's card ran a few percent
+faster).
+
+Pick it with any of:
+
+| where | |
+|---|---|
+| server | `python -m magpie.server --encoder bf16` |
+| environment | `MAGPIE_ENCODER=bf16` (also the default for `load()` and the server) |
+| Python | `load("bf16")` |
+
+Use `bf16` when an edit must render exact text and the card has the room; pictures without lettering look the same
+with either.
 
 ## from python
 
