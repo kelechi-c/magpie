@@ -10,15 +10,18 @@ Qwen-Image 2.1 Turbo (8 steps, one 7.1 B transformer for text-to-image and image
 Blackwell GPUs (sm_120: RTX 5090, RTX PRO 6000): a lean PyTorch port with block-scaled FP8 and NVFP4
 matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that stays quantised.
 
-| whole request, text encoder included | edit 1024² | edit 2048² |
+| RTX 5090, request to PNG reply, text encoder included | edit 1024² | edit 2048² |
 |---|---|---|
-| **magpie, RTX 5090** | **1.49 s** | **6.19 s** |
-| magpie, RTX 5090, `fast` | 1.26 s | 5.00 s |
-| official diffusers pipeline, RTX 5090 (CPU offload) | 27.1 s | out of memory |
-| magpie, RTX PRO 6000 (bf16 text encoder) | 1.10 s | 5.80 s |
+| **magpie, `fast`** | **1.26 s** | **5.00 s** |
+| magpie, 8 steps | 1.49 s | 6.19 s |
+| sglang 0.5.21, FP8 + SageAttention | 2.54 s | 12.07 s |
+| LightX2V, text encoder offloaded | 4.54 s | 20.07 s |
+| vLLM-Omni, text encoder offloaded | out of memory | out of memory |
+| official diffusers pipeline, CPU offload (in-process) | 28.0 s | out of memory |
 
-Median of five warm requests, everything resident, with the default calibrated 4-bit text encoder and, for 2048², a
-1448² reference. The transformer and VAE pass a 16-image gate against the bf16 baseline at both sizes (DINOv2 ≥ 0.98,
+Median of five warm requests on one RTX 5090, every system the same day, everything resident for magpie, with the
+default calibrated 4-bit text encoder and, for 2048², a 1448² reference. On an RTX PRO 6000 magpie takes 1.02 s and
+4.76 s at 8 steps (prompt remembered). The transformer and VAE pass a 16-image gate against the bf16 baseline at both sizes (DINOv2 ≥ 0.98,
 DreamSim ≤ 0.05). The 4-bit encoder moves one of the sixteen edits' composition past that line (DINOv2 0.94; a VLM
 judge calls it a tie) and now and then gets requested lettering wrong; `--encoder bf16` keeps the original (see
 [the text encoder](#the-text-encoder)). Numbers are in `baseline/rtx5090.json` and `baseline/compare.json`.
@@ -50,7 +53,7 @@ bash tools/build_native.sh
 ```
 
 Run it once per machine, inside the Python environment magpie runs in. It needs `nvcc` from CUDA 13
-(`CUDA_HOME`, default `/usr/local/cuda`) and gcc with C++20, and takes about ten minutes. It fetches
+(`CUDA_HOME`, default `/usr/local/cuda`) and gcc with C++20, and takes about seven minutes on an RTX 5090. It fetches
 SageAttention 2 and CUTLASS at pinned commits into `MAGPIE_DEPS` (default `~/.cache/magpie`), installs
 `sageattention`, and builds three extensions into the environment:
 
@@ -88,8 +91,8 @@ curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-
 | `reference` | `resolution`, at most 1448 | the side the images enter the model at. 1448 for a 2048² edit passes the quality gate, 16 % sooner than a full-size reference |
 | `seed` | 0 | |
 | `format` | `png` | `png`, `jpeg` or `webp` |
-| `fast` | false | run 6 of the 8 transformer steps (steps 3 and 6 reuse the previous step's velocity): 1024² 979 → 787 ms, 2048² 4,679 → 3,690 ms (DiT + VAE, PRO 6000). On the 16-edit quality gate it flags the same items as 8 steps, no new ones |
-| `keep` | false | hold the images' attention cache on the card for the next edit of the same images at the same size: that edit skips their VAE encode and their part of the first step (1024² 979 → 863 ms, 2048² 4,679 → 4,443 ms on the PRO 6000) for +4.6 / +11 GiB. Kept only when it fits beside the request; any other request frees it. A resumed edit is close to a fresh one, not identical (DINOv2 median 0.998, worst 0.92 over 16 edits) |
+| `fast` | false | run 6 of the 8 transformer steps (steps 3 and 6 reuse the previous step's velocity): DiT + VAE 1024² 1,158 → 935 ms, 2048² 5,474 → 4,306 ms on the RTX 5090 (979 → 787, 4,679 → 3,690 on the PRO 6000). It passes the 16-edit quality gate wherever 8 steps does: all 32 edits on the 5090; on the PRO 6000 it flags the same two 1024² items as 8 steps, no new ones |
+| `keep` | false | hold the images' attention cache on the card for the next edit of the same images at the same size: that edit skips their VAE encode and their part of the first step (DiT + VAE 1024² 1,158 → 1,023 ms, 2048² 5,474 → 5,247 ms on the RTX 5090) for +4.6 / +11 GiB; at 2048² that is 29.5 of the 5090's 29.6 usable GiB. Kept only when it fits beside the request; any other request frees it. A resumed edit is close to a fresh one, not identical (DINOv2 median 0.998, worst 0.92 over 16 edits) |
 
 The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib`, `mode`, `predicted_gib`, `remembered`, `kept`, `resumed` and `ms`
 (`fetch`, `text`, `dit_vae`, `encode_image`). The server keeps the text encoder's output for its last eight prompt and
@@ -100,10 +103,10 @@ At start the server measures the card, as vLLM does before it sizes its cache: s
 one, two and four references) give it the memory each request needs. It then prints what the card takes:
 
 ```
-probe 1024² edit, 1024² references: dit + vae 8.78, 10.18, 12.97 gib with 1, 2, 4
-probe 2048² edit, 1448² references: dit + vae 12.27, 13.74, 17.54 gib with 1, 2, 4
-probed in 31.2 s: 30.2 gib usable, encoder 5.9 gib, parks when a request needs the room
-most references, 1024² edit: 12 resident, 16 staged
+probe 1024² edit, 1024² references: dit + vae 8.78, 10.19, 13.00 gib with 1, 2, 4
+probe 2048² edit, 1448² references: dit + vae 12.28, 13.77, 17.60 gib with 1, 2, 4
+probed in 44.8 s: 29.6 gib usable, encoder 5.9 gib, parks when a request needs the room
+most references, 1024² edit: 11 resident, 15 staged
 most references, 2048² edit: 6 resident, 8 staged
 ```
 
@@ -163,17 +166,18 @@ Edit a generated image with a different seed from the one that drew it; the same
 
 ## limits
 
-- A 2048² edit on an RTX 5090 stays fully resident: 6.19 s and 18.4 GiB (1448² reference), 6.45 s and 19.7 GiB
-  with a 2048² reference; with the bf16 encoder, 5.41 s and 27.5 GiB.
+- A 2048² edit on an RTX 5090 stays fully resident: 18.4 GiB at peak with a 1448² reference and the 4-bit encoder,
+  27.5 GiB with the bf16 encoder.
 - References per edit, as Qwen suggests up to ten: an RTX PRO 6000 takes 10+ at both sizes with either encoder. An
   RTX 5090 takes eleven at 1024² and six at 2048² (1448² references) with the 4-bit encoder resident, four and two
-  with the bf16 encoder, thirteen and seven with the encoder off the card. Each 1024² reference adds about 0.5 s and
+  with the bf16 encoder, fifteen and eight with the encoder parked. Each 1024² reference adds about 0.4 s and
   1.4 GiB to a 1024² edit; each 1448² reference about 1.2 s and 1.9 GiB to a 2048² edit.
 - 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
 - Text-to-image keeps the subject, style and detail, but its composition can differ from the bf16 picture for the
   same seed (DINOv2 min 0.90 at 1024² and 2048²; the NVFP4 MLP weights shift it). It is judged on quality, not on
   matching that picture.
-- Turbo only. The 40-step base checkpoint runs in the port but is not tuned or gated.
+- Tuned for Turbo. The 40-step base checkpoint runs through the same build and passes the gate (DiT + VAE 4.76 s
+  at 1024², 27.90 s at 2048² on the RTX 5090).
 
 ## layout
 
