@@ -3,7 +3,6 @@ import pathlib as pl
 from typing import Any, Literal
 
 import torch
-from PIL import Image
 from torch import Tensor, nn
 
 from magpie.kernels import MX, Fp8Linear, mx_project, nv_rows, nv_slots
@@ -20,11 +19,10 @@ def template(prompt: str, images: int) -> str:
     return f"<|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n{vision}{prompt or ' '}<|im_end|>\n<|im_start|>assistant\n"
 
 
-# the vision tower saw rgba composited over white during training.
-def flatten_alpha(image: Image.Image) -> Image.Image:
-    white = Image.new("RGB", image.size, (255, 255, 255))
-    white.paste(image, mask=image.getchannel("A"))
-    return white
+# the vision tower saw rgba composited over white during training: uint8 (4, H, W) -> uint8 (3, H, W), where it is.
+def flatten_alpha(image: Tensor) -> Tensor:
+    rgb, alpha = image[:3].float(), image[3:].float() / 255
+    return (rgb * alpha + 255 * (1 - alpha)).round().to(torch.uint8)
 
 
 # runs the qwen3-vl model as an encoder: returns the last decoder layer's output *before* the final
@@ -32,11 +30,11 @@ def flatten_alpha(image: Image.Image) -> Image.Image:
 # calls the bare model, so neither the lm head nor the stack of per-layer hidden states is computed, and without
 # the kv cache a single forward would only write.
 @torch.no_grad()
-def encode(encoder: Any, processor: Any, prompt: str, images: list[Image.Image]) -> tuple[Tensor, Tensor]:
+def encode(encoder: Any, processor: Any, prompt: str, images: list[Tensor]) -> tuple[Tensor, Tensor]:
     system = [{"role": "system", "content": [{"type": "text", "text": SYSTEM}]}]
     drop = len(processor.apply_chat_template(system, tokenize=True, return_dict=False)[0])
     pad = processor.tokenizer.encode("<|image_pad|>")[0]
-    vision = {"images": [flatten_alpha(image) for image in images]} if images else {}
+    vision = {"images": [flatten_alpha(image.to(encoder.device)) for image in images], "device": encoder.device} if images else {}
     inputs = processor(text=[template(prompt, len(images))], return_tensors="pt", **vision).to(encoder.device)
     norm = getattr(encoder.model, "language_model", encoder.model).norm
     hook = norm.register_forward_hook(lambda module, args, output: args[0])

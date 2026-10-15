@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 
@@ -94,11 +95,19 @@ def fit(area: int, ratio: float) -> Shape:
     return round(width / 32) * 32, round(width / ratio / 32) * 32
 
 
-# pil -> (1, 4, H, W) in [-1, 1].
-# the bytes are moved to `device` first, so the arithmetic runs there.
-def to_pixels(image: Image.Image, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> Tensor:
-    raw = torch.from_numpy(np.array(image.convert("RGBA"))).to(device)
-    return (raw.float().div(255.0).permute(2, 0, 1)[None] * 2.0 - 1.0).to(dtype)
+# pil -> uint8 (4, H, W) rgba on `device`: the raw bytes go up once, everything after runs there.
+def uploaded(images: tuple[Image.Image, ...], device: torch.device | str = "cuda") -> list[Tensor]:
+    return [torch.from_numpy(np.array(image.convert("RGBA"))).to(device).permute(2, 0, 1) for image in images]
+
+
+# an uploaded image's (width, height).
+def side(image: Tensor) -> Shape:
+    return image.shape[-1], image.shape[-2]
+
+
+# uint8 (4, H, W) -> (1, 4, H, W) in [-1, 1].
+def to_pixels(image: Tensor, dtype: torch.dtype = torch.float32) -> Tensor:
+    return (image.float().div(255.0)[None] * 2.0 - 1.0).to(dtype)
 
 
 # (1, 4, H, W) in [-1, 1] -> rgba pil.
@@ -152,22 +161,27 @@ def reference_side(resolution: int) -> int:
     return min(resolution, REFERENCE)
 
 
-# condition images at the working size: `resolution`^2 pixels, their own aspect ratio, sides multiples of 32.
-def resized(images: tuple[Image.Image, ...], resolution: int) -> list[Image.Image]:
-    return [image.convert("RGBA").resize(fit(resolution**2, image.width / image.height), Image.LANCZOS) for image in images]
+# uploaded condition images at the working size: `resolution`^2 pixels, their own aspect ratio, sides multiples of 32.
+# an antialiased bicubic resize where they already are (~0.1 ms on the gpu against ~30 ms for pil lanczos to 1448).
+def resized(images: list[Tensor], resolution: int) -> list[Tensor]:
+    sizes = [fit(resolution**2, width / height) for width, height in map(side, images)]
+    return [
+        F.interpolate(image[None].float(), size=(height, width), mode="bicubic", antialias=True)[0].round().clamp(0, 255).to(torch.uint8)
+        for image, (width, height) in zip(images, sizes)
+    ]
 
 
 # conditioning (+ already resized condition images) -> rgba image, with no text encoder in sight:
 # vae-encode the images, denoise, decode. with images and no size, the output takes the last image's size.
 @torch.no_grad()
 def render(
-    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Image.Image] | None = None,
+    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Tensor] | None = None,
     size: Shape | None = None, resolution: int = 1024, seed: int = 0,
 ) -> Image.Image:
     device, dtype = dit.img_in.weight.device, dit.img_in.weight.dtype
     images = images or []
-    width, height = size or (images[-1].size if images else (resolution,) * 2)
-    encoded = [vae.encode(to_pixels(image, device, dtype)) for image in images]
+    width, height = size or (side(images[-1]) if images else (resolution,) * 2)
+    encoded = [vae.encode(to_pixels(image.to(device), dtype)) for image in images]
     shapes = [tuple(latent.shape[-2:]) for latent in encoded] + [(height // 16, width // 16)]
     references = torch.cat([pack(latent) for latent in encoded], dim=1) if encoded else None
     generator = torch.Generator("cpu").manual_seed(seed)
@@ -176,24 +190,24 @@ def render(
     return to_image(vae.decode(unpack(latents, shapes[-1])))
 
 
-# what `render_kept` leaves for the next edit of the same condition images: their identity and the dit's kv cache.
-Kept = tuple[tuple, list]
+# what `render_kept` leaves for the next edit of the same condition images: the caller's key for them and the dit's kv cache.
+Kept = tuple[Any, list]
 
 
 # `render` for editing one set of condition images repeatedly: returns the image and a `Kept`; given the `Kept` of an
-# earlier call on the same (already resized) images, it skips their vae encode and their rows of the first dit step.
-# a `Kept` of other images is ignored. it holds the cache on the gpu between requests (see `Dit.prefill`'s `keep`).
+# earlier call with the same `key` (the caller's name for these resized images, e.g. a hash of the bytes it received),
+# it skips their vae encode and their rows of the first dit step. a `Kept` under another key is ignored. it holds the
+# cache on the gpu between requests (see `Dit.prefill`'s `keep`).
 @torch.no_grad()
 def render_kept(
-    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Image.Image],
+    dit: Dit, vae: Vae, text: Tensor, slots: Tensor, sampler: SamplerConfig, images: list[Tensor], key: Any,
     size: Shape | None = None, seed: int = 0, kept: Kept | None = None,
 ) -> tuple[Image.Image, Kept]:
     device, dtype = dit.img_in.weight.device, dit.img_in.weight.dtype
-    key = tuple((image.size, hash(image.tobytes())) for image in images)
     cache = kept[1] if kept is not None and kept[0] == key else None
-    width, height = size or images[-1].size
-    shapes = [(image.height // 16, image.width // 16) for image in images] + [(height // 16, width // 16)]
-    references = torch.cat([pack(vae.encode(to_pixels(image, device, dtype))) for image in images], dim=1) if cache is None else None
+    width, height = size or side(images[-1])
+    shapes = [(image.shape[-2] // 16, image.shape[-1] // 16) for image in images] + [(height // 16, width // 16)]
+    references = torch.cat([pack(vae.encode(to_pixels(image.to(device), dtype))) for image in images], dim=1) if cache is None else None
     noise = torch.randn((1, 1, 64, *shapes[-1]), generator=torch.Generator("cpu").manual_seed(seed), dtype=dtype).to(device)
     latents, cache = denoise_kept(dit, text.to(device, dtype), slots.to(device), references, pack(noise[:, 0]), shapes, sampler, cache, True)
     return to_image(vae.decode(unpack(latents, shapes[-1]))), (key, cache)
@@ -210,10 +224,11 @@ def generate(
     size: Shape | None = None, resolution: int = 1024, seed: int = 0, look: int | None = 1024, reference: int | None = None,
 ) -> Image.Image:
     reference = reference or reference_side(resolution)
-    sized = resized(images, reference)
+    raw = uploaded(images, models.dit.img_in.weight.device)
+    sized = resized(raw, reference)
     small = look is not None and reference > look
-    text, slots = encode(models.encoder, models.processor, prompt, resized(images, look) if small else sized)
+    text, slots = encode(models.encoder, models.processor, prompt, resized(raw, look) if small else sized)
     if small:
-        text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
+        text, slots = reslot(text, slots, [image[0].numel() // 1024 for image in sized])
     shape = size or (fit(resolution**2, images[-1].width / images[-1].height) if images else None)
     return render(models.dit, models.vae, text, slots, sampler, sized, shape, resolution, seed)

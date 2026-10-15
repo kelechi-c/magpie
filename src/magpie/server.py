@@ -3,13 +3,15 @@
     python -m magpie.server [--host 0.0.0.0] [--port 8188] [--encoder nvfp4|bf16] [--max-memory GIB]
 
     GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks", "encoder", "limits"}
-    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format"}
-                    -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib", "remembered"}
+    POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format", "keep"}
+                    -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib", "mode", "remembered", "kept", "resumed"}
 
 only `prompt` is required. with images and no width/height the output takes the last image's shape at `resolution`
 (1024 or 2048, the side of a square of the same area); with neither it is a square. `reference` (default: `resolution`,
-at most 1448) is the side the images enter the model at. MAGPIE_TOKEN, when set, must
-arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start). the text
+at most 1448) is the side the images enter the model at. `keep` holds the images' kv cache on the card after the edit (~4.6 gib more at
+1024 with one reference, ~11 at 2048), so the next `keep` edit of the same images at the same size skips their encode
+and their rows of the first step (~115 ms at 1024, ~250 at 2048); any other request drops it. MAGPIE_TOKEN, when set,
+must arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start). the text
 encoder's output for the last MAGPIE_PROMPTS (prompt, images) pairs is kept, so a repeat (another seed or size) skips it.
 at start the server runs six small probe edits to learn this card's memory (see `probe`); every request is then planned
 from them: resident, with the encoder parked in host memory while the dit runs (staged), or refused with the limit.
@@ -48,6 +50,10 @@ LOOK = 1024  # the encoder reads condition images no larger than this
 PROBES = ((1024, 1024), (2048, pipeline.REFERENCE))  # (output side, reference side) of the startup probes, one and two references each
 REFERENCE_CAP = 10  # a card that cannot hold this many references at 2048 resident keeps a pinned host copy of the encoder, to park it
 PROMPTS = int(os.environ.get("MAGPIE_PROMPTS", "8"))  # conditionings kept for repeated requests
+# what a resumed `keep` request adds over a plain one, gib per reference token and per output token: the kept bf16 keys
+# and values of the reference rows, and the refitted cache built while the old one is still held. fitted to the pro
+# 6000's resumed peaks: +4.58 gib at 1024 with one 1024 reference, +11.28 at 2048 with one 1448.
+KEPT_GIB = (0.87 / 1024, 0.28 / 1024)  # rounded up: plans 4.60 and 11.36 gib
 Format = Literal["png", "jpeg", "webp"]
 Job = dict[str, Any]
 Remembered = dict[tuple, tuple[torch.Tensor, torch.Tensor]]  # (prompt, image sizes and digests) -> the encoder's (text, slots), oldest first
@@ -223,7 +229,7 @@ def probe(runtime: Runtime, most: float | None = None) -> Runtime:
 
     def peak(output: int, side: int, count: int) -> float:
         try:
-            return generate(trial, {"prompt": "probe", "images": [blank(side)] * count, "resolution": output}, True, {}, "staged")[0]["dit_peak_gib"]
+            return generate(trial, {"prompt": "probe", "images": [blank(side)] * count, "resolution": output}, True, {}, None, "staged")[0]["dit_peak_gib"]
         except torch.OutOfMemoryError:
             park()
             return math.inf
@@ -272,23 +278,42 @@ def shapes(job: Job) -> tuple[tuple[Image.Image, ...], int, tuple[int, int]]:
     return images, reference, size or (pipeline.fit(resolution**2, images[-1].width / images[-1].height) if images else (resolution,) * 2)
 
 
-# a job's plan from its sizes alone: (mode, predicted peak gib).
-def planned(runtime: Runtime, job: Job) -> tuple[Mode, float]:
+# what a `keep` cache is filed under: the reference side, the output size and a digest of each image as sent.
+def pictures(job: Job) -> tuple:
+    _, reference, size = shapes(job)
+    return reference, *size, tuple(hashlib.blake2b(data.encode(), digest_size=16).hexdigest() for data in job.get("images", []))
+
+
+# a job's plan from its sizes alone: (mode, predicted peak gib, whether it keeps its references' kv cache). a job asking
+# to `keep` keeps it only when it runs resident and the cache fits beside it too, and its peak then includes the cache.
+def planned(runtime: Runtime, job: Job) -> tuple[Mode, float, bool]:
     images, reference, (width, height) = shapes(job)
-    return plan(runtime, width * height, sum(math.prod(pipeline.fit(reference**2, image.width / image.height)) for image in images))
+    references = sum(math.prod(pipeline.fit(reference**2, image.width / image.height)) for image in images)
+    mode, need = plan(runtime, width * height, references)
+    extra = references / 256 * KEPT_GIB[0] + width * height / 256 * KEPT_GIB[1]
+    keep = bool(job.get("keep")) and bool(images) and mode == "resident" and need + extra <= runtime.budget.capacity
+    return mode, need + keep * extra, keep
 
 
 # one request, as `pipeline.generate` runs it but in two timed stages, so the encoder can leave the gpu between them
 # when the plan says the request does not fit beside it. a (prompt, images) pair in `remembered` skips the encoder (and
-# bringing it back). returns the json reply, whether the encoder is parked, and the conditionings kept.
+# bringing it back). `kept` is the references' kv cache an earlier `keep` request left: a `keep` request on the same
+# images resumes from it (no vae encode, no reference rows in the first dit step), any other request drops it first.
+# returns the json reply, whether the encoder is parked, the conditionings kept and the cache kept.
 @torch.no_grad()
-def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered, force: Mode | None = None) -> tuple[Job, bool, Remembered]:
+def generate(
+    runtime: Runtime, job: Job, parked: bool, remembered: Remembered, kept: pipeline.Kept | None = None, force: Mode | None = None,
+) -> tuple[Job, bool, Remembered, pipeline.Kept | None]:
     models, resolution = runtime.models, int(job.get("resolution", 1024))
     images, reference, (width, height) = shapes(job)
-    sized = pipeline.resized(images, reference)
-    mode, need = (force, 0.0) if force else planned(runtime, job)
+    mode, need, keep = (force, 0.0, False) if force else planned(runtime, job)
     crowded = mode == "staged"
-    key = (job["prompt"], tuple((image.size, hashlib.blake2b(image.tobytes(), digest_size=16).hexdigest()) for image in sized))
+    filed = pictures(job)
+    kept = kept if keep and kept is not None and kept[0] == filed else None
+    resumed = kept is not None
+    raw = pipeline.uploaded(images)
+    sized = pipeline.resized(raw, reference)
+    key = (job["prompt"], reference, filed[-1])
     hit = key in remembered
     torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
@@ -296,31 +321,36 @@ def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered, f
         runtime.fetch()
     fetch_ms, start = elapsed(start), time.perf_counter()
     small = reference > LOOK
-    text, slots = remembered[key] if hit else encode(models.encoder, models.processor, job["prompt"], pipeline.resized(images, LOOK) if small else sized)
+    text, slots = remembered[key] if hit else encode(models.encoder, models.processor, job["prompt"], pipeline.resized(raw, LOOK) if small else sized)
     if small and not hit:
-        text, slots = reslot(text, slots, [image.width * image.height // 1024 for image in sized])
+        text, slots = reslot(text, slots, [image[0].numel() // 1024 for image in sized])
     remembered = remember(remembered, key, (text, slots))
     text_ms, start = elapsed(start), time.perf_counter()
     if crowded and not (parked and hit):
         runtime.park()
     text_peak = torch.cuda.max_memory_allocated()
     torch.cuda.reset_peak_memory_stats()
-    image = pipeline.render(models.dit, models.vae, text, slots, TURBO, sized, (width, height), resolution, int(job.get("seed", 0)))
+    sampler, seed = TURBO, int(job.get("seed", 0))
+    if keep:
+        image, kept = pipeline.render_kept(models.dit, models.vae, text, slots, sampler, sized, filed, (width, height), seed, kept)
+    else:
+        image = pipeline.render(models.dit, models.vae, text, slots, sampler, sized, (width, height), resolution, seed)
     render_ms, start = elapsed(start), time.perf_counter()
     fmt: Format = job.get("format", "png")
     reply = {"image": encoded(image, fmt), "format": fmt, "width": image.width, "height": image.height, "seed": int(job.get("seed", 0)),
              "peak_gib": round(max(text_peak, torch.cuda.max_memory_allocated()) / GIB, 2), "dit_peak_gib": round(torch.cuda.max_memory_allocated() / GIB, 2),
-             "predicted_gib": round(need, 2), "mode": mode, "remembered": hit}
+             "predicted_gib": round(need, 2), "mode": mode, "remembered": hit, "kept": keep, "resumed": resumed}
     ms = {"fetch": fetch_ms, "text": text_ms, "dit_vae": render_ms, "encode_image": round((time.perf_counter() - start) * 1e3, 1)}
-    return {**reply, "ms": ms}, crowded or (parked and hit), remembered
+    return {**reply, "ms": ms}, crowded or (parked and hit), remembered, kept
 
 
 # the request handler for one runtime. the gpu takes one job at a time (`lock`), always on the same thread (`gpu`): the
 # first gpu work on a new thread costs ~1.6 s (measured on the 5090: 2.7 s instead of 1.1 s for a 1024 edit), and the
-# server gives every connection a new one. `state` holds whether the last job left the encoder off the card and the
+# server gives every connection a new one. `state` holds whether the last job left the encoder off the card, the cache
+# a `keep` job left (taken out of `state`, and dropped before the job unless it resumes from it) and the
 # conditionings kept, as the last `generate` returned them.
 def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
-    lock, gpu, state, token = threading.Lock(), ThreadPoolExecutor(1), [False, {}], os.environ.get("MAGPIE_TOKEN")
+    lock, gpu, state, token = threading.Lock(), ThreadPoolExecutor(1), [False, {}, None], os.environ.get("MAGPIE_TOKEN")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"  # keep-alive: a proxy in front reuses its connection, and http/1.0 would close it under it
@@ -352,17 +382,19 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             job = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if not isinstance(job.get("prompt"), str) or not job["prompt"].strip():
                 return self.reply(400, {"error": "prompt is required"})
-            mode, need = planned(runtime, job)
+            mode, need, keep = planned(runtime, job)
             if mode == "refused":
                 return self.reply(507, {"error": f"this request needs about {need:.1f} gib, the card holds {runtime.budget.capacity:.1f}", "limits": card_limits(runtime)})
             with lock:
                 try:
-                    body, *state[:] = gpu.submit(generate, runtime, job, *state).result()
+                    held = state.pop()
+                    held = held if keep and held is not None and held[0] == pictures(job) else None  # the executor holds its arguments until the job ends
+                    body, *state[:] = gpu.submit(generate, runtime, job, state[0], state[1], held).result()
                 except torch.OutOfMemoryError as error:  # the one failure a caller can act on: ask for less
                     message = str(error)[:200]
                     del error
                     gpu.submit(runtime.park).result()
-                    state[0] = runtime.parks
+                    state[:] = [runtime.parks, state[1], None]
                     return self.reply(507, {"error": f"out of gpu memory: {message}"})
             print(f"{body['width']}x{body['height']} {len(job.get('images', []))} images, {body['mode']}: {body['ms']} peak {body['peak_gib']} gib (predicted {body['predicted_gib']})", flush=True)
             self.reply(200, body)
