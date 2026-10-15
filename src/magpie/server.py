@@ -1,8 +1,8 @@
 """http api for magpie: one qwen-image 2.1 turbo model on one gpu, one request at a time.
 
-    python -m magpie.server [--host 0.0.0.0] [--port 8188] [--encoder nvfp4|bf16]
+    python -m magpie.server [--host 0.0.0.0] [--port 8188] [--encoder nvfp4|bf16] [--max-memory GIB]
 
-    GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks", "encoder"}
+    GET  /health    -> {"gpu", "vram_gib", "allocated_gib", "busy", "parks", "encoder", "limits"}
     POST /generate  <- {"prompt", "images": [base64, ...], "width", "height", "resolution", "reference", "seed", "format"}
                     -> {"image": base64, "format", "width", "height", "seed", "ms": {...}, "peak_gib", "remembered"}
 
@@ -11,18 +11,24 @@ only `prompt` is required. with images and no width/height the output takes the 
 at most 1448) is the side the images enter the model at. MAGPIE_TOKEN, when set, must
 arrive as `Authorization: Bearer <token>`. weights come from the hugging face cache (downloaded on first start). the text
 encoder's output for the last MAGPIE_PROMPTS (prompt, images) pairs is kept, so a repeat (another seed or size) skips it.
+at start the server runs six small probe edits to learn this card's memory (see `probe`); every request is then planned
+from them: resident, with the encoder parked in host memory while the dit runs (staged), or refused with the limit.
 """
+
+import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # set before torch loads: without it reserved memory runs ~1.2 gib past what is allocated, and the plan budgets allocated
 
 import argparse
 import base64
 import hashlib
 import io
 import json
-import os
+import math
 import pathlib as pl
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Literal
@@ -39,19 +45,26 @@ REPO = "Qwen/Qwen-Image-2.1-Turbo"
 PACKED_REPO = "tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16"  # the transformer prepacked; qwen research license, non-commercial
 GIB = 2**30
 LOOK = 1024  # the encoder reads condition images no larger than this
-SMALL_CARD_GIB = 40  # below this the encoder cannot stay beside the dit for every request
-# output + reference pixels a 32 gb card holds with the encoder resident (rtx 5090, measured 2026-10-14): a 1024 edit
-# with four references for bf16 (five fail), with eleven for nvfp4 (28.7 gib; twelve fail). pixels are a rough proxy:
-# a 2048 edit at the 1448 reference also fits with two (bf16) or six (nvfp4) references, but parks past these lines.
-RESIDENT_PIXELS: dict[Encoder, int] = {"bf16": 5 * 1024**2, "nvfp4": 12 * 1024**2}
+PROBES = ((1024, 1024), (2048, pipeline.REFERENCE))  # (output side, reference side) of the startup probes, one and two references each
+REFERENCE_CAP = 10  # a card that cannot hold this many references at 2048 resident keeps a pinned host copy of the encoder, to park it
 PROMPTS = int(os.environ.get("MAGPIE_PROMPTS", "8"))  # conditionings kept for repeated requests
 Format = Literal["png", "jpeg", "webp"]
 Job = dict[str, Any]
 Remembered = dict[tuple, tuple[torch.Tensor, torch.Tensor]]  # (prompt, image sizes and digests) -> the encoder's (text, slots), oldest first
 
 
-# the loaded models and how to move the encoder: `fetch` brings it onto the gpu, `park` leaves only its
-# pinned host copy. on a large card both do nothing.
+# what the server plans memory with, in gib: what the allocator may hold, what the encoder holds on the gpu, and per probe
+# output size (output pixels, reference pixels, and the dit + vae peak without the encoder as a quadratic a + b n + c n^2
+# in n, the reference pixels in units of that size's reference).
+@dataclass(frozen=True)
+class Budget:
+    capacity: float = math.inf
+    encoder: float = 0.0
+    fits: tuple[tuple[int, int, tuple[float, float, float]], ...] = ()
+
+
+# the loaded models, how to move the encoder (`fetch` brings it onto the gpu, `park` leaves only its pinned host copy;
+# both do nothing when `parks` is false) and the card's budget.
 @dataclass(frozen=True)
 class Runtime:
     models: pipeline.Models
@@ -59,6 +72,58 @@ class Runtime:
     park: Callable[[], None]
     parks: bool
     encoder: Encoder
+    budget: Budget = Budget()
+
+
+# the dit + vae peak (gib, encoder not counted) of an edit with `output` pixels and `references` reference pixels in all:
+# each probe size's quadratic, its coefficients interpolated in output pixels and extended past 2048 the same way. the
+# peak grows faster than the reference count (2048 at 1448 references, measured: +1.5 gib from one to two, +2.0 from five
+# to six), so a straight line would plan edits that do not fit. with no probes, nothing is predicted.
+def predict(budget: Budget, output: int, references: int) -> float:
+    if not budget.fits:
+        return 0.0
+    (low, low_side, low_fit), (high, high_side, high_fit) = budget.fits
+    t = max((output - low) / (high - low), 0.0)
+    mix = lambda a, b: a + t * (b - a) if t else a
+    a, b, c = (mix(x, y) for x, y in zip(low_fit, high_fit))
+    n = references / mix(low_side, high_side)
+    return a + b * n + c * n * n
+
+
+COUNTS = (1, 2, 4)  # references in each size's probes
+
+
+# a + b n + c n^2 through the peaks at n = COUNTS (divided differences; inf where a probe ran out of memory).
+def quadratic(peaks: list[float]) -> tuple[float, float, float]:
+    if not all(map(math.isfinite, peaks)):
+        return (peaks[0], math.inf, math.inf) if math.isfinite(peaks[0]) else (math.inf, 0.0, 0.0)
+    (n1, n2, n3), (p1, p2, p3) = COUNTS, peaks
+    first, second = (p2 - p1) / (n2 - n1), (p3 - p2) / (n3 - n2)
+    c = max((second - first) / (n3 - n1), 0.0)
+    b = first - c * (n1 + n2)
+    return p1 - b * n1 - c * n1 * n1, b, c
+
+
+# how a request runs: "resident" (the encoder stays), "staged" (it is parked after the text stage) or "refused".
+Mode = Literal["resident", "staged", "refused"]
+
+
+# resident when dit + vae fit beside the encoder, staged when they fit alone and the encoder can park; returns the
+# mode and the predicted peak of the whole request in it.
+def plan(runtime: Runtime, output: int, references: int) -> tuple[Mode, float]:
+    budget = runtime.budget
+    need = predict(budget, output, references)
+    if need + budget.encoder <= budget.capacity:
+        return "resident", need + budget.encoder
+    return ("staged" if runtime.parks and need <= budget.capacity else "refused"), need
+
+
+# the most square references of `side` a square edit of `output` side takes, resident and staged (staged only where it parks).
+def limits(runtime: Runtime, output: int, side: int, cap: int = 99) -> tuple[int, int]:
+    budget = runtime.budget
+    fits = lambda n, room: predict(budget, output**2, n * side**2) <= room
+    return (max([n for n in range(1, cap + 1) if fits(n, budget.capacity - budget.encoder)], default=0),
+            max([n for n in range(1, cap + 1) if fits(n, budget.capacity)], default=0) if runtime.parks else 0)
 
 
 # a `packed_state` file as written by the packer: fp8 tensors are stored as bytes under "<name>@f8".
@@ -106,10 +171,9 @@ def parking(encoder: Any) -> tuple[Callable[[], None], Callable[[], None]]:
     return fetch, park
 
 
-# downloads what is missing and puts dit, vae and encoder on the gpu. the dit comes prepacked when it can (and is
-# packed and saved here when it cannot);
-# the encoder (`encoder_kind`: the calibrated nvfp4 checkpoint or the bf16 original) gets a pinned host copy on cards under
-# SMALL_CARD_GIB (or with MAGPIE_PARK=1) so it can step aside.
+# downloads what is missing and puts dit, vae and encoder (`encoder_kind`: the calibrated nvfp4 checkpoint or the bf16
+# original) on the gpu. the dit comes prepacked when it can (and is packed and saved here when it cannot). nothing parks
+# yet: `probe` decides that.
 def load(encoder_kind: Encoder = ENCODER) -> Runtime:
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file, save_file
@@ -125,14 +189,54 @@ def load(encoder_kind: Encoder = ENCODER) -> Runtime:
 
     config = json.loads((snapshot / "vae" / "config.json").read_text())
     mean, std = config["latents_mean"], config["latents_std"]
-    dit, vae = pipeline.adopt_packed(from_disk(load_file(local, device="cuda")), read("vae"), mean, std) if ready else pipeline.adopt(read("transformer"), read("vae"), mean, std, slim=MX)
+    dit, vae = pipeline.adopt_packed(from_disk(load_file(local, device="cuda")), read("vae"), mean, std) if ready else pipeline.adopt(read("transformer"), read("vae"), mean, std)
     if MX and not ready:  # packed here: keep it, so the next start reads one file and skips the bf16 transformer
         local.parent.mkdir(parents=True, exist_ok=True)
         save_file(to_disk(pipeline.packed_state(dit)), local)
     encoder, processor = load_encoder(snapshot, nvfp4_from=calibrated_folder(encoder_kind))
-    parks = os.environ.get("MAGPIE_PARK") == "1" or torch.cuda.get_device_properties(0).total_memory < SMALL_CARD_GIB * GIB
-    fetch, park = parking(encoder) if parks else (lambda: None, lambda: None)
-    return Runtime(pipeline.Models(encoder, processor, dit, vae), fetch, park, parks, encoder_kind)
+    return Runtime(pipeline.Models(encoder, processor, dit, vae), lambda: None, lambda: None, False, encoder_kind)
+
+
+# a gray square of `side` pixels as a request carries it.
+def blank(side: int) -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (side, side), (128, 128, 128)).save(buffer, "png")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+# the card's budget, measured the way vllm sizes its cache at start: six staged edits (each probe size with COUNTS
+# references; the encoder parked while dit and vae run), whose dit + vae peaks give `predict` its quadratics. a probe that
+# runs out of memory makes its size's peak infinite, so those requests are refused. the allocator may hold the card's
+# memory less what is not torch's (context, other processes) and a margin for fragmentation. the probes also warm up
+# every kernel. the encoder keeps its pinned host copy (and parks when a request needs the room) where a 2048 edit with
+# REFERENCE_CAP references would not fit beside it, or with MAGPIE_PARK=1. `most` (gib) caps what it plans with, as
+# `--max-memory` sets it (torch's allocator is held to it too).
+def probe(runtime: Runtime, most: float | None = None) -> Runtime:
+    free, total = torch.cuda.mem_get_info()
+    room = min((free + torch.cuda.memory_reserved()) / GIB, most or math.inf)
+    capacity = 0.97 * room - 0.25
+    fetch, park = parking(runtime.models.encoder)
+    held = torch.cuda.memory_allocated()
+    park()
+    encoder = (held - torch.cuda.memory_allocated()) / GIB
+    trial = replace(runtime, fetch=fetch, park=park, parks=True)
+
+    def peak(output: int, side: int, count: int) -> float:
+        try:
+            return generate(trial, {"prompt": "probe", "images": [blank(side)] * count, "resolution": output}, True, {}, "staged")[0]["dit_peak_gib"]
+        except torch.OutOfMemoryError:
+            park()
+            return math.inf
+
+    fits = []
+    for output, side in PROBES:
+        peaks = [peak(output, side, count) for count in COUNTS]
+        fits.append((output**2, side**2, quadratic(peaks)))
+        print(f"probe {output}² edit, {side}² references: dit + vae {', '.join(f'{p:.2f}' for p in peaks)} gib with {', '.join(map(str, COUNTS))}", flush=True)
+    runtime = replace(runtime, budget=Budget(round(capacity, 2), round(encoder, 2), tuple(fits)))
+    parks = os.environ.get("MAGPIE_PARK") == "1" or limits(runtime, 2048, pipeline.REFERENCE)[0] < REFERENCE_CAP
+    fetch()
+    return replace(runtime, fetch=fetch, park=park, parks=True) if parks else runtime
 
 
 def decoded(data: str) -> Image.Image:
@@ -156,18 +260,32 @@ def remember(remembered: Remembered, key: tuple, conditioning: tuple[torch.Tenso
     return dict(kept[max(len(kept) - PROMPTS, 0) :]) if PROMPTS else {}
 
 
-# one request, as `pipeline.generate` runs it but in two timed stages, so the encoder can leave the gpu
-# between them when the image is too large to share the card with it. a (prompt, images) pair in `remembered` skips the
-# encoder (and bringing it back). returns the json reply, whether the encoder is parked, and the conditionings kept.
-@torch.no_grad()
-def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered) -> tuple[Job, bool, Remembered]:
-    models, resolution = runtime.models, int(job.get("resolution", 1024))
+# the condition images a job carries (pil opens them lazily: sizes are read, pixels not yet decoded), at the side they
+# enter the dit at, and the output size.
+def shapes(job: Job) -> tuple[tuple[Image.Image, ...], int, tuple[int, int]]:
+    resolution = int(job.get("resolution", 1024))
     reference = int(job.get("reference") or pipeline.reference_side(resolution))
     images = tuple(decoded(data) for data in job.get("images", []))
-    sized = pipeline.resized(images, reference)
     size = (round(job["width"] / 32) * 32, round(job["height"] / 32) * 32) if job.get("width") and job.get("height") else None
-    width, height = size or (pipeline.fit(resolution**2, images[-1].width / images[-1].height) if images else (resolution,) * 2)
-    crowded = runtime.parks and width * height + sum(image.width * image.height for image in sized) > RESIDENT_PIXELS[runtime.encoder]
+    return images, reference, size or (pipeline.fit(resolution**2, images[-1].width / images[-1].height) if images else (resolution,) * 2)
+
+
+# a job's plan from its sizes alone: (mode, predicted peak gib).
+def planned(runtime: Runtime, job: Job) -> tuple[Mode, float]:
+    images, reference, (width, height) = shapes(job)
+    return plan(runtime, width * height, sum(math.prod(pipeline.fit(reference**2, image.width / image.height)) for image in images))
+
+
+# one request, as `pipeline.generate` runs it but in two timed stages, so the encoder can leave the gpu between them
+# when the plan says the request does not fit beside it. a (prompt, images) pair in `remembered` skips the encoder (and
+# bringing it back). returns the json reply, whether the encoder is parked, and the conditionings kept.
+@torch.no_grad()
+def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered, force: Mode | None = None) -> tuple[Job, bool, Remembered]:
+    models, resolution = runtime.models, int(job.get("resolution", 1024))
+    images, reference, (width, height) = shapes(job)
+    sized = pipeline.resized(images, reference)
+    mode, need = (force, 0.0) if force else planned(runtime, job)
+    crowded = mode == "staged"
     key = (job["prompt"], tuple((image.size, hashlib.blake2b(image.tobytes(), digest_size=16).hexdigest()) for image in sized))
     hit = key in remembered
     torch.cuda.reset_peak_memory_stats()
@@ -183,11 +301,14 @@ def generate(runtime: Runtime, job: Job, parked: bool, remembered: Remembered) -
     text_ms, start = elapsed(start), time.perf_counter()
     if crowded and not (parked and hit):
         runtime.park()
+    text_peak = torch.cuda.max_memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     image = pipeline.render(models.dit, models.vae, text, slots, TURBO, sized, (width, height), resolution, int(job.get("seed", 0)))
     render_ms, start = elapsed(start), time.perf_counter()
     fmt: Format = job.get("format", "png")
     reply = {"image": encoded(image, fmt), "format": fmt, "width": image.width, "height": image.height, "seed": int(job.get("seed", 0)),
-             "peak_gib": round(torch.cuda.max_memory_allocated() / GIB, 2), "remembered": hit}
+             "peak_gib": round(max(text_peak, torch.cuda.max_memory_allocated()) / GIB, 2), "dit_peak_gib": round(torch.cuda.max_memory_allocated() / GIB, 2),
+             "predicted_gib": round(need, 2), "mode": mode, "remembered": hit}
     ms = {"fetch": fetch_ms, "text": text_ms, "dit_vae": render_ms, "encode_image": round((time.perf_counter() - start) * 1e3, 1)}
     return {**reply, "ms": ms}, crowded or (parked and hit), remembered
 
@@ -220,7 +341,7 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:
             props = torch.cuda.get_device_properties(0)
             health = {"gpu": props.name, "vram_gib": round(props.total_memory / GIB, 1), "allocated_gib": round(torch.cuda.memory_allocated() / GIB, 2),
-                      "busy": lock.locked(), "parks": runtime.parks, "encoder": runtime.encoder}
+                      "busy": lock.locked(), "parks": runtime.parks, "encoder": runtime.encoder, "limits": card_limits(runtime)}
             self.reply(*((200, health) if self.path == "/health" and self.allowed() else (401 if self.path == "/health" else 404, {"error": "not found or not allowed"})))
 
         def do_POST(self) -> None:
@@ -229,6 +350,9 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             job = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if not isinstance(job.get("prompt"), str) or not job["prompt"].strip():
                 return self.reply(400, {"error": "prompt is required"})
+            mode, need = planned(runtime, job)
+            if mode == "refused":
+                return self.reply(507, {"error": f"this request needs about {need:.1f} gib, the card holds {runtime.budget.capacity:.1f}", "limits": card_limits(runtime)})
             with lock:
                 try:
                     body, *state[:] = gpu.submit(generate, runtime, job, *state).result()
@@ -238,7 +362,7 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                     gpu.submit(runtime.park).result()
                     state[0] = runtime.parks
                     return self.reply(507, {"error": f"out of gpu memory: {message}"})
-            print(f"{body['width']}x{body['height']} {len(job.get('images', []))} images {body['ms']} peak {body['peak_gib']} gib", flush=True)
+            print(f"{body['width']}x{body['height']} {len(job.get('images', []))} images, {body['mode']}: {body['ms']} peak {body['peak_gib']} gib (predicted {body['predicted_gib']})", flush=True)
             self.reply(200, body)
 
         def log_message(self, *args: Any) -> None:
@@ -247,15 +371,43 @@ def handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+# most references per square edit, as /health and a refusal report them: {"1024": {"resident": n, "staged": n}, "2048": ...}.
+def card_limits(runtime: Runtime) -> dict[str, dict[str, int]]:
+    return {str(output): dict(zip(("resident", "staged"), limits(runtime, output, side))) for output, side in PROBES}
+
+
+# what this process runs on and with, before anything loads.
+def describe() -> str:
+    from magpie.kernels import ATTN4, ATTN8, CAPABILITY, FP8, MX, SAGE
+
+    props = torch.cuda.get_device_properties(0)
+    linears = "mxfp8 + nvfp4 (cutlass)" if MX else "fp8 (triton)" if FP8 else "bf16"
+    attention = "magpie_attn8" if ATTN8 else "sageattention 2" if SAGE else "triton / torch"
+    return (f"gpu: {props.name}, sm_{CAPABILITY[0]}{CAPABILITY[1]}, {props.total_memory / GIB:.1f} gib\n"
+            f"paths: linears {linears}; attention {attention}{', magpie_attn4 for 2048-class outputs' if ATTN4 else ''}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8188)
-    parser.add_argument("--encoder", choices=("nvfp4", "bf16"), default=ENCODER, help="text encoder: calibrated 4-bit (default) or the bf16 original")
+    parser.add_argument("--encoder", choices=("nvfp4", "bf16"), default=ENCODER, help="text encoder: calibrated 4-bit (default on blackwell) or the bf16 original")
+    parser.add_argument("--max-memory", type=float, help="gib of the card this server may use (default: all of it)")
     args = parser.parse_args()
+    print(describe(), flush=True)
+    if args.max_memory:
+        torch.cuda.set_per_process_memory_fraction(min(args.max_memory * GIB / torch.cuda.get_device_properties(0).total_memory, 1.0))
     start = time.perf_counter()
     runtime = load(args.encoder)
-    print(f"loaded in {time.perf_counter() - start:.1f} s, {runtime.encoder} encoder {'parks when crowded' if runtime.parks else 'resident'}; listening on {args.host}:{args.port}", flush=True)
+    print(f"loaded in {time.perf_counter() - start:.1f} s: {torch.cuda.memory_allocated() / GIB:.1f} gib, {runtime.encoder} encoder", flush=True)
+    start = time.perf_counter()
+    runtime = probe(runtime, args.max_memory)
+    budget = runtime.budget
+    print(f"probed in {time.perf_counter() - start:.1f} s: {budget.capacity:.1f} gib usable, encoder {budget.encoder:.1f} gib, "
+          f"{'parks when a request needs the room' if runtime.parks else 'stays resident'}", flush=True)
+    for output, counts in card_limits(runtime).items():
+        print(f"most references, {output}² edit: {counts['resident']} resident" + (f", {counts['staged']} staged" if runtime.parks else ""), flush=True)
+    print(f"listening on {args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), handler(runtime)).serve_forever()
 
 
