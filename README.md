@@ -1,14 +1,6 @@
 # magpie
 
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="assets/plan_fractal-banner-dark.webp">
-<img src="assets/plan_fractal-banner.webp" alt="Pencil study of octagonal room plans with a drawing folded out of each wall">
-</picture>
-
-custom runtime for Qwen-Image 2.1 Turbo on Blackwell/sm_120 GPUs (like the 5090). 
-Qwen-Image 2.1 Turbo (8 steps, one 7.1 B transformer for text-to-image and image editing) made fast on
-Blackwell GPUs (sm_120: RTX 5090, RTX PRO 6000): a lean PyTorch port with block-scaled FP8 and NVFP4
-matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that stays quantised.
+Lean PyTorch runtime for `Qwen/Qwen-Image-2.1-Turbo` (8 steps, 7.1B DiT for text-to-image and editing) on Blackwell GPUs (`sm_120`: RTX 5090, RTX PRO 6000), with block-scaled MXFP8/NVFP4 matmuls, a 4-bit attention kernel, and a quantised prefix cache.
 
 | RTX 5090, request to PNG reply, text encoder included | edit 1024² | edit 2048² |
 |---|---|---|
@@ -19,140 +11,80 @@ matmuls, a 4-bit attention kernel written for the chip, and a prefix cache that 
 | vLLM-Omni, text encoder offloaded | out of memory | out of memory |
 | official diffusers pipeline, CPU offload (in-process) | 28.0 s | out of memory |
 
-Median of five warm requests on one RTX 5090, every system the same day, everything resident for magpie, with the
-default calibrated 4-bit text encoder and, for 2048², a 1448² reference. On an RTX PRO 6000 magpie takes 1.02 s and
-4.76 s at 8 steps (prompt remembered). The transformer and VAE pass a 16-image gate against the bf16 baseline at both sizes (DINOv2 ≥ 0.98,
-DreamSim ≤ 0.05). The 4-bit encoder moves one of the sixteen edits' composition past that line (DINOv2 0.94; a VLM
-judge calls it a tie) and now and then gets requested lettering wrong; `--encoder bf16` keeps the original (see
-[the text encoder](#the-text-encoder)). Numbers are in `baseline/rtx5090.json` and `baseline/compare.json`.
+Median of five warm requests on one RTX 5090 (resident, default 4-bit text encoder, 1448² reference at 2048²). On an RTX PRO 6000, magpie takes 1.02 s and 4.76 s at 8 steps (prompt remembered). The transformer and VAE pass a 16-image quality gate against bf16 at both sizes (DINOv2 ≥ 0.98, DreamSim ≤ 0.05); the 4-bit encoder shifts one edit's composition past that line (DINOv2 0.94, VLM judge tie) and occasionally misspells requested lettering (`--encoder bf16` keeps the original). Measurements live in `baseline/rtx5090.json` and `baseline/compare.json`.
 
-## requirements
+## setup
 
-- A Blackwell GPU (sm_120) with a driver ≥ 580, CUDA 13, PyTorch 2.14.
-- About 31 GiB of weights from `Qwen/Qwen-Image-2.1-Turbo`, downloaded on first start. The transformer comes
-  prepacked from [tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16](https://huggingface.co/tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16)
-  (under the same license); without the native matmul kernels it loads the original bf16 transformer instead.
-- The fast paths are native extensions built from `native/` on the machine that runs them (see below).
+Requires a Blackwell GPU (`sm_120`), driver ≥ 580, CUDA 13, PyTorch 2.14, and ~31 GiB for `Qwen/Qwen-Image-2.1-Turbo` weights (downloaded on first start; transformer prepacked at [tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16](https://huggingface.co/tensorkelechi/magpie-qwen-image-2.1-turbo-hybrid-nvfp4-mxfp8-bf16)). Without native kernels or off `sm_120`, magpie falls back to bf16 with PyTorch attention; for Ada (`sm_89`), see the [`ada` branch](https://github.com/kelechi-c/magpie/tree/ada).
 
-magpie is built for Blackwell (sm_120) and checks for it when it starts. Without the native kernels, or on another
-GPU, it still runs, in plain bf16 with PyTorch's attention: slower, and not tuned or gated there. The
-[`ada` branch](https://github.com/kelechi-c/magpie/tree/ada) keeps an FP8 (Triton) path for Ada cards (sm_89: RTX 4090,
-L40S, L4).
-
-## install
-
-```
+```sh
 git clone https://github.com/kelechi-c/magpie && cd magpie
 pip install -e .
-```
-
-## build the kernels
-
-```
 bash tools/build_native.sh
 ```
 
-Run it once per machine, inside the Python environment magpie runs in. It needs `nvcc` from CUDA 13
-(`CUDA_HOME`, default `/usr/local/cuda`) and gcc with C++20, and takes about seven minutes on an RTX 5090. It fetches
-SageAttention 2 and CUTLASS at pinned commits into `MAGPIE_DEPS` (default `~/.cache/magpie`), installs
-`sageattention`, and builds three extensions into the environment:
+`tools/build_native.sh` runs once per machine (~7 min on an RTX 5090, needs CUDA 13 `nvcc` and C++20 `gcc`), caches SageAttention 2 and CUTLASS in `MAGPIE_DEPS` (`~/.cache/magpie`), and builds `magpie_gemm` (MXFP8/NVFP4 linears), `magpie_attn8` (< 2048 outputs), and `magpie_attn4` (2048-class outputs). Verify with:
 
-| extension | from | used for |
-|---|---|---|
-| `magpie_gemm` | `native/gemm.cu` on CUTLASS | block-scaled MXFP8 and NVFP4 matmuls in the transformer |
-| `magpie_attn8` | `native/attn.cu` | 8-bit attention, everything below 2048-class outputs |
-| `magpie_attn4` | `native/attn.cu` | 4-bit attention (both matmuls) for 2048-class outputs |
-
-Check (torch first: the extensions link against its libraries): `python -c "import torch, magpie_gemm, magpie_attn4, magpie_attn8, sageattention"`.
-
-## the server
-
+```sh
+python -c "import torch, magpie_gemm, magpie_attn4, magpie_attn8, sageattention"
 ```
+
+## server
+
+```sh
 MAGPIE_TOKEN=<secret> python -m magpie.server --port 8188 [--encoder nvfp4|bf16] [--max-memory GIB]
 ```
 
-It loads the model once and takes one request at a time. `--encoder nvfp4|bf16` picks the text encoder (see below);
-`--max-memory` caps the GiB of the card it plans with and allocates.
+Loads once and serves one request at a time:
 
-```
+```sh
 curl -s localhost:8188/generate -H "Authorization: Bearer <secret>" -H "Content-Type: application/json" \
   -d '{"prompt": "Ink drawing of a magpie on a fence post", "seed": 1}' | python -c \
   "import sys, json, base64; open('out.png', 'wb').write(base64.b64decode(json.load(sys.stdin)['image']))"
 ```
 
-`POST /generate` takes JSON:
+`POST /generate` fields:
 
-| field | | |
+| field | default | notes |
 |---|---|---|
-| `prompt` | required | the description, or the edit instruction |
-| `images` | optional | base64 images (or data URLs) to edit or combine; none means text-to-image |
-| `resolution` | 1024 | 1024 or 2048: the side of a square with the output's area |
-| `width`, `height` | optional | exact output size, rounded to multiples of 32. Without them an edit takes the last image's shape |
-| `reference` | `resolution`, at most 1448 | the side the images enter the model at. 1448 for a 2048² edit passes the quality gate, 16 % sooner than a full-size reference |
-| `seed` | 0 | |
-| `format` | `png` | `png`, `jpeg` or `webp` |
-| `fast` | false | run 6 of the 8 transformer steps (steps 3 and 6 reuse the previous step's velocity): DiT + VAE 1024² 1,158 → 935 ms, 2048² 5,474 → 4,306 ms on the RTX 5090 (979 → 787, 4,679 → 3,690 on the PRO 6000). It passes the 16-edit quality gate wherever 8 steps does: all 32 edits on the 5090; on the PRO 6000 it flags the same two 1024² items as 8 steps, no new ones |
-| `keep` | false | hold the images' attention cache on the card for the next edit of the same images at the same size: that edit skips their VAE encode and their part of the first step (DiT + VAE 1024² 1,158 → 1,023 ms, 2048² 5,474 → 5,247 ms on the RTX 5090) for +4.6 / +11 GiB; at 2048² that is 29.5 of the 5090's 29.6 usable GiB. Kept only when it fits beside the request; any other request frees it. A resumed edit is close to a fresh one, not identical (DINOv2 median 0.998, worst 0.92 over 16 edits) |
+| `prompt` | required | generation prompt or edit instruction |
+| `images` | none | base64 images or data URLs to edit/combine |
+| `resolution` | `1024` | `1024` or `2048` (side of equivalent-area square) |
+| `width`, `height` | auto | exact output dimensions (rounded to 32); defaults to last image's shape |
+| `reference` | `min(resolution, 1448)` | input side entering the model; `1448` passes the 2048² gate ~16% faster |
+| `seed` | `0` | RNG seed |
+| `format` | `png` | `png`, `jpeg`, or `webp` |
+| `fast` | `false` | run 6 of 8 DiT steps (reusing velocity on steps 3 and 6); DiT + VAE 1024² 1,158 → 935 ms, 2048² 5,474 → 4,306 ms on RTX 5090 |
+| `keep` | `false` | keep the images' KV cache on GPU for the next same-size edit (+4.6 / +11 GiB; DiT + VAE 1,158 → 1,023 ms / 5,474 → 5,247 ms on RTX 5090; DINOv2 median 0.998, worst 0.92 vs fresh) |
 
-The reply holds `image` (base64), `width`, `height`, `seed`, `peak_gib`, `mode`, `predicted_gib`, `remembered`, `kept`, `resumed` and `ms`
-(`fetch`, `text`, `dit_vae`, `encode_image`). The server keeps the text encoder's output for its last eight prompt and
-image pairs, so a repeat with another seed or size skips the encoder (`remembered` is then true). `GET /health` reports
-the card, the text encoder and the reference limits.
+Replies return `image` (base64), `format`, `width`, `height`, `seed`, `peak_gib`, `mode`, `predicted_gib`, `remembered`, `kept`, `resumed`, and `ms` (`fetch`, `text`, `dit_vae`, `encode_image`). `GET /health` reports GPU, encoder, and reference limits.
 
-At start the server measures the card, as vLLM does before it sizes its cache: six small edits (1024² and 2048², with
-one, two and four references) give it the memory each request needs. It then prints what the card takes:
+On startup the server runs six quick probe edits to model VRAM usage and plans each request as `resident` (fits beside the encoder), `staged` (parks the encoder in host RAM during DiT/VAE when < 10 resident 2048² refs fit or `MAGPIE_PARK=1`), or HTTP `507` with card limits.
 
-```
-probe 1024² edit, 1024² references: dit + vae 8.78, 10.19, 13.00 gib with 1, 2, 4
-probe 2048² edit, 1448² references: dit + vae 12.28, 13.77, 17.60 gib with 1, 2, 4
-probed in 44.8 s: 29.6 gib usable, encoder 5.9 gib, parks when a request needs the room
-most references, 1024² edit: 11 resident, 15 staged
-most references, 2048² edit: 6 resident, 8 staged
-```
-
-Every request is planned from that: resident when it fits beside the text encoder; staged when it fits only without
-it, with the encoder parked in host memory while the transformer runs (about 0.1–0.6 s, on that request and the next);
-refused with status 507 and the limits when it fits neither way. The encoder can park only on a card that cannot hold
-ten 2048² references beside it (or with `MAGPIE_PARK=1`), and parking needs free host memory the size of the encoder.
-
-| environment | |
-|---|---|
-| `MAGPIE_TOKEN` | when set, requests must carry `Authorization: Bearer <token>` |
-| `MAGPIE_ENCODER` | `nvfp4` (default where `magpie_gemm` is built) or `bf16`: the text encoder, as `--encoder` |
-| `MAGPIE_PARK=1` | let the encoder park on a large card too |
-| `MAGPIE_PROMPTS` | how many prompt and image pairs to remember (8; 0 turns it off) |
-| `HF_HOME` | where weights are cached |
-
-## the text encoder
-
-Two text encoders, chosen when the model loads (not per request):
-
-| | `nvfp4` (default on Blackwell) | `bf16` (default elsewhere) |
+| env | default | purpose |
 |---|---|---|
-| what | Qwen's encoder with calibrated 4-bit weights, 5.9 GiB | the original, 15.2 GiB |
-| edit 1024², RTX 5090 | 1.31 s, 14.7 GiB | 1.32 s, 24.0 GiB |
-| edit 2048² (1448² reference), RTX 5090 | 5.63 s, 18.2 GiB | 5.71 s, 27.5 GiB |
-| most references, RTX 5090 (1024² / 2048²) | 11 / 6 | 4 / 2 |
-| lettering | now and then misspells a requested title or leaves the old one (2 of 6 test renders that bf16 got right) | |
+| `MAGPIE_TOKEN` | unset | require `Authorization: Bearer <token>` |
+| `MAGPIE_ENCODER` | `nvfp4` on Blackwell | `nvfp4` or `bf16` (same as `--encoder`) |
+| `MAGPIE_PARK` | unset | set `1` to allow encoder parking on large cards |
+| `MAGPIE_PROMPTS` | `8` | cached `(prompt, images)` encoder outputs (`0` disables) |
+| `HF_HOME` | HF default | Hugging Face weight cache directory |
 
-Whole request, median of five warm runs, both encoders on the same 575 W RTX 5090 (a separate run; the headline row's 8-step
-numbers are 1.49 s and 6.19 s).
+## text encoder
 
-Pick it with any of:
+Chosen at startup (not per request):
 
-| where | |
-|---|---|
-| server | `python -m magpie.server --encoder bf16` |
-| environment | `MAGPIE_ENCODER=bf16` (also the default for `load()` and the server) |
-| Python | `load("bf16")` |
+| | `nvfp4` (Blackwell default) | `bf16` (default elsewhere) |
+|---|---|---|
+| weights | calibrated 4-bit, 5.9 GiB | original, 15.2 GiB |
+| RTX 5090 1024² / 2048² (1448² ref) | 1.31 s (14.7 GiB) / 5.63 s (18.2 GiB) | 1.32 s (24.0 GiB) / 5.71 s (27.5 GiB) |
+| max resident refs on RTX 5090 (1024² / 2048²) | 11 / 6 | 4 / 2 |
+| lettering | occasionally misspells or keeps old titles (2/6 test cases) | exact |
 
-Use `bf16` when an edit must render exact text and the card has the room; pictures without lettering look the same
-with either.
+Select via `--encoder bf16`, `MAGPIE_ENCODER=bf16`, or `load("bf16")` when exact text rendering matters and VRAM allows.
 
-## from python
+## python
 
 ```python
-from PIL import Image
 from magpie.pipeline import generate
 from magpie.sampling import TURBO
 from magpie.server import load
@@ -162,30 +94,21 @@ drawn = generate(models, "Ink drawing of a magpie on a fence post", TURBO, size=
 edited = generate(models, "Add falling snow", TURBO, images=(drawn,), seed=2)
 ```
 
-Edit a generated image with a different seed from the one that drew it; the same noise gives a harsh result.
+Use a different seed when editing a generated image; reusing the same seed yields harsh results.
 
 ## limits
 
-- A 2048² edit on an RTX 5090 stays fully resident: 18.4 GiB at peak with a 1448² reference and the 4-bit encoder,
-  27.5 GiB with the bf16 encoder.
-- References per edit, as Qwen suggests up to ten: an RTX PRO 6000 takes 10+ at both sizes with either encoder. An
-  RTX 5090 takes eleven at 1024² and six at 2048² (1448² references) with the 4-bit encoder resident, four and two
-  with the bf16 encoder, fifteen and eight with the encoder parked. Each 1024² reference adds about 0.4 s and
-  1.4 GiB to a 1024² edit; each 1448² reference about 1.2 s and 1.9 GiB to a 2048² edit.
-- 4-bit attention is used only for 2048-class outputs; everything else runs 8-bit.
-- Text-to-image keeps the subject, style and detail, but its composition can differ from the bf16 picture for the
-  same seed (DINOv2 min 0.90 at 1024² and 2048²; the NVFP4 MLP weights shift it). It is judged on quality, not on
-  matching that picture.
-- Tuned for Turbo. The 40-step base checkpoint runs through the same build and passes the gate (DiT + VAE 4.76 s
-  at 1024², 27.90 s at 2048² on the RTX 5090).
+- Per-reference cost on RTX 5090: ~0.4 s / 1.4 GiB per 1024² reference (up to 15 staged with `nvfp4`), ~1.2 s / 1.9 GiB per 1448² reference at 2048² (up to 8 staged). RTX PRO 6000 fits 10+ references at both sizes with either encoder.
+- `magpie_attn4` runs only for 2048-class outputs; smaller outputs use 8-bit attention (`magpie_attn8`).
+- Text-to-image preserves subject, style, and detail, though NVFP4 MLP weights can shift composition vs bf16 at the same seed (DINOv2 min 0.90).
+- Tuned for Turbo; the 40-step base checkpoint runs through the same build and passes the gate (DiT + VAE 4.76 s at 1024², 27.90 s at 2048² on RTX 5090).
 
 ## layout
 
 - `src/magpie/` — `dit.py`, `vae.py`, `text.py`, `sampling.py`, `pipeline.py`, `kernels.py`, `server.py`
-- `native/` — CUDA sources of the matmul and attention kernels
-- `baseline/` — measured numbers behind the article's charts
+- `native/` — CUDA sources for `magpie_gemm`, `magpie_attn8`, and `magpie_attn4`
+- `baseline/` — measured benchmark and gate numbers
 
 ## license
 
-No weights are in this repository. Qwen-Image 2.1 weights are under the Qwen Research License
-(non-commercial); do not redistribute them, and keep that notice with any derived checkpoint.
+No weights are in this repository. Qwen-Image 2.1 weights are under the Qwen Research License (non-commercial); do not redistribute them, and keep that notice with any derived checkpoint.
